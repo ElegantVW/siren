@@ -43,7 +43,17 @@ enum Cmd {
     /// Previous track
     Prev,
     /// Now playing
-    Now,
+    Now {
+        /// Read ~/.cache/siren/now.json instead of live state
+        #[arg(long)]
+        cached: bool,
+        /// Refresh the cache file (for the timer; quiet)
+        #[arg(long)]
+        refresh: bool,
+        /// Emit JSON {label,output,state,vol,age} (for starship-box)
+        #[arg(long)]
+        json: bool,
+    },
     /// Show library + playback status
     Status,
     /// Play the whole library shuffled
@@ -341,6 +351,110 @@ fn shellexpand(p: &str) -> String {
     } else {
         p.to_string()
     }
+}
+
+fn now_cache_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    std::path::PathBuf::from(format!("{home}/.cache/siren/now.json"))
+}
+
+fn now_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Gather current playback (output-aware) for the cache / JSON.
+fn now_snapshot(cfg: &SirenConfig) -> serde_json::Value {
+    if cfg.audio_output == "heos" {
+        if let Some(t) = heos_target(cfg, None) {
+            let mut ps = vec![heos::HeosPlayer {
+                name: t.2.clone(),
+                pid: t.1,
+                model: String::new(),
+                ip: t.0.clone(),
+                network: String::new(),
+                state: None,
+                volume: None,
+            }];
+            heos::enrich(&mut ps);
+            let p = &ps[0];
+            let label = format!(
+                "{} — {}",
+                p.name,
+                p.state.as_deref().unwrap_or("?")
+            );
+            return serde_json::json!({
+                "label": label,
+                "output": "heos",
+                "state": p.state,
+                "vol": p.volume,
+                "ts": now_epoch(),
+            });
+        }
+        return serde_json::json!({
+            "label": "", "output": "heos",
+            "state": null, "vol": null, "ts": now_epoch(),
+        });
+    }
+    let label = queue::now_label();
+    let state = if !player::alive() {
+        "idle"
+    } else if player::get_bool("pause", false) {
+        "pause"
+    } else if label.is_empty() {
+        "stop"
+    } else {
+        "play"
+    };
+    let vol = player::get("volume").and_then(|v| v.as_i64());
+    serde_json::json!({
+        "label": label, "output": "local",
+        "state": state, "vol": vol, "ts": now_epoch(),
+    })
+}
+
+/// `siren now --refresh`: rewrite the cache, quiet. Timer calls this.
+fn cmd_now_refresh(cfg: &SirenConfig, json: bool) -> i32 {
+    let snap = now_snapshot(cfg);
+    if let Some(parent) = now_cache_path().parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = now_cache_path().with_extension("json.tmp");
+    match serde_json::to_string(&snap) {
+        Ok(text) => {
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, now_cache_path());
+            }
+        }
+        Err(_) => return 1,
+    }
+    if json {
+        println!("{snap}");
+    }
+    0
+}
+
+/// `siren now --cached [--json]`: instant read for prompts/boxes.
+fn cmd_now_cached(json: bool) -> i32 {
+    let raw = std::fs::read_to_string(now_cache_path()).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::json!({}));
+    let ts = v.get("ts").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let age = (now_epoch() - ts).max(0.0);
+    if json {
+        let mut m = v.as_object().cloned().unwrap_or_default();
+        m.insert("age".into(), serde_json::json!(age));
+        println!("{}", serde_json::Value::Object(m));
+        return 0;
+    }
+    let label = v.get("label").and_then(|x| x.as_str()).unwrap_or("");
+    if label.is_empty() {
+        println!("Not playing");
+    } else {
+        println!("{label}");
+    }
+    0
 }
 
 fn heos_target(cfg: &SirenConfig, hint: Option<&str>) -> Option<(String, i64, String)> {
@@ -684,7 +798,12 @@ fn main() -> Result<()> {
                 0
             }
         }
-        Some(Cmd::Now) => {
+        Some(Cmd::Now { cached, refresh, json }) => {
+            if refresh {
+                cmd_now_refresh(&cfg, json)
+            } else if cached {
+                cmd_now_cached(json)
+            } else {
             if use_heos(&cfg) {
                 match heos_target(&cfg, None) {
                     Some(t) => {
@@ -720,6 +839,7 @@ fn main() -> Result<()> {
                     println!("{label}");
                 }
                 0
+            }
             }
         }
         Some(Cmd::Status) => {

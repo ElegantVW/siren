@@ -1,0 +1,10 @@
+[Unit]
+Description=refresh siren now-playing cache every 10s
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

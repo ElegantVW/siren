@@ -1,0 +1,7 @@
+[Unit]
+Description=siren now-playing cache refresh (for starship-box)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/siren now --refresh
