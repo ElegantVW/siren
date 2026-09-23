@@ -4,10 +4,12 @@
 //! transport CLI. Still Python-only: TUI, audio menu, trove (out of v1).
 
 mod config;
+mod heos;
 mod library;
 mod player;
 mod playlist;
 mod queue;
+mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -55,6 +57,12 @@ enum Cmd {
         #[command(subcommand)]
         sub: Option<AudioCmd>,
     },
+    /// Cast a library match to the speaker (DLNA)
+    Cast {
+        query: Vec<String>,
+        #[arg(long, short)]
+        speaker: Option<String>,
+    },
     /// Queue: add|list|clear|play|next|remove|move
     Queue {
         args: Vec<String>,
@@ -73,6 +81,20 @@ enum Cmd {
 enum AudioCmd {
     /// Show current audio routing
     Status,
+    /// Set output: local | heos
+    Output {
+        value: Option<String>,
+    },
+    /// Set/show preferred speaker
+    Speaker {
+        value: Option<String>,
+    },
+    /// Set/show speaker volume (0-100)
+    Vol {
+        value: Option<String>,
+    },
+    /// Cast now-playing (or first queue/library track) to the speaker
+    Test,
 }
 
 fn cmd_config(action: Option<String>, key: Option<String>, value: Option<String>) -> i32 {
@@ -283,16 +305,216 @@ fn cmd_playlist(rest: &[String]) -> i32 {
     }
 }
 
+fn heos_target(cfg: &SirenConfig, hint: Option<&str>) -> Option<(String, i64, String)> {
+    let h = hint.map(|s| s.to_string()).or_else(|| {
+        if cfg.audio_speaker.trim().is_empty() {
+            None
+        } else {
+            Some(cfg.audio_speaker.clone())
+        }
+    });
+    heos::resolve(h.as_deref()).map(|(ip, pid, p)| (ip, pid, p.name))
+}
+
+fn cmd_audio(sub: Option<AudioCmd>) -> i32 {
+    let mut cfg = SirenConfig::load();
+    match sub {
+        None | Some(AudioCmd::Status) => {
+            println!("output:  {}", cfg.audio_output);
+            println!("speaker: {}", cfg.audio_speaker);
+            match heos_target(&cfg, None) {
+                Some((ip, pid, name)) => {
+                    let mut ps = vec![heos::HeosPlayer {
+                        name: name.clone(),
+                        pid,
+                        model: String::new(),
+                        ip: ip.clone(),
+                        network: String::new(),
+                        state: None,
+                        volume: None,
+                    }];
+                    heos::enrich(&mut ps);
+                    let p = &ps[0];
+                    println!(
+                        "live:    {} ({}) state={} vol={}",
+                        p.name,
+                        p.ip,
+                        p.state.as_deref().unwrap_or("?"),
+                        p.volume.map(|v| format!("{v}%")).unwrap_or("?".into())
+                    );
+                }
+                None => println!("live:    no speaker found"),
+            }
+            0
+        }
+        Some(AudioCmd::Output { value }) => match value {
+            None => {
+                println!("{}", cfg.audio_output);
+                0
+            }
+            Some(v) => match cfg.set("audio_output", &v) {
+                Ok(shown) => {
+                    if cfg.save().is_err() {
+                        eprintln!("save failed");
+                        return 1;
+                    }
+                    println!("output = {shown}");
+                    0
+                }
+                Err(msg) => {
+                    eprintln!("audio_output: {msg}");
+                    1
+                }
+            },
+        },
+        Some(AudioCmd::Speaker { value }) => match value {
+            None => {
+                println!("{}", cfg.audio_speaker);
+                0
+            }
+            Some(v) => match cfg.set("audio_speaker", &v) {
+                Ok(shown) => {
+                    if cfg.save().is_err() {
+                        eprintln!("save failed");
+                        return 1;
+                    }
+                    println!("speaker = {shown}");
+                    0
+                }
+                Err(msg) => {
+                    eprintln!("audio_speaker: {msg}");
+                    1
+                }
+            },
+        },
+        Some(AudioCmd::Vol { value }) => {
+            let tgt = match heos_target(&cfg, None) {
+                Some(t) => t,
+                None => {
+                    eprintln!("no speaker found");
+                    return 1;
+                }
+            };
+            match value {
+                None => {
+                    let mut ps = vec![heos::HeosPlayer {
+                        name: tgt.2.clone(),
+                        pid: tgt.1,
+                        model: String::new(),
+                        ip: tgt.0.clone(),
+                        network: String::new(),
+                        state: None,
+                        volume: None,
+                    }];
+                    heos::enrich(&mut ps);
+                    println!(
+                        "{} volume: {}",
+                        tgt.2,
+                        ps[0].volume.map(|v| format!("{v}%")).unwrap_or("?".into())
+                    );
+                    0
+                }
+                Some(v) => {
+                    let lvl: i32 = match v.trim().trim_end_matches('%').parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            eprintln!("volume must be 0-100");
+                            return 1;
+                        }
+                    };
+                    if heos::set_volume(&tgt.0, tgt.1, lvl) {
+                        println!("{} volume → {}%", tgt.2, lvl.clamp(0, 100));
+                        0
+                    } else {
+                        eprintln!("volume failed");
+                        1
+                    }
+                }
+            }
+        }
+        Some(AudioCmd::Test) => {
+            // now-playing → queue top → library top
+            let pick = {
+                let p = player::now_path();
+                if !p.is_empty() {
+                    Some(std::path::PathBuf::from(p))
+                } else {
+                    None
+                }
+            }
+            .or_else(|| queue::snapshot().first().map(|it| std::path::PathBuf::from(&it.path)))
+            .or_else(|| library::scan_library(&cfg).first().cloned());
+            match pick {
+                Some(p) => {
+                    let tgt = match heos_target(&cfg, None) {
+                        Some(t) => t,
+                        None => {
+                            eprintln!("no speaker found");
+                            return 1;
+                        }
+                    };
+                    match heos::dlna_cast(&tgt.0, tgt.1, &p) {
+                        Ok(()) => {
+                            println!("cast {} → {}", p.display(), tgt.2);
+                            0
+                        }
+                        Err(e) => {
+                            eprintln!("cast failed: {e}");
+                            1
+                        }
+                    }
+                }
+                None => {
+                    eprintln!("nothing to cast");
+                    1
+                }
+            }
+        }
+    }
+}
+
+fn cmd_cast(cfg: &SirenConfig, query: &[String], speaker: Option<&str>) -> i32 {
+    let hits = library::resolve_play_args(
+        cfg,
+        &query.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+    );
+    if hits.is_empty() {
+        println!("No tracks match: {}", query.join(" "));
+        return 1;
+    }
+    let top = &hits[0];
+    let tgt = match heos_target(cfg, speaker) {
+        Some(t) => t,
+        None => {
+            eprintln!("no speaker found");
+            return 1;
+        }
+    };
+    match heos::dlna_cast(&tgt.0, tgt.1, top) {
+        Ok(()) => {
+            println!("cast {} → {}", top.display(), tgt.2);
+            0
+        }
+        Err(e) => {
+            eprintln!("cast failed: {e}");
+            1
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = SirenConfig::load();
     let code = match cli.cmd {
         // back-compat bare query → play
         None if !cli.query.is_empty() => cmd_play(&cfg, &cli.query),
-        None => {
-            println!("siren: TUI still lives in Python — try play | status | queue | playlist | config | audio.");
-            0
-        }
+        None => match tui::run() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("tui failed: {e:#}");
+                1
+            }
+        },
         Some(Cmd::Play { query }) => cmd_play(&cfg, &query),
         Some(Cmd::Pause) => {
             queue::cmd_pause();
@@ -353,12 +575,8 @@ fn main() -> Result<()> {
             }
         }
         Some(Cmd::Config { action, key, value }) => cmd_config(action, key, value),
-        Some(Cmd::Audio { sub }) => match sub {
-            None | Some(AudioCmd::Status) => {
-                println!("audio: output=local (mpv) — heos routing lands with the audio menu slice.");
-                0
-            }
-        },
+        Some(Cmd::Audio { sub }) => cmd_audio(sub),
+        Some(Cmd::Cast { query, speaker }) => cmd_cast(&cfg, &query, speaker.as_deref()),
         Some(Cmd::Queue { args }) => cmd_queue(&args),
         Some(Cmd::Playlist { args }) => cmd_playlist(&args),
         Some(Cmd::Resolve { query }) => {

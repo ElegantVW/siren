@@ -31,6 +31,12 @@ pub struct SirenConfig {
     pub wave_bands: i32,
     #[serde(default = "d_true")]
     pub mouse: bool,
+    /// Audio routing: "local" (mpv) or "heos" (network speaker)
+    #[serde(default = "d_output")]
+    pub audio_output: String,
+    /// Preferred HEOS speaker (name fragment)
+    #[serde(default = "d_speaker")]
+    pub audio_speaker: String,
 }
 
 fn d_volume() -> i32 {
@@ -45,6 +51,12 @@ fn d_true() -> bool {
 fn d_bands() -> i32 {
     16
 }
+fn d_output() -> String {
+    "local".into()
+}
+fn d_speaker() -> String {
+    "Vanguarda Office".into()
+}
 
 impl Default for SirenConfig {
     fn default() -> Self {
@@ -58,6 +70,8 @@ impl Default for SirenConfig {
             cache_meta: true,
             wave_bands: 16,
             mouse: true,
+            audio_output: d_output(),
+            audio_speaker: d_speaker(),
         }
     }
 }
@@ -179,6 +193,21 @@ impl SirenConfig {
                 }
                 _ => Err("expects 8, 16 or 32".to_string()),
             },
+            "audio_output" => match val.trim().to_lowercase().as_str() {
+                "local" | "heos" => {
+                    self.audio_output = val.trim().to_lowercase();
+                    Ok(self.audio_output.clone())
+                }
+                _ => Err("expects local or heos".to_string()),
+            },
+            "audio_speaker" => {
+                let v = val.trim().to_string();
+                if v.is_empty() {
+                    return Err("expects a speaker name".to_string());
+                }
+                self.audio_speaker = v.clone();
+                Ok(v)
+            }
             _ => Err(format!("unknown key: {key}")),
         }
     }
@@ -194,6 +223,8 @@ impl SirenConfig {
             "cache_meta" => Some(onoff(self.cache_meta)),
             "wave_bands" => Some(self.wave_bands.to_string()),
             "mouse" => Some(onoff(self.mouse)),
+            "audio_output" => Some(self.audio_output.clone()),
+            "audio_speaker" => Some(self.audio_speaker.clone()),
             _ => None,
         }
     }
@@ -209,6 +240,8 @@ impl SirenConfig {
             "cache_meta",
             "wave_bands",
             "mouse",
+            "audio_output",
+            "audio_speaker",
         ]
     }
 }

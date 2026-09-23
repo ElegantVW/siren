@@ -3,9 +3,10 @@
 faeOS first-party media player. mpv-backed local playback plus HEOS
 network-speaker control, in one remote.
 
-**Status:** rust scaffold (v0.1.0). The live player is still the Python
-implementation at `faeOS/bin/siren` (2477 lines); this repo ports it slice
-by slice. **No trove/Internet-Archive support in v1.**
+**Status:** engine plays (v0.1.0). Ported: config, library/fuzzy, mpv IPC,
+queue/playlist, transport CLI, two-box TUI, audio menu + `cast`.
+The Python `faeOS/bin/siren` stays fallback until parity sign-off.
+**No trove/Internet-Archive support in v1.**
 
 ## Layout
 
