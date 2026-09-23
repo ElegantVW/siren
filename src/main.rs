@@ -74,6 +74,12 @@ enum Cmd {
         query: Vec<String>,
         #[arg(long, short)]
         speaker: Option<String>,
+        /// Queue play-next instead of play-now
+        #[arg(long)]
+        next: bool,
+        /// Append to end of speaker queue
+        #[arg(long)]
+        append: bool,
     },
     /// Free & legal music (Internet Archive)
     Trove {
@@ -119,7 +125,15 @@ enum AudioCmd {
     },
     /// Cast now-playing (or first queue/library track) to the speaker
     Test,
+    /// Speaker queue: list | play <n> | rm <n> | clear | move <from> <to>
+    /// (local queue stays `siren queue …`; this is the HEOS box)
+    Queue {
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        args: Vec<String>,
+    },
 }
+
+
 
 fn cmd_config(action: Option<String>, key: Option<String>, value: Option<String>) -> i32 {
     let mut cfg = SirenConfig::load();
@@ -192,7 +206,7 @@ fn cmd_play(cfg: &SirenConfig, rest: &[String]) -> i32 {
             println!("Playing: {}", tgt.2);
             return 0;
         }
-        return cmd_cast(cfg, rest, None);
+        return cmd_cast(cfg, rest, None, false, false);
     }
     if rest.is_empty()
         && player::alive()
@@ -510,6 +524,8 @@ fn now_snapshot(cfg: &SirenConfig) -> serde_json::Value {
 
 /// `siren now --refresh`: rewrite the cache, quiet. Timer calls this.
 fn cmd_now_refresh(cfg: &SirenConfig, json: bool) -> i32 {
+    // keep the roster cache warm too (best effort, never fails the refresh)
+    heos::refresh_roster();
     let snap = now_snapshot(cfg);
     if let Some(parent) = now_cache_path().parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -677,6 +693,10 @@ fn cmd_audio(sub: Option<AudioCmd>) -> i32 {
                 }
             }
         }
+        Some(AudioCmd::Queue { args }) => {
+            let cfg = SirenConfig::load();
+            cmd_speaker_queue(&cfg, &args)
+        },
         Some(AudioCmd::Test) => {
             // now-playing → queue top → library top
             let pick = {
@@ -698,7 +718,7 @@ fn cmd_audio(sub: Option<AudioCmd>) -> i32 {
                             return 1;
                         }
                     };
-                    match heos::dlna_cast(&tgt.0, tgt.1, &p) {
+                    match heos::dlna_cast(&tgt.0, tgt.1, &p, 1) {
                         Ok(()) => {
                             heos::note_cast(&p);
                             println!("cast {} → {}", p.display(), tgt.2);
@@ -719,7 +739,13 @@ fn cmd_audio(sub: Option<AudioCmd>) -> i32 {
     }
 }
 
-fn cmd_cast(cfg: &SirenConfig, query: &[String], speaker: Option<&str>) -> i32 {
+fn cmd_cast(
+    cfg: &SirenConfig,
+    query: &[String],
+    speaker: Option<&str>,
+    next: bool,
+    append: bool,
+) -> i32 {
     let hits = library::resolve_play_args(
         cfg,
         &query.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -736,14 +762,124 @@ fn cmd_cast(cfg: &SirenConfig, query: &[String], speaker: Option<&str>) -> i32 {
             return 1;
         }
     };
-    match heos::dlna_cast(&tgt.0, tgt.1, top) {
+    let aid = if next { 2 } else if append { 3 } else { 1 };
+    match heos::dlna_cast(&tgt.0, tgt.1, top, aid) {
         Ok(()) => {
-            heos::note_cast(top);
-            println!("cast {} → {}", top.display(), tgt.2);
+            if aid == 1 {
+                heos::note_cast(top);
+            }
+            let how = match aid {
+                2 => " (play-next)",
+                3 => " (appended)",
+                _ => "",
+            };
+            println!("cast {} → {}{}", top.display(), tgt.2, how);
             0
         }
         Err(e) => {
             eprintln!("cast failed: {e}");
+            1
+        }
+    }
+}
+
+/// `siren audio queue …` — the SPEAKER's queue (local stays `siren queue`).
+/// Indices are 1-based into the current listing.
+fn cmd_speaker_queue(cfg: &SirenConfig, args: &[String]) -> i32 {
+    // optional --speaker/-s NAME anywhere in args
+    let mut hint: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        if a == "--speaker" || a == "-s" {
+            hint = it.next().cloned();
+        } else if let Some(v) = a.strip_prefix("--speaker=") {
+            hint = Some(v.to_string());
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    let tgt = match heos_target(cfg, hint.as_deref()) {
+        Some(t) => t,
+        None => {
+            eprintln!("no speaker found");
+            return 1;
+        }
+    };
+    let args = rest;
+    let sub = args.first().map(|s| s.to_lowercase()).unwrap_or_default();
+    if sub.is_empty() || sub == "list" || sub == "ls" {
+        let items = heos::get_queue(&tgt.0, tgt.1);
+        if items.is_empty() {
+            println!("(speaker queue empty)");
+            return 0;
+        }
+        for (i, it) in items.iter().enumerate() {
+            let artist = if it.artist.is_empty() { "".into() } else { format!(" — {}", it.artist) };
+            println!("  {:3}. {}{}", i + 1, it.song, artist);
+        }
+        return 0;
+    }
+    let items = heos::get_queue(&tgt.0, tgt.1);
+    let qid_at = |n: usize| -> Option<i64> {
+        if n >= 1 && n <= items.len() {
+            Some(items[n - 1].qid)
+        } else {
+            None
+        }
+    };
+    match sub.as_str() {
+        "play" | "p" => {
+            let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            match qid_at(n) {
+                Some(qid) if heos::play_queue(&tgt.0, tgt.1, qid) => {
+                    println!("playing #{} on {}", n, tgt.2);
+                    0
+                }
+                _ => {
+                    eprintln!("usage: siren audio queue play <1-{}>", items.len().max(1));
+                    1
+                }
+            }
+        }
+        "rm" | "remove" | "del" | "d" => {
+            let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            match qid_at(n) {
+                Some(qid) if heos::remove_from_queue(&tgt.0, tgt.1, qid) => {
+                    println!("removed #{} from {}", n, tgt.2);
+                    0
+                }
+                _ => {
+                    eprintln!("usage: siren audio queue rm <1-{}>", items.len().max(1));
+                    1
+                }
+            }
+        }
+        "clear" | "c" => {
+            if heos::clear_queue(&tgt.0, tgt.1) {
+                println!("{} queue cleared", tgt.2);
+                0
+            } else {
+                eprintln!("clear failed");
+                1
+            }
+        }
+        "move" | "mv" => {
+            let f: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let t: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+            match (qid_at(f), qid_at(t)) {
+                (Some(sqid), Some(dqid)) if heos::move_queue_item(&tgt.0, tgt.1, sqid, dqid) => {
+                    println!("moved #{} → #{} on {}", f, t, tgt.2);
+                    0
+                }
+                _ => {
+                    eprintln!("usage: siren audio queue move <from> <to>");
+                    1
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: siren audio queue [list|play <n>|rm <n>|clear|move <from> <to>]");
             1
         }
     }
@@ -802,6 +938,7 @@ fn cmd_trove(args: &[String]) -> i32 {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = SirenConfig::load();
+    queue::ensure_loaded();
     let code = match cli.cmd {
         // back-compat bare query → play
         None if !cli.query.is_empty() => cmd_play(&cfg, &cli.query),
@@ -992,7 +1129,9 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Config { action, key, value }) => cmd_config(action, key, value),
         Some(Cmd::Audio { sub }) => cmd_audio(sub),
-        Some(Cmd::Cast { query, speaker }) => cmd_cast(&cfg, &query, speaker.as_deref()),
+        Some(Cmd::Cast { query, speaker, next, append }) => {
+            cmd_cast(&cfg, &query, speaker.as_deref(), next, append)
+        }
         Some(Cmd::Trove { args }) => cmd_trove(&args),
         Some(Cmd::Sleep { args }) => cmd_sleep(&args),
         Some(Cmd::Queue { args }) => cmd_queue(&args),

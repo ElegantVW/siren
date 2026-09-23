@@ -94,12 +94,84 @@ static QUEUE: OnceLock<Mutex<Queue>> = OnceLock::new();
 static QUEUE_DRIVEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static LAST_LABEL: OnceLock<Mutex<String>> = OnceLock::new();
+static QUEUE_LOADED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn queue_file() -> std::path::PathBuf {
+    let base = std::env::var("SIREN_CONFIG_DIR").unwrap_or_else(|_| {
+        format!(
+            "{}/.config/siren",
+            std::env::var("HOME").unwrap_or_else(|_| "/root".into())
+        )
+    });
+    std::path::PathBuf::from(base).join("queue.json")
+}
 
 fn queue() -> std::sync::MutexGuard<'static, Queue> {
     QUEUE
         .get_or_init(|| Mutex::new(Queue { items: Vec::new() }))
         .lock()
         .unwrap()
+}
+
+/// Persist the session queue (survives processes/restarts).
+fn save_queue() {
+    let q = queue();
+    let v: Vec<serde_json::Value> = q
+        .items
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "path": t.path, "display": t.display, "title": t.title,
+                "artist": t.artist, "duration": t.duration,
+            })
+        })
+        .collect();
+    drop(q);
+    let p = queue_file();
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = p.with_extension("json.tmp");
+    if std::fs::write(&tmp, serde_json::to_string_pretty(&v).unwrap_or_default()).is_ok() {
+        let _ = std::fs::rename(&tmp, p);
+    }
+}
+
+/// Load persisted queue once per process (drops missing files).
+pub fn ensure_loaded() {
+    if QUEUE_LOADED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let raw = match std::fs::read_to_string(queue_file()) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let arr = match v.as_array() {
+        Some(a) => a,
+        None => return,
+    };
+    let mut items = Vec::new();
+    for t in arr {
+        let path = t.get("path").and_then(|x| x.as_str()).unwrap_or("");
+        if path.is_empty() || !std::path::Path::new(path).exists() {
+            continue;
+        }
+        items.push(QueueItem {
+            path: path.to_string(),
+            display: t.get("display").and_then(|x| x.as_str()).unwrap_or("").into(),
+            title: t.get("title").and_then(|x| x.as_str()).unwrap_or("").into(),
+            artist: t.get("artist").and_then(|x| x.as_str()).unwrap_or("").into(),
+            duration: t.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        });
+    }
+    if !items.is_empty() {
+        queue().items = items;
+    }
 }
 
 fn set_driven(v: bool) {
@@ -387,6 +459,7 @@ pub fn cli_add(cfg: &SirenConfig, query: &str, prepend: bool) -> i32 {
         if prepend { "Prepended" } else { "Added" },
         files.len()
     );
+    save_queue();
     0
 }
 
@@ -432,6 +505,7 @@ pub fn cli_play() -> i32 {
     }
     if !removed.is_empty() {
         maybe_resync_queue();
+        save_queue();
     }
     let q = queue();
     if q.items.is_empty() {
@@ -475,6 +549,7 @@ pub fn cli_remove(index_1based: &str) -> i32 {
                     };
                     drop(q);
                     maybe_resync_queue();
+                    save_queue();
                     println!("Removed: {d}");
                     0
                 }
@@ -501,6 +576,7 @@ pub fn cli_move(a: &str, b: &str) -> i32 {
                 q.items.insert(t - 1, it);
                 drop(q);
                 maybe_resync_queue();
+                save_queue();
                 println!("Moved.");
                 0
             } else {
@@ -518,6 +594,7 @@ pub fn cli_move(a: &str, b: &str) -> i32 {
 pub fn cli_clear() -> i32 {
     queue().clear();
     maybe_resync_queue();
+    save_queue();
     println!("Queue cleared.");
     0
 }
@@ -525,6 +602,7 @@ pub fn cli_clear() -> i32 {
 /// Replace the whole queue (mirrors Python `QUEUE.items = tracks`).
 pub fn replace(items: Vec<QueueItem>) {
     queue().items = items;
+    save_queue();
 }
 
 /// Snapshot for playlist save.

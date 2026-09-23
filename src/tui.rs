@@ -149,6 +149,7 @@ struct App {
 impl App {
     fn new() -> Self {
         let cfg = SirenConfig::load();
+        queue::ensure_loaded();
         let lib = library::scan_library(&cfg);
         Self {
             cfg,
@@ -343,7 +344,7 @@ impl App {
         };
         let (ip, pid, name) = target;
         self.say(format!("casting {} → {name}…", path_name(path)));
-        match heos::dlna_cast(&ip, pid, path) {
+        match heos::dlna_cast(&ip, pid, path, 1) {
             Ok(()) => {
                 heos::note_cast(path);
                 // reset the elapsed clock + optimistic play state

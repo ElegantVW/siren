@@ -36,6 +36,11 @@ siren audio                  # output, speaker, volumes, DLNA status
 siren audio output heos      # route play/pause/next/now to the speaker
 siren audio output local     # back to mpv (default)
 siren cast <query>           # top library match → Vanguarda Office (DLNA)
+siren audio queue              # speaker queue: qid · song — artist
+siren audio queue play 2       # play / rm / clear / move 1 3
+siren cast QUERY --next        # queue play-next (aid=2)
+siren cast QUERY --append      # add to end (aid=3)
+siren queue add QUERY          # local queue persists (~/.config/siren/queue.json)
 ```
 
 Default speaker: **Vanguarda Office** (HEOS 1, `192.168.8.184`), `--speaker`

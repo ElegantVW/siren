@@ -100,13 +100,31 @@ fn rpc_once(stream: &mut TcpStream, uris: &[String]) -> Option<Vec<Value>> {
     for u in uris {
         stream.write_all(format!("{u}\n").as_bytes()).ok()?;
     }
+    // stop at the first quiet gap AFTER all expected replies arrived
+    // (firmware sometimes sends "command under process" + the real reply,
+    // so exact counting alone would cut off early)
+    stream.set_read_timeout(Some(Duration::from_millis(120))).ok()?;
     let mut data = Vec::new();
     let mut buf = [0u8; 8192];
+    let mut quiet_rounds = 0;
     loop {
         match stream.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => data.extend_from_slice(&buf[..n]),
-            Err(_) => break, // idle gap = end of this batch's replies
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                quiet_rounds = 0;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                let text = String::from_utf8_lossy(&data);
+                if split_objects(&text).len() >= uris.len() {
+                    break;
+                }
+                quiet_rounds += 1;
+                if quiet_rounds >= 25 {
+                    break; // ~3s deadline
+                }
+            }
+            Err(_) => break,
         }
     }
     if data.is_empty() {
@@ -303,9 +321,86 @@ pub fn enrich(players: &mut [HeosPlayer]) {
     }
 }
 
+/// Roster cache: discovery (sweep + probes) costs ~2s per CLI call.
+/// Cache (name→pid/ip/model + ts) makes commands cost 1 action RPC.
+const ROSTER_TTL: f64 = 120.0;
+
+fn roster_cache_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    std::path::PathBuf::from(format!("{home}/.cache/siren/heos-roster.json"))
+}
+
+fn now_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn player_from_json(v: &Value) -> Option<HeosPlayer> {
+    Some(HeosPlayer {
+        name: v.get("name")?.as_str()?.to_string(),
+        pid: v.get("pid")?.as_i64()?,
+        model: v.get("model").and_then(|x| x.as_str()).unwrap_or("").into(),
+        ip: v.get("ip")?.as_str()?.to_string(),
+        network: v.get("network").and_then(|x| x.as_str()).unwrap_or("").into(),
+        state: None,
+        volume: None,
+    })
+}
+
+fn read_roster_cache() -> Option<Vec<HeosPlayer>> {
+    let raw = std::fs::read_to_string(roster_cache_path()).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let ts = v.get("ts")?.as_f64()?;
+    if now_epoch() - ts > ROSTER_TTL {
+        return None;
+    }
+    let arr = v.get("players")?.as_array()?;
+    let ps: Vec<HeosPlayer> = arr.iter().filter_map(player_from_json).collect();
+    if ps.is_empty() {
+        return None;
+    }
+    Some(ps)
+}
+
+fn write_roster_cache(players: &[HeosPlayer]) {
+    let arr: Vec<Value> = players
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.name, "pid": p.pid, "model": p.model,
+                "ip": p.ip, "network": p.network,
+            })
+        })
+        .collect();
+    let v = serde_json::json!({ "players": arr, "ts": now_epoch() });
+    if let Some(parent) = roster_cache_path().parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = roster_cache_path().with_extension("json.tmp");
+    if std::fs::write(&tmp, v.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, roster_cache_path());
+    }
+}
+
+/// Live discovery + rewrite the cache (timer calls this; best effort).
+pub fn refresh_roster() {
+    let players = roster();
+    if !players.is_empty() {
+        write_roster_cache(&players);
+    }
+}
+
 /// Resolve a speaker by name fragment (default: Vanguarda Office).
 pub fn resolve(hint: Option<&str>) -> Option<(String, i64, HeosPlayer)> {
-    let mut players = roster();
+    let mut players = read_roster_cache().unwrap_or_else(|| {
+        let live = roster();
+        if !live.is_empty() {
+            write_roster_cache(&live);
+        }
+        live
+    });
     if players.is_empty() {
         return None;
     }
@@ -385,6 +480,51 @@ pub fn play_next(ip: &str, pid: i64) -> bool {
 
 pub fn play_previous(ip: &str, pid: i64) -> bool {
     ok(&rpc(ip, &[format!("heos://player/play_previous?pid={pid}")]))
+}
+
+// ---- speaker queue (verbs per HEOS CLI spec; aid 1=now 2=next 3=end 4=replace) ----
+
+#[derive(Debug, Clone, Default)]
+pub struct QueueEntry {
+    pub qid: i64,
+    pub song: String,
+    pub artist: String,
+    pub album: String,
+    pub mid: String,
+}
+
+pub fn get_queue(ip: &str, pid: i64) -> Vec<QueueEntry> {
+    let mut out = Vec::new();
+    for o in rpc(ip, &[format!("heos://player/get_queue?pid={pid}")]) {
+        if let Some(arr) = o.get("payload").and_then(|p| p.as_array()) {
+            for it in arr {
+                out.push(QueueEntry {
+                    qid: it.get("qid").and_then(|x| x.as_i64()).unwrap_or(0),
+                    song: it.get("song").and_then(|x| x.as_str()).unwrap_or("?").into(),
+                    artist: it.get("artist").and_then(|x| x.as_str()).unwrap_or("").into(),
+                    album: it.get("album").and_then(|x| x.as_str()).unwrap_or("").into(),
+                    mid: it.get("mid").and_then(|x| x.as_str()).unwrap_or("").into(),
+                });
+            }
+        }
+    }
+    out
+}
+
+pub fn play_queue(ip: &str, pid: i64, qid: i64) -> bool {
+    ok(&rpc(ip, &[format!("heos://player/play_queue?pid={pid}&qid={qid}")]))
+}
+
+pub fn remove_from_queue(ip: &str, pid: i64, qid: i64) -> bool {
+    ok(&rpc(ip, &[format!("heos://player/remove_from_queue?pid={pid}&qid={qid}")]))
+}
+
+pub fn clear_queue(ip: &str, pid: i64) -> bool {
+    ok(&rpc(ip, &[format!("heos://player/clear_queue?pid={pid}")]))
+}
+
+pub fn move_queue_item(ip: &str, pid: i64, sqid: i64, dqid: i64) -> bool {
+    ok(&rpc(ip, &[format!("heos://player/move_queue_item?pid={pid}&sqid={sqid}&dqid={dqid}")]))
 }
 
 // ---- DLNA casting (via VANGUARDA-DLNA / minidlna :8200) ----
@@ -543,7 +683,8 @@ pub fn last_cast() -> Option<(std::path::PathBuf, f64)> {
 
 /// Cast a local file to a speaker via DLNA. Copies into /tmp/dlna when the
 /// file isn't already served (~/Music and /tmp/dlna are minidlna roots).
-pub fn dlna_cast(ip: &str, pid: i64, path: &std::path::Path) -> Result<(), String> {
+/// `aid`: 1 play-now (default), 2 play-next, 3 add-to-end, 4 replace-and-play.
+pub fn dlna_cast(ip: &str, pid: i64, path: &std::path::Path, aid: i64) -> Result<(), String> {
     let served = ["/tmp/dlna", &format!("{}/Music", std::env::var("HOME").unwrap_or_default())];
     let abs = path.to_string_lossy().into_owned();
     let in_dlna = served.iter().any(|d| abs.starts_with(d));
@@ -577,9 +718,10 @@ pub fn dlna_cast(ip: &str, pid: i64, path: &std::path::Path) -> Result<(), Strin
     })?;
     match dlna_find(ip, sid, &target) {
         Some((cid, mid)) => {
+            let aid = aid.clamp(1, 4);
             // RAW $ in cid/mid (never %-encode) — firmware rejects %24
             let cmd = format!(
-                "heos://browse/add_to_queue?pid={pid}&sid={sid}&cid={cid}&mid={mid}&aid=1"
+                "heos://browse/add_to_queue?pid={pid}&sid={sid}&cid={cid}&mid={mid}&aid={aid}"
             );
             if ok(&rpc(ip, &[cmd])) {
                 return Ok(());
