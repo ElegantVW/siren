@@ -43,6 +43,21 @@ for Cave. Protocol: HEOS CLI on TCP/1255 (newline `heos://` URIs) +
 `VANGUARDA-DLNA` (minidlna on `:8200`); queue via `add_to_queue aid=1`
 with raw `$` in cid/mid.
 
+## Trove
+
+Free & legal music (Internet Archive), zero new Rust deps (system `curl`):
+
+```
+siren trove 10 music lofi   # interactive search + pick
+siren trove get <identifier>
+siren trove about
+```
+
+TUI: 5th Tab stop (`trove`), `s` search · `enter/1-9` download · `a` all —
+search and downloads run in background threads. Guards: `.part` resume,
+skip-if-exists, 40-file cap, 32MB confirm, `TROVE_MAX_TOTAL`.
+Lands in `~/Music/trove/<identifier>`.
+
 ## Build
 
 ```bash
