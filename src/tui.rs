@@ -73,8 +73,10 @@ struct TroveState {
     searching: bool,
     search_rx: Option<std::sync::mpsc::Receiver<Result<(Vec<crate::trove::Doc>, u64, String), String>>>,
     dl_active: bool,
-    dl_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    dl_rx: Option<std::sync::mpsc::Receiver<DlMsg>>,
     log: Vec<String>,
+    /// file currently showing live progress (replaced in place)
+    dl_prog_file: Option<String>,
     /// session format: mp3|flac|ogg|wav|opus|m4a|all
     fmt: String,
     /// doc idx awaiting a format pick + its options
@@ -146,6 +148,7 @@ impl App {
                 dl_active: false,
                 dl_rx: None,
                 log: Vec::new(),
+                dl_prog_file: None,
                 fmt: "mp3".into(),
                 fmt_for: None,
                 fmt_opts: Vec::new(),
@@ -672,24 +675,42 @@ fn poll_trove(app: &mut App) {
         if let Some(rx) = app.trove.dl_rx.as_ref() {
             loop {
                 match rx.try_recv() {
-                    Ok(lines) => {
-                        if lines.is_empty() {
-                            // worker sentinel
-                            app.trove.dl_active = false;
-                            app.trove.dl_rx = None;
-                            app.say("download finished — see trove log");
-                            break;
+                    Ok(DlMsg::Progress { file, i, n, frac }) => {
+                        let pct = match frac {
+                            Some(f) => format!("{:>3.0}%", f * 100.0),
+                            None => "  ?".into(),
+                        };
+                        let line = format!("↓ {i}/{n} {file}  {pct}");
+                        // same file → replace live line in place; else push
+                        if app.trove.dl_prog_file.as_deref() == Some(file.as_str()) {
+                            app.trove.log.pop();
+                        } else {
+                            app.trove.dl_prog_file = Some(file);
                         }
-                        for l in lines {
-                            app.trove.log.push(l);
-                        }
+                        app.trove.log.push(line);
                         while app.trove.log.len() > 6 {
                             app.trove.log.remove(0);
                         }
                     }
+                    Ok(DlMsg::Line(l)) => {
+                        // completion line supersedes its live line
+                        app.trove.dl_prog_file = None;
+                        app.trove.log.push(l);
+                        while app.trove.log.len() > 6 {
+                            app.trove.log.remove(0);
+                        }
+                    }
+                    Ok(DlMsg::Finished) => {
+                        app.trove.dl_active = false;
+                        app.trove.dl_rx = None;
+                        app.trove.dl_prog_file = None;
+                        app.say("download finished — see trove log");
+                        break;
+                    }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         app.trove.dl_active = false;
                         app.trove.dl_rx = None;
+                        app.trove.dl_prog_file = None;
                         break;
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -721,6 +742,16 @@ fn poll_trove(app: &mut App) {
     }
 }
 
+/// Download-thread → TUI messages.
+enum DlMsg {
+    /// live per-file progress (replaces the previous progress line)
+    Progress { file: String, i: usize, n: usize, frac: Option<f64> },
+    /// finished line (completion / failure / done summary)
+    Line(String),
+    /// worker done
+    Finished,
+}
+
 fn trove_download(app: &mut App, idxs: Vec<usize>, format: Option<String>) {
     if app.trove.dl_active {
         app.say("download already running");
@@ -748,16 +779,26 @@ fn trove_download(app: &mut App, idxs: Vec<usize>, format: Option<String>) {
     ));
     let (tx, rx) = std::sync::mpsc::channel();
     app.trove.dl_rx = Some(rx);
+    app.trove.dl_prog_file = None;
     std::thread::spawn(move || {
         for d in &docs {
             let tx2 = tx.clone();
             let ident = d.identifier.clone();
             let mut cb = move |i: usize, n: usize, name: &str, good: bool| {
-                let _ = tx2.send(vec![format!(
+                let _ = tx2.send(DlMsg::Line(format!(
                     "↓ {i}/{n} {}{}",
                     name,
                     if good { "" } else { " FAILED" }
-                )]);
+                )));
+            };
+            let tx3 = tx.clone();
+            let mut live = move |i: usize, n: usize, name: &str, frac: Option<f64>| {
+                let _ = tx3.send(DlMsg::Progress {
+                    file: name.to_string(),
+                    i,
+                    n,
+                    frac,
+                });
             };
             match crate::trove::do_download_inner(
                 &d.identifier,
@@ -765,17 +806,22 @@ fn trove_download(app: &mut App, idxs: Vec<usize>, format: Option<String>) {
                 true,
                 fmt.as_deref(),
                 Some(&mut cb as &mut dyn FnMut(usize, usize, &str, bool)),
+                Some(&mut live
+                    as &mut dyn FnMut(usize, usize, &str, Option<f64>)),
             ) {
                 Ok((ok, n, dir)) => {
-                    let _ = tx.send(vec![format!("Done {ok}/{n} {} → {}", ident, dir.display())]);
+                    let _ = tx.send(DlMsg::Line(format!(
+                        "Done {ok}/{n} {} → {}",
+                        ident,
+                        dir.display()
+                    )));
                 }
                 Err(e) => {
-                    let _ = tx.send(vec![format!("{ident}: {e}")]);
+                    let _ = tx.send(DlMsg::Line(format!("{ident}: {e}")));
                 }
             }
         }
-        // sentinel: empty batch = worker done
-        let _ = tx.send(Vec::new());
+        let _ = tx.send(DlMsg::Finished);
     });
 }
 
@@ -1429,7 +1475,9 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             ])));
         }
     }
-    for l in app.trove.log.iter().rev().take(3) {
+    // chronological tail: oldest first, newest at the bottom
+    let tail: Vec<&String> = app.trove.log.iter().rev().take(3).collect();
+    for l in tail.into_iter().rev() {
         rows.push(ListItem::new(Line::from(Span::styled(
             format!("  {l}"),
             Style::default().fg(Color::Cyan),

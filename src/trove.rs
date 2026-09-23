@@ -406,7 +406,15 @@ fn confirm(prompt: &str, default: bool) -> bool {
 
 /// Download one file with resume (.part + Range via curl -C -).
 /// Returns true on success. Ctrl-C kills curl; .part is kept.
-pub fn download_file(url: &str, dest: &std::path::Path, size: u64) -> bool {
+/// `progress`: None → curl's own meter on stderr (CLI).
+/// Some → curl runs silent (TUI-safe: no escape spam on the alt screen)
+/// and the watcher reports 0..1 (None when size unknown) ~2Hz.
+pub fn download_file(
+    url: &str,
+    dest: &std::path::Path,
+    size: u64,
+    progress: Option<&mut dyn FnMut(Option<f64>)>,
+) -> bool {
     if let Err(e) = std::fs::create_dir_all(dest.parent().unwrap()) {
         eprintln!("  mkdir failed: {e}");
         return false;
@@ -423,18 +431,50 @@ pub fn download_file(url: &str, dest: &std::path::Path, size: u64) -> bool {
     eprintln!(
         "  ↓ {}  {}",
         dest.file_name().unwrap_or_default().to_string_lossy(),
-        if size > 0 { fmt_size(size) } else { "…".into() }
+        if size > 0 { fmt_size(size) } else { "?".into() }
     );
-    let st = Command::new("curl")
-        .args([
-            "-fL", "--retry", "2", "--retry-delay", "2",
-            "--max-time", "0", "-C", "-", "--progress-bar",
-            "-A", UA, "-o",
-        ])
+    let silent = progress.is_some();
+    let meter_args: &[&str] = if silent {
+        // TUI/headless: no escape spam on the alt screen; progress via .part poll
+        &["-fL", "--retry", "2", "--retry-delay", "2", "--max-time", "0", "-C", "-", "-sS"]
+    } else {
+        &["-fL", "--retry", "2", "--retry-delay", "2", "--max-time", "0", "-C", "-", "--progress-bar"]
+    };
+    let mut child = match Command::new("curl")
+        .args(meter_args)
+        .arg("-A")
+        .arg(UA)
+        .arg("-o")
         .arg(&part)
         .arg(url)
         .stderr(Stdio::inherit())
-        .status();
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  curl spawn failed: {e}");
+            return false;
+        }
+    };
+    // poll .part while curl writes (~4Hz) when the owner wants progress
+    if let Some(cb) = progress {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let cur = part.metadata().map(|m| m.len()).unwrap_or(0);
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    cb(if size > 0 {
+                        Some((cur as f64 / size as f64).clamp(0.0, 1.0))
+                    } else {
+                        None
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    let st = child.wait();
     match st {
         Ok(s) if s.success() => {
             if std::fs::rename(&part, dest).is_err() {
@@ -464,6 +504,7 @@ pub fn do_download_inner(
     assume_yes: bool,
     format: Option<&str>,
     mut progress: Option<&mut dyn FnMut(usize, usize, &str, bool)>,
+    mut live: Option<&mut dyn FnMut(usize, usize, &str, Option<f64>)>,
 ) -> Result<(usize, usize, PathBuf), String> {
     let targets =
         pick_targets(ident, mediatype, format).map_err(|e| format!("metadata error: {e}"))?;
@@ -494,8 +535,16 @@ pub fn do_download_inner(
         }
     }
     let mut ok = 0;
+    let n = targets.len();
     for (i, t) in targets.iter().enumerate() {
-        let good = download_file(&t.url, &t.dir.join(&t.name), t.size);
+        // live % with file context for the owner's progress line
+        let good = if let Some(live_cb) = live.as_mut() {
+            let name = t.name.clone();
+            let mut tick = |frac: Option<f64>| live_cb(i + 1, n, &name, frac);
+            download_file(&t.url, &t.dir.join(&t.name), t.size, Some(&mut tick))
+        } else {
+            download_file(&t.url, &t.dir.join(&t.name), t.size, None)
+        };
         if good {
             ok += 1;
         }
@@ -508,7 +557,7 @@ pub fn do_download_inner(
 
 pub fn do_download(ident: &str, mediatype: &str, title: &str, format: Option<&str>) {
     eprintln!("Fetching file list for {ident} …");
-    match do_download_inner(ident, mediatype, false, format, None) {
+    match do_download_inner(ident, mediatype, false, format, None, None) {
         Ok((ok, n, dir)) => eprintln!("Done: {ok}/{n}  ({title} → {})", dir.display()),
         Err(e) => eprintln!("{e}"),
     }
