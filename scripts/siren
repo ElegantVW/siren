@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# siren — thin launcher (never a prebuilt ELF in git)
+# Discovery: SIREN_BIN → ~/.local/lib/faeos/siren → sibling tree
+set -euo pipefail
+
+USER_HOME="${HOME}"
+if [[ -n "${SUDO_USER:-}" ]]; then
+  USER_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+  USER_HOME="${USER_HOME:-$HOME}"
+fi
+
+CANDIDATES=(
+  "${SIREN_BIN:-}"
+  "$USER_HOME/.local/lib/faeos/siren"
+  /usr/local/lib/faeos/siren
+  "$USER_HOME/siren/target/release/siren"
+  "${SIREN_ROOT:-}/target/release/siren"
+)
+here="$(cd "$(dirname "$0")" && pwd)"
+if [[ -x "$here/../target/release/siren" ]]; then
+  CANDIDATES+=("$here/../target/release/siren")
+fi
+
+for c in "${CANDIDATES[@]}"; do
+  [[ -n "$c" && -x "$c" ]] || continue
+  exec "$c" "$@"
+done
+
+echo "siren: engine not built yet." >&2
+echo "  build:  cd ~/siren && ./build.sh install" >&2
+exit 127
