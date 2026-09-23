@@ -79,6 +79,10 @@ enum Cmd {
     Trove {
         args: Vec<String>,
     },
+    /// Sleep timer: `siren sleep 30` stops playback in 30min, `off` cancels
+    Sleep {
+        args: Vec<String>,
+    },
     /// Queue: add|list|clear|play|next|remove|move
     Queue {
         args: Vec<String>,
@@ -341,6 +345,89 @@ fn cmd_playlist(rest: &[String]) -> i32 {
         _ => {
             println!("Playlist commands: save, load, list, remove");
             1
+        }
+    }
+}
+
+/// Sleep timer via a transient user timer (no daemon).
+/// `siren sleep 30` → stop in 30min · `siren sleep off` → cancel ·
+/// `siren sleep` → remaining.
+fn cmd_sleep(args: &[String]) -> i32 {
+    use std::process::Command;
+    let unit = "siren-sleep";
+    let ctl = |a: &[&str]| -> Option<String> {
+        Command::new("systemctl")
+            .arg("--user")
+            .args(a)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    match args.first().map(|s| s.to_lowercase()).as_deref() {
+        None | Some("") => {
+            // status: time left on the transient timer
+            let out = ctl(&["list-timers", "--no-legend", "--no-pager"]).unwrap_or_default();
+            let line = out.lines().find(|l| l.contains(unit));
+            match line {
+                Some(l) => {
+                    // LEFT column looks like "9min left" inside a spaced table
+                    let toks: Vec<&str> = l.split_whitespace().collect();
+                    let left = toks
+                        .iter()
+                        .position(|t| *t == "left")
+                        .and_then(|i| toks.get(i.saturating_sub(1)))
+                        .map(|t| format!("{t} left"))
+                        .unwrap_or_else(|| "?".into());
+                    println!("sleep: stops in {left}");
+                    0
+                }
+                None => {
+                    println!("sleep: off");
+                    0
+                }
+            }
+        }
+        Some("off") | Some("cancel") | Some("stop") => {
+            ctl(&["stop", &format!("{unit}.timer")]);
+            ctl(&["reset-failed", &format!("{unit}.*")]);
+            println!("sleep: off");
+            0
+        }
+        Some(m) => {
+            let mins: f64 = match m.parse() {
+                Ok(v) if v > 0.0 => v,
+                _ => {
+                    eprintln!("usage: siren sleep [minutes|off]");
+                    return 2;
+                }
+            };
+            let siren = format!(
+                "{}/bin/siren",
+                std::env::var("HOME").unwrap_or_else(|_| "/root".into())
+            );
+            // cancel any previous timer first
+            ctl(&["stop", &format!("{unit}.timer")]);
+            let st = Command::new("systemd-run")
+                .args([
+                    "--user",
+                    "--quiet",
+                    &format!("--on-active={mins}min"),
+                    &format!("--unit={unit}"),
+                    &siren,
+                    "stop",
+                ])
+                .status();
+            match st {
+                Ok(s) if s.success() => {
+                    println!("sleep: stops in {mins}min");
+                    0
+                }
+                _ => {
+                    eprintln!("sleep: systemd-run failed (user manager up?)");
+                    1
+                }
+            }
         }
     }
 }
@@ -901,6 +988,7 @@ fn main() -> Result<()> {
         Some(Cmd::Audio { sub }) => cmd_audio(sub),
         Some(Cmd::Cast { query, speaker }) => cmd_cast(&cfg, &query, speaker.as_deref()),
         Some(Cmd::Trove { args }) => cmd_trove(&args),
+        Some(Cmd::Sleep { args }) => cmd_sleep(&args),
         Some(Cmd::Queue { args }) => cmd_queue(&args),
         Some(Cmd::Playlist { args }) => cmd_playlist(&args),
         Some(Cmd::Spectrum { path }) => {
