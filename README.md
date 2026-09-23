@@ -53,10 +53,11 @@ siren trove get <identifier>
 siren trove about
 ```
 
-TUI: 5th Tab stop (`trove`), `s` search · `enter/1-9` download · `a` all —
-search and downloads run in background threads. Guards: `.part` resume,
-skip-if-exists, 40-file cap, 32MB confirm, `TROVE_MAX_TOTAL`.
-Lands in `~/Music/trove/<identifier>`.
+TUI: 5th Tab stop (`trove`), `s` search · `enter` pick version · `1-9` dl ·
+`a` all · `f` session format · mouse wheel + click select, double-click
+acts. Search, metadata and downloads run in background threads.
+Guards: `.part` resume, skip-if-exists, 40-file cap, 32MB confirm,
+`TROVE_MAX_TOTAL`. Lands in `~/Music/trove/<identifier>`.
 
 ## Build
 

@@ -527,17 +527,37 @@ fn cmd_cast(cfg: &SirenConfig, query: &[String], speaker: Option<&str>) -> i32 {
     }
 }
 
+/// Split `--format EXT` / `--format=EXT` out of trove args.
+fn trove_format_arg(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut format: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        if a == "--format" {
+            if let Some(v) = it.next() {
+                format = Some(v.to_lowercase());
+            }
+        } else if let Some(v) = a.strip_prefix("--format=") {
+            format = Some(v.to_lowercase());
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (format, rest)
+}
+
 fn cmd_trove(args: &[String]) -> i32 {
+    let (format, args) = trove_format_arg(args);
     if args.is_empty() {
-        return trove::run_trove(10, &[], None);
+        return trove::run_trove(10, &[], None, format);
     }
     let sub = args[0].to_lowercase();
     if sub == "get" || sub == "g" {
         if args.len() < 2 {
-            eprintln!("usage: siren trove get <identifier>");
+            eprintln!("usage: siren trove get <identifier> [--format EXT|all]");
             return 2;
         }
-        return trove::run_get(&args[1]);
+        return trove::run_get(&args[1], format);
     }
     if sub == "about" || sub == "help" || sub == "-h" || sub == "--help" {
         for line in trove::about_text() {
@@ -546,7 +566,7 @@ fn cmd_trove(args: &[String]) -> i32 {
         return 0;
     }
     // optional leading count, then kind detection inside run_trove
-    let mut words: Vec<String> = args.to_vec();
+    let mut words: Vec<String> = args;
     let mut n = 10u32;
     if let Some(first) = words.first() {
         if let Ok(v) = first.parse::<u32>() {
@@ -554,7 +574,7 @@ fn cmd_trove(args: &[String]) -> i32 {
             words.remove(0);
         }
     }
-    trove::run_trove(n, &words, None)
+    trove::run_trove(n, &words, None, format)
 }
 
 fn main() -> Result<()> {

@@ -225,8 +225,55 @@ fn sanitize_ident(ident: &str) -> String {
         .collect()
 }
 
+/// Preferred display order for format choice.
+pub const FORMAT_ORDER: &[&str] = &["mp3", "flac", "ogg", "m4a", "wav", "opus"];
+
+fn ext_of(name: &str) -> Option<String> {
+    let lo = name.to_lowercase();
+    AUDIO_EXT
+        .iter()
+        .chain(VIDEO_EXT.iter())
+        .find(|e| lo.ends_with(**e))
+        .map(|e| e.trim_start_matches('.').to_string())
+}
+
+/// Distinct audio formats an item offers, in preference order.
+pub fn available_formats(ident: &str, mediatype: &str) -> Result<Vec<String>, String> {
+    let meta = item_meta(ident)?;
+    let files = meta.get("files").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+    let mut have: Vec<String> = Vec::new();
+    for f in &files {
+        if let Some(n) = f.get("name").and_then(|x| x.as_str()) {
+            if let Some(e) = ext_of(n) {
+                if AUDIO_EXT.contains(&format!(".{e}").as_str()) && !have.contains(&e) {
+                    have.push(e);
+                }
+            }
+        }
+    }
+    have.sort_by_key(|e| FORMAT_ORDER.iter().position(|o| o == e).unwrap_or(99));
+    let _ = mediatype;
+    Ok(have)
+}
+
+/// Everything the item offers (unfiltered) + its format list.
+pub fn plan_download(ident: &str, mediatype: &str) -> Result<(Vec<Target>, Vec<String>), String> {
+    let targets = pick_targets(ident, mediatype, None)?;
+    let mut fmts: Vec<String> = Vec::new();
+    for t in &targets {
+        if let Some(e) = ext_of(&t.name) {
+            if AUDIO_EXT.contains(&format!(".{e}").as_str()) && !fmts.contains(&e) {
+                fmts.push(e);
+            }
+        }
+    }
+    fmts.sort_by_key(|e| FORMAT_ORDER.iter().position(|o| o == e).unwrap_or(99));
+    Ok((targets, fmts))
+}
+
 /// (url, filename, dest_dir, size) — video decided by mediatype.
-pub fn pick_targets(ident: &str, mediatype: &str) -> Result<Vec<Target>, String> {
+/// `format`: Some(ext) keeps one file per song (stem-dedupe); None/"all" keeps everything.
+pub fn pick_targets(ident: &str, mediatype: &str, format: Option<&str>) -> Result<Vec<Target>, String> {
     let meta = item_meta(ident)?;
     let files = meta.get("files").and_then(|f| f.as_array()).cloned().unwrap_or_default();
     let mt = if mediatype.is_empty() {
@@ -270,9 +317,40 @@ pub fn pick_targets(ident: &str, mediatype: &str) -> Result<Vec<Target>, String>
     } else {
         media.truncate(40);
     }
+    let want = format.map(|s| s.to_lowercase());
     let mut targets = Vec::new();
+    let mut seen_stems: Vec<String> = Vec::new();
     for f in media {
         let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let ext = ext_of(name).unwrap_or_default();
+        if let Some(w) = &want {
+            if w != "all" && ext != *w {
+                continue;
+            }
+        }
+        // one file per song when a specific format is chosen
+        if want.as_deref().is_some_and(|w| w != "all") {
+            let stem: String = name
+                .rsplit('/')
+                .next()
+                .unwrap_or(name)
+                .chars()
+                .take_while(|c| *c != '.')
+                .collect::<String>()
+                .to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect();
+            // strip trailing bitrate tags (64kb, vbr) so versions dedupe
+            let stem = stem
+                .trim_end_matches(|c: char| c.is_numeric() || c == 'k' || c == 'b')
+                .trim_end_matches("_- ")
+                .to_string();
+            if seen_stems.contains(&stem) {
+                continue;
+            }
+            seen_stems.push(stem);
+        }
         let base = name.rsplit('/').next().unwrap_or(name).to_string();
         let url = format!(
             "https://archive.org/download/{}/{}",
@@ -378,13 +456,17 @@ pub fn download_file(url: &str, dest: &std::path::Path, size: u64) -> bool {
 
 /// Headless download worker. Returns (ok, total, dest_dir).
 /// `assume_yes` skips the size confirm (TUI thread — no stdin there).
+/// `format`: Some(ext)|Some("all")|None(all). `progress` fires per file.
 /// Errors are returned as strings (empty-targets / over-cap / metadata).
 pub fn do_download_inner(
     ident: &str,
     mediatype: &str,
     assume_yes: bool,
+    format: Option<&str>,
+    mut progress: Option<&mut dyn FnMut(usize, usize, &str, bool)>,
 ) -> Result<(usize, usize, PathBuf), String> {
-    let targets = pick_targets(ident, mediatype).map_err(|e| format!("metadata error: {e}"))?;
+    let targets =
+        pick_targets(ident, mediatype, format).map_err(|e| format!("metadata error: {e}"))?;
     if targets.is_empty() {
         return Err(format!(
             "No audio/video files found (metadata only?). Browse: https://archive.org/details/{ident}"
@@ -412,20 +494,46 @@ pub fn do_download_inner(
         }
     }
     let mut ok = 0;
-    for t in &targets {
-        if download_file(&t.url, &t.dir.join(&t.name), t.size) {
+    for (i, t) in targets.iter().enumerate() {
+        let good = download_file(&t.url, &t.dir.join(&t.name), t.size);
+        if good {
             ok += 1;
+        }
+        if let Some(cb) = progress.as_mut() {
+            cb(i + 1, targets.len(), &t.name, good);
         }
     }
     Ok((ok, targets.len(), dir))
 }
 
-pub fn do_download(ident: &str, mediatype: &str, title: &str) {
+pub fn do_download(ident: &str, mediatype: &str, title: &str, format: Option<&str>) {
     eprintln!("Fetching file list for {ident} …");
-    match do_download_inner(ident, mediatype, false) {
+    match do_download_inner(ident, mediatype, false, format, None) {
         Ok((ok, n, dir)) => eprintln!("Done: {ok}/{n}  ({title} → {})", dir.display()),
         Err(e) => eprintln!("{e}"),
     }
+}
+
+/// Ask which of the available formats to take. Returns "all" or an ext.
+pub fn prompt_format(formats: &[String]) -> String {
+    if formats.len() <= 1 {
+        return formats.first().cloned().unwrap_or_else(|| "all".into());
+    }
+    eprint!("format ({})? [{}] ", formats.join("/"), formats[0]);
+    let _ = std::io::stderr().flush();
+    let mut ans = String::new();
+    if std::io::stdin().read_line(&mut ans).is_err() {
+        return formats[0].clone();
+    }
+    let ans = ans.trim().to_lowercase();
+    if ans.is_empty() {
+        return formats[0].clone();
+    }
+    if ans == "all" || formats.contains(&ans) {
+        return ans;
+    }
+    eprintln!("  unknown format — taking {}", formats[0]);
+    formats[0].clone()
 }
 
 pub fn doc_lines(i: usize, d: &Doc) -> (String, String) {
@@ -447,7 +555,12 @@ pub fn doc_lines(i: usize, d: &Doc) -> (String, String) {
 }
 
 /// `siren trove …` — search archive.org, interactively download.
-pub fn run_trove(n: u32, terms: &[String], kind: Option<&str>) -> i32 {
+pub fn run_trove(
+    n: u32,
+    terms: &[String],
+    kind: Option<&str>,
+    format: Option<String>,
+) -> i32 {
     let n = n.clamp(1, 50);
     let mut k = kind.map(|s| s.to_string());
     let mut words: Vec<String> = terms.to_vec();
@@ -469,7 +582,7 @@ pub fn run_trove(n: u32, terms: &[String], kind: Option<&str>) -> i32 {
             }
         };
         eprintln!("  got {} hits ({num_found} total) in {:.1}s", docs.len(), t0.elapsed().as_secs_f32());
-        match interactive_list(&docs, num_found, &query) {
+        match interactive_list(&docs, num_found, &query, format.clone()) {
             Loop::Quit => return 0,
             Loop::Again => {
                 eprint!("new search words (or empty to keep): ");
@@ -499,7 +612,12 @@ enum Loop {
     Done,
 }
 
-fn interactive_list(docs: &[Doc], num_found: u64, query: &str) -> Loop {
+fn interactive_list(
+    docs: &[Doc],
+    num_found: u64,
+    query: &str,
+    format: Option<String>,
+) -> Loop {
     println!();
     println!("  query:   {query}");
     println!("  matches: {num_found}  ·  showing {}", docs.len());
@@ -529,7 +647,8 @@ fn interactive_list(docs: &[Doc], num_found: u64, query: &str) -> Loop {
             "s" | "search" | "again" | "r" => return Loop::Again,
             "a" | "all" => {
                 for d in docs {
-                    do_download(&d.identifier, &d.mediatype, &d.title);
+                    let f = format.clone().or_else(|| choose_format(&d.identifier, &d.mediatype));
+                    do_download(&d.identifier, &d.mediatype, &d.title, f.as_deref());
                 }
                 println!("Done. [s] new search, [q] quit.");
                 return Loop::Done;
@@ -538,7 +657,8 @@ fn interactive_list(docs: &[Doc], num_found: u64, query: &str) -> Loop {
                 let n: usize = c.parse().unwrap_or(0);
                 if 1 <= n && n <= docs.len() {
                     let d = &docs[n - 1];
-                    do_download(&d.identifier, &d.mediatype, &d.title);
+                    let f = format.clone().or_else(|| choose_format(&d.identifier, &d.mediatype));
+                    do_download(&d.identifier, &d.mediatype, &d.title, f.as_deref());
                     println!("Another number, [s] search again, or [q] quit?");
                     continue;
                 }
@@ -549,14 +669,27 @@ fn interactive_list(docs: &[Doc], num_found: u64, query: &str) -> Loop {
     }
 }
 
+/// Pick a format for one item: flag wins, else prompt when >1 available.
+fn choose_format(ident: &str, mediatype: &str) -> Option<String> {
+    match plan_download(ident, mediatype) {
+        Ok((_, fmts)) if fmts.len() > 1 => Some(prompt_format(&fmts)),
+        Ok(_) => None, // single format (or none) — no question
+        Err(e) => {
+            eprintln!("{e}");
+            None
+        }
+    }
+}
+
 /// `siren trove get <identifier>`
-pub fn run_get(identifier: &str) -> i32 {
+pub fn run_get(identifier: &str, format: Option<String>) -> i32 {
     let ident = identifier.trim();
     if ident.is_empty() {
-        eprintln!("usage: siren trove get <identifier>");
+        eprintln!("usage: siren trove get <identifier> [--format EXT|all]");
         return 2;
     }
-    do_download(ident, "", ident);
+    let f = format.or_else(|| choose_format(ident, ""));
+    do_download(ident, "", ident, f.as_deref());
     0
 }
 
@@ -568,6 +701,7 @@ pub fn about_text() -> Vec<String> {
         "  siren trove 10 music lofi      search + pick".into(),
         "  siren trove podcast history     kind + terms".into(),
         "  siren trove get <identifier>    download one item".into(),
+        "  --format mp3|flac|ogg|all      pick a version (else it asks)".into(),
         "  siren trove about".into(),
         "".into(),
         "downloads land in ~/Music/trove and ~/Videos/trove".into(),
