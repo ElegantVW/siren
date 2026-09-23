@@ -371,14 +371,20 @@ fn cmd_sleep(args: &[String]) -> i32 {
             let line = out.lines().find(|l| l.contains(unit));
             match line {
                 Some(l) => {
-                    // LEFT column looks like "9min left" inside a spaced table
+                    // NEXT is "Dow YYYY-MM-DD HH:MM:SS TZ" (4 tokens) or "n/a";
+                    // LEFT follows ("44min" transient, "44min left" persistent)
                     let toks: Vec<&str> = l.split_whitespace().collect();
-                    let left = toks
-                        .iter()
-                        .position(|t| *t == "left")
-                        .and_then(|i| toks.get(i.saturating_sub(1)))
-                        .map(|t| format!("{t} left"))
-                        .unwrap_or_else(|| "?".into());
+                    let left = if toks.first() == Some(&"n/a") {
+                        toks.get(1).unwrap_or(&"?").to_string()
+                    } else if toks.len() > 4 {
+                        let mut s = toks[4].to_string();
+                        if toks.get(5) == Some(&"left") {
+                            s.push_str(" left");
+                        }
+                        s
+                    } else {
+                        "?".into()
+                    };
                     println!("sleep: stops in {left}");
                     0
                 }
