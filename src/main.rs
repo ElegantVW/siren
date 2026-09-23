@@ -9,6 +9,7 @@ mod library;
 mod player;
 mod playlist;
 mod queue;
+mod trove;
 mod tui;
 
 use anyhow::Result;
@@ -62,6 +63,10 @@ enum Cmd {
         query: Vec<String>,
         #[arg(long, short)]
         speaker: Option<String>,
+    },
+    /// Free & legal music (Internet Archive)
+    Trove {
+        args: Vec<String>,
     },
     /// Queue: add|list|clear|play|next|remove|move
     Queue {
@@ -522,6 +527,36 @@ fn cmd_cast(cfg: &SirenConfig, query: &[String], speaker: Option<&str>) -> i32 {
     }
 }
 
+fn cmd_trove(args: &[String]) -> i32 {
+    if args.is_empty() {
+        return trove::run_trove(10, &[], None);
+    }
+    let sub = args[0].to_lowercase();
+    if sub == "get" || sub == "g" {
+        if args.len() < 2 {
+            eprintln!("usage: siren trove get <identifier>");
+            return 2;
+        }
+        return trove::run_get(&args[1]);
+    }
+    if sub == "about" || sub == "help" || sub == "-h" || sub == "--help" {
+        for line in trove::about_text() {
+            println!("  {line}");
+        }
+        return 0;
+    }
+    // optional leading count, then kind detection inside run_trove
+    let mut words: Vec<String> = args.to_vec();
+    let mut n = 10u32;
+    if let Some(first) = words.first() {
+        if let Ok(v) = first.parse::<u32>() {
+            n = v;
+            words.remove(0);
+        }
+    }
+    trove::run_trove(n, &words, None)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = SirenConfig::load();
@@ -710,6 +745,7 @@ fn main() -> Result<()> {
         Some(Cmd::Config { action, key, value }) => cmd_config(action, key, value),
         Some(Cmd::Audio { sub }) => cmd_audio(sub),
         Some(Cmd::Cast { query, speaker }) => cmd_cast(&cfg, &query, speaker.as_deref()),
+        Some(Cmd::Trove { args }) => cmd_trove(&args),
         Some(Cmd::Queue { args }) => cmd_queue(&args),
         Some(Cmd::Playlist { args }) => cmd_playlist(&args),
         Some(Cmd::Resolve { query }) => {

@@ -25,8 +25,15 @@ enum View {
     Queue,
     Waves,
     Audio,
+    Trove,
 }
-const VIEWS: [View; 4] = [View::Browser, View::Queue, View::Waves, View::Audio];
+const VIEWS: [View; 5] = [
+    View::Browser,
+    View::Queue,
+    View::Waves,
+    View::Audio,
+    View::Trove,
+];
 
 impl View {
     fn title(&self) -> &'static str {
@@ -35,6 +42,7 @@ impl View {
             View::Queue => "queue",
             View::Waves => "waves",
             View::Audio => "audio",
+            View::Trove => "trove",
         }
     }
     fn menu(&self) -> &'static str {
@@ -43,6 +51,7 @@ impl View {
             View::Queue => "enter play-from · d remove · c clear",
             View::Waves => "p pause · n/b next/prev · s shuffle · r repeat · W bands · +/- vol",
             View::Audio => "o output · s speaker · v refresh · t test-cast · m mute · +/- vol",
+            View::Trove => "s search · enter/1-9 download · a all · j/k move",
         }
     }
 }
@@ -53,6 +62,19 @@ enum InputMode {
     SavePl,
     LoadPl,
     RmPl,
+    TroveSearch,
+}
+
+struct TroveState {
+    query: String,
+    docs: Vec<crate::trove::Doc>,
+    total: u64,
+    sel: usize,
+    searching: bool,
+    search_rx: Option<std::sync::mpsc::Receiver<Result<(Vec<crate::trove::Doc>, u64, String), String>>>,
+    dl_active: bool,
+    dl_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    log: Vec<String>,
 }
 
 struct AudioState {
@@ -74,6 +96,7 @@ struct App {
     msg: String,
     msg_at: Instant,
     audio: AudioState,
+    trove: TroveState,
     spk_rx: Option<std::sync::mpsc::Receiver<(Vec<heos::HeosPlayer>, bool)>>,
     spk_pending: bool,
     spk_at: Instant,
@@ -105,6 +128,17 @@ impl App {
                 roster: Vec::new(),
                 dlna_ok: false,
                 last_poll: Instant::now() - Duration::from_secs(99),
+            },
+            trove: TroveState {
+                query: String::new(),
+                docs: Vec::new(),
+                total: 0,
+                sel: 0,
+                searching: false,
+                search_rx: None,
+                dl_active: false,
+                dl_rx: None,
+                log: Vec::new(),
             },
             spk_rx: None,
             spk_pending: false,
@@ -317,10 +351,12 @@ fn event_loop(
             last_tick = Instant::now();
             app.poll_mpv();
             app.poll_speaker();
+            poll_trove(app);
             terminal.draw(|f| draw(f, app))?;
         } else {
-            // harvest background speaker results without a full redraw
+            // harvest background results without a full redraw
             app.poll_speaker();
+            poll_trove(app);
         }
     }
 }
@@ -370,6 +406,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             View::Queue => handle_queue(app, code, mods),
             View::Waves => handle_waves(app, code, mods),
             View::Audio => handle_audio(app, code, mods),
+            View::Trove => handle_trove(app, code, mods),
         },
     }
     false
@@ -412,6 +449,153 @@ fn apply_input(app: &mut App, mode: InputMode, val: &str) {
                 app.say(format!("Playlist not found: {}", val.trim()));
             }
         }
+        InputMode::TroveSearch => {
+            let q = val.trim().to_string();
+            if q.is_empty() {
+                return;
+            }
+            app.trove.query = q.clone();
+            app.trove.docs.clear();
+            app.trove.sel = 0;
+            app.trove.searching = true;
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.trove.search_rx = Some(rx);
+            std::thread::spawn(move || {
+                // kind-first-token + default 10 rows, like CLI
+                let mut words: Vec<String> =
+                    q.split_whitespace().map(|s| s.to_string()).collect();
+                let mut kind: Option<String> = None;
+                if !words.is_empty() && crate::trove::is_kind_token(&words[0]) {
+                    kind = Some(words.remove(0));
+                }
+                let query = crate::trove::build_query(kind.as_deref(), &words);
+                let res = crate::trove::search(&query, 10, 1)
+                    .map(|(docs, n)| (docs, n, query))
+                    .map_err(|e| e);
+                let _ = tx.send(res);
+            });
+        }
+    }
+}
+
+/// Harvest finished trove search/download threads (non-blocking).
+fn poll_trove(app: &mut App) {
+    if app.trove.searching {
+        if let Some(rx) = app.trove.search_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok((docs, total, _query))) => {
+                    app.trove.docs = docs;
+                    app.trove.total = total;
+                    app.trove.sel = 0;
+                    app.trove.searching = false;
+                    app.trove.search_rx = None;
+                    app.say(format!(
+                        "{} hits ({} total)",
+                        app.trove.docs.len(),
+                        app.trove.total
+                    ));
+                }
+                Ok(Err(e)) => {
+                    app.trove.searching = false;
+                    app.trove.search_rx = None;
+                    app.say(format!("search failed: {e}"));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.trove.searching = false;
+                    app.trove.search_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        } else {
+            app.trove.searching = false;
+        }
+    }
+    if app.trove.dl_active {
+        if let Some(rx) = app.trove.dl_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(lines) => {
+                    for l in lines {
+                        app.trove.log.push(l);
+                    }
+                    while app.trove.log.len() > 6 {
+                        app.trove.log.remove(0);
+                    }
+                    app.trove.dl_active = false;
+                    app.trove.dl_rx = None;
+                    app.say("download finished — see trove log");
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.trove.dl_active = false;
+                    app.trove.dl_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        } else {
+            app.trove.dl_active = false;
+        }
+    }
+}
+
+fn trove_download(app: &mut App, idxs: Vec<usize>) {
+    if app.trove.dl_active {
+        app.say("download already running");
+        return;
+    }
+    let docs: Vec<crate::trove::Doc> = idxs
+        .into_iter()
+        .filter_map(|i| app.trove.docs.get(i).cloned())
+        .collect();
+    if docs.is_empty() {
+        return;
+    }
+    app.trove.dl_active = true;
+    app.trove.log.push(format!("↓ {} item(s)…", docs.len()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.trove.dl_rx = Some(rx);
+    std::thread::spawn(move || {
+        let mut lines = Vec::new();
+        for d in &docs {
+            match crate::trove::do_download_inner(&d.identifier, &d.mediatype, true) {
+                Ok((ok, n, dir)) => lines.push(format!(
+                    "Done {ok}/{n} {} → {}",
+                    d.identifier,
+                    dir.display()
+                )),
+                Err(e) => lines.push(format!("{}: {e}", d.identifier)),
+            }
+        }
+        let _ = tx.send(lines);
+    });
+}
+
+fn handle_trove(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
+    let n = app.trove.docs.len();
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            if n > 0 {
+                app.trove.sel = (app.trove.sel + 1).min(n - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.trove.sel = app.trove.sel.saturating_sub(1);
+        }
+        KeyCode::Char('s') => {
+            app.input = Some(InputMode::TroveSearch);
+            app.input_buf.clear();
+        }
+        KeyCode::Enter => {
+            trove_download(app, vec![app.trove.sel]);
+        }
+        KeyCode::Char('a') => {
+            trove_download(app, (0..n).collect());
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() => {
+            let idx = c.to_digit(10).unwrap() as usize;
+            if idx >= 1 && idx <= n {
+                trove_download(app, vec![idx - 1]);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -711,6 +895,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Queue => draw_queue(f, app, inner),
         View::Waves => draw_waves(f, app, inner),
         View::Audio => draw_audio(f, app, inner),
+        View::Trove => draw_trove(f, app, inner),
     }
 
     // persistent waves strip — visible at all times, all views
@@ -729,6 +914,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             InputMode::SavePl => "save playlist as",
             InputMode::LoadPl => "load playlist",
             InputMode::RmPl => "remove playlist",
+            InputMode::TroveSearch => "trove search (kind + words)",
         };
         (
             format!(" ✦ {prompt} ✦ "),
@@ -759,6 +945,18 @@ fn draw(f: &mut Frame, app: &mut App) {
                     }
                 }
                 View::Audio => format!("out:{} · spk:{} · tab cycle · q quit", app.cfg.audio_output, app.cfg.audio_speaker),
+                View::Trove => {
+                    let st = if app.trove.searching {
+                        "searching…"
+                    } else if app.trove.dl_active {
+                        "downloading…"
+                    } else if app.trove.docs.is_empty() {
+                        "s to search"
+                    } else {
+                        "enter/1-9 dl · a all"
+                    };
+                    format!("{st} · tab cycle · q quit")
+                }
             };
             lines.push(Line::from(Span::styled(format!("  {hint}"), Style::default().fg(Color::DarkGray))));
         }
@@ -923,6 +1121,66 @@ fn draw_waves(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             gauge_area,
         );
     }
+}
+
+fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let mut rows: Vec<ListItem> = Vec::new();
+    if app.trove.searching {
+        rows.push(ListItem::new(Line::from(Span::styled(
+            "  searching archive.org…",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    } else if app.trove.docs.is_empty() {
+        rows.push(ListItem::new(Line::from(Span::styled(
+            if app.trove.query.is_empty() {
+                "  press s to search free & legal music"
+            } else {
+                "  no results — s to search again"
+            },
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
+    for (i, d) in app.trove.docs.iter().enumerate() {
+        let (l1, l2) = crate::trove::doc_lines(i + 1, d);
+        rows.push(ListItem::new(Line::from(Span::raw(format!("  {l1}")))));
+        let _ = l2;
+        rows.push(ListItem::new(Line::from(Span::styled(
+            format!("      {l2}"),
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
+    for l in app.trove.log.iter().rev().take(3) {
+        rows.push(ListItem::new(Line::from(Span::styled(
+            format!("  {l}"),
+            Style::default().fg(Color::Cyan),
+        ))));
+    }
+    // selection tracks result rows (2 rows per doc)
+    let mut state = ListState::default();
+    if !app.trove.docs.is_empty() {
+        let row = 1 + (app.trove.sel.min(app.trove.docs.len() - 1)) * 2;
+        state.select(Some(row.min(rows.len().saturating_sub(1))));
+    }
+    let title = if app.trove.query.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "  {} hits ({} total) for “{}”",
+            app.trove.docs.len(),
+            app.trove.total,
+            app.trove.query
+        )
+    };
+    if !title.is_empty() {
+        rows.insert(
+            0,
+            ListItem::new(Line::from(Span::styled(title, Style::default().fg(Color::Gray)))),
+        );
+    }
+    let list = List::new(rows)
+        .highlight_style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+        .highlight_symbol("❯ ");
+    f.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {

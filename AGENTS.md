@@ -20,7 +20,7 @@ low volume).
 | Safety | Volume changes print the new level. Test casts at ≤20%. `add_to_queue` cids keep raw `$` (never %-encode). |
 | Secrets | None. LAN-only, no tokens. |
 | State | `~/.config/siren/config.json` (library, output, speaker). DLNA server stays external (minidlna). |
-| Scope | No trove/Internet-Archive in v1. Python `faeOS/bin/siren` is fallback until parity sign-off, then retired. |
+| Scope | Trove landed (CLI + TUI, music scope). Python `faeOS/bin/siren` is fallback until parity sign-off, then retired. |
 
 ## Iteration rule
 

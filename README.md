@@ -5,10 +5,9 @@ network-speaker control, in one remote.
 
 **Status:** default engine (v0.1.0, cut over 2026-09-23). Ported: config,
 library/fuzzy, mpv IPC, queue/playlist, transport CLI, two-box TUI,
-audio menu + `cast` — all live-verified. `~/bin/siren` is the thin
-launcher; Python `faeOS/bin/siren` is fallback until parity sign-off
-(mutagen tags, dir-browser nav deferred).
-**No trove/Internet-Archive support in v1.**
+audio menu + `cast`, trove (CLI + TUI) — all live-verified.
+`~/bin/siren` is the thin launcher; Python `faeOS/bin/siren` is fallback
+until parity sign-off (mutagen tags, dir-browser nav deferred).
 
 ## Layout
 
