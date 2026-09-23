@@ -3,9 +3,11 @@
 faeOS first-party media player. mpv-backed local playback plus HEOS
 network-speaker control, in one remote.
 
-**Status:** engine plays (v0.1.0). Ported: config, library/fuzzy, mpv IPC,
-queue/playlist, transport CLI, two-box TUI, audio menu + `cast`.
-The Python `faeOS/bin/siren` stays fallback until parity sign-off.
+**Status:** default engine (v0.1.0, cut over 2026-09-23). Ported: config,
+library/fuzzy, mpv IPC, queue/playlist, transport CLI, two-box TUI,
+audio menu + `cast` — all live-verified. `~/bin/siren` is the thin
+launcher; Python `faeOS/bin/siren` is fallback until parity sign-off
+(mutagen tags, dir-browser nav deferred).
 **No trove/Internet-Archive support in v1.**
 
 ## Layout
