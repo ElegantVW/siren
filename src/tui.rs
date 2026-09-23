@@ -617,7 +617,7 @@ fn click_at(app: &mut App, row: u16) -> bool {
             if idx < n {
                 app.queue_sel = idx;
                 if double {
-                    queue::play_queue_from(idx, false);
+                    play_queue_output(app, idx);
                 }
                 return true;
             }
@@ -667,7 +667,25 @@ fn apply_input(app: &mut App, mode: InputMode, val: &str) {
                 app.say(format!("Playlist not found: {}", val.trim()));
             } else {
                 queue::replace(tracks);
-                if queue::play_queue_from(0, false) {
+                if app.is_heos() {
+                    let paths: Vec<PathBuf> = queue::snapshot()
+                        .iter()
+                        .map(|t| PathBuf::from(&t.path))
+                        .collect();
+                    let tgt = match app.speaker_target() {
+                        Some(t) => t,
+                        None => {
+                            app.say("no speaker found");
+                            return;
+                        }
+                    };
+                    let (ok, n) = heos::dlna_cast_many(&tgt.0, tgt.1, &paths);
+                    if ok > 0 {
+                        heos::note_cast(&paths[0]);
+                        patch_roster(app, Some("play"), None);
+                    }
+                    app.say(format!("Playing playlist: {name} ({ok}/{n})"));
+                } else if queue::play_queue_from(0, false) {
                     app.say(format!("Playing playlist: {name}"));
                 }
             }
@@ -1054,9 +1072,8 @@ fn handle_queue(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
             app.queue_sel = app.queue_sel.saturating_sub(1);
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
-            if queue::play_queue_from(app.queue_sel, false) {
-                app.say("playing from queue");
-            }
+            let sel = app.queue_sel;
+            play_queue_output(app, sel);
         }
         KeyCode::Char('d') => {
             let items = queue::snapshot();
@@ -1153,6 +1170,35 @@ fn cycle_repeat(app: &mut App) {
     player::send(&serde_json::json!(["set_property", "loop-playlist", if nxt == "all" { "inf" } else { "no" }]));
     player::send(&serde_json::json!(["set_property", "loop-file", if nxt == "track" { "inf" } else { "no" }]));
     app.say(format!("repeat {nxt}"));
+}
+
+/// Play queue from `index`, following `audio_output` (speaker = cast all
+/// in order, first play-now + rest append; local = mpv mirror).
+fn play_queue_output(app: &mut App, index: usize) {
+    if app.is_heos() {
+        let items = queue::snapshot();
+        if index >= items.len() {
+            return;
+        }
+        let paths: Vec<PathBuf> =
+            items[index..].iter().map(|t| PathBuf::from(&t.path)).collect();
+        let tgt = match app.speaker_target() {
+            Some(t) => t,
+            None => {
+                app.say("no speaker found");
+                return;
+            }
+        };
+        app.say(format!("casting {} track(s) → {}…", paths.len(), tgt.2));
+        let (ok, n) = heos::dlna_cast_many(&tgt.0, tgt.1, &paths);
+        if ok > 0 {
+            heos::note_cast(&paths[0]);
+            patch_roster(app, Some("play"), None);
+        }
+        app.say(format!("playing queue ({ok}/{n} on {})", tgt.2));
+    } else if queue::play_queue_from(index, false) {
+        app.say("playing from queue");
+    }
 }
 
 /// Optimistic roster patch: show the commanded state NOW, poll confirms.

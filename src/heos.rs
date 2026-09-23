@@ -681,6 +681,19 @@ pub fn last_cast() -> Option<(std::path::PathBuf, f64)> {
     Some((std::path::PathBuf::from(p), ts))
 }
 
+/// Cast a playlist in order: first aid=1 (play-now), rest aid=3 (append).
+/// Returns (ok_count, total). Slow per track (one DLNA browse each) but exact.
+pub fn dlna_cast_many(ip: &str, pid: i64, paths: &[std::path::PathBuf]) -> (usize, usize) {
+    let mut ok = 0;
+    for (i, p) in paths.iter().enumerate() {
+        let aid = if i == 0 { 1 } else { 3 };
+        if dlna_cast(ip, pid, p, aid).is_ok() {
+            ok += 1;
+        }
+    }
+    (ok, paths.len())
+}
+
 /// Cast a local file to a speaker via DLNA. Copies into /tmp/dlna when the
 /// file isn't already served (~/Music and /tmp/dlna are minidlna roots).
 /// `aid`: 1 play-now (default), 2 play-next, 3 add-to-end, 4 replace-and-play.

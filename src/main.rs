@@ -257,6 +257,12 @@ fn cmd_playlist_load(name: &str) -> i32 {
     }
     // mirror Python play_playlist: replace QUEUE, play from 0
     queue::replace(tracks);
+    let cfg = SirenConfig::load();
+    if use_heos(&cfg) {
+        let paths: Vec<std::path::PathBuf> =
+            queue::snapshot().iter().map(|t| std::path::PathBuf::from(&t.path)).collect();
+        return play_paths_heos(&cfg, &paths, Some(name));
+    }
     if queue::play_queue_from(0, false) {
         println!("Playing playlist: {name}");
         0
@@ -264,6 +270,31 @@ fn cmd_playlist_load(name: &str) -> i32 {
         println!("Playlist not found: {name}");
         1
     }
+}
+
+/// Play local paths on the speaker in order (first play-now, rest append).
+fn play_paths_heos(cfg: &SirenConfig, paths: &[std::path::PathBuf], what: Option<&str>) -> i32 {
+    if paths.is_empty() {
+        println!("Queue empty.");
+        return 1;
+    }
+    let tgt = match heos_target(cfg, None) {
+        Some(t) => t,
+        None => {
+            eprintln!("no speaker found");
+            return 1;
+        }
+    };
+    println!("casting {} track(s) → {}…", paths.len(), tgt.2);
+    let (ok, n) = heos::dlna_cast_many(&tgt.0, tgt.1, paths);
+    if ok > 0 {
+        heos::note_cast(&paths[0]);
+    }
+    match what {
+        Some(name) => println!("Playing playlist: {name} ({ok}/{n} on {})", tgt.2),
+        None => println!("Playing queue ({ok}/{n} on {})", tgt.2),
+    }
+    if ok == 0 { 1 } else { 0 }
 }
 
 fn cmd_queue(rest: &[String]) -> i32 {
@@ -281,8 +312,34 @@ fn cmd_queue(rest: &[String]) -> i32 {
         }
         "list" | "l" | "ls" => queue::cli_list(),
         "clear" | "c" => queue::cli_clear(),
-        "play" | "p" => queue::cli_play(),
-        "next" | "n" => queue::cli_queue_next(),
+        "play" | "p" => {
+            if use_heos(&cfg) {
+                let paths: Vec<std::path::PathBuf> = queue::snapshot()
+                    .iter()
+                    .map(|t| std::path::PathBuf::from(&t.path))
+                    .collect();
+                play_paths_heos(&cfg, &paths, None)
+            } else {
+                queue::cli_play()
+            }
+        }
+        "next" | "n" => {
+            if use_heos(&cfg) {
+                match heos_target(&cfg, None) {
+                    Some(t) => {
+                        heos::play_next(&t.0, t.1);
+                        println!("Next: {}", t.2);
+                        0
+                    }
+                    None => {
+                        eprintln!("no speaker found");
+                        1
+                    }
+                }
+            } else {
+                queue::cli_queue_next()
+            }
+        }
         "remove" | "rm" | "del" | "d" => {
             if rest.len() > 1 {
                 queue::cli_remove(&rest[1])
@@ -1117,6 +1174,34 @@ fn main() -> Result<()> {
             if lib.is_empty() {
                 println!("No tracks found in library.");
                 1
+            } else if use_heos(&cfg) {
+                // speaker: cast one shuffled pick (whole library would be a crawl)
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+                    .hash(&mut h);
+                let pick = &lib[(h.finish() as usize) % lib.len()];
+                match heos_target(&cfg, None) {
+                    Some(t) => match heos::dlna_cast(&t.0, t.1, pick, 1) {
+                        Ok(()) => {
+                            heos::note_cast(pick);
+                            println!("cast {} → {}", pick.display(), t.2);
+                            0
+                        }
+                        Err(e) => {
+                            eprintln!("cast failed: {e}");
+                            1
+                        }
+                    },
+                    None => {
+                        eprintln!("no speaker found");
+                        1
+                    }
+                }
             } else {
                 let paths: Vec<String> =
                     lib.iter().map(|p| p.to_string_lossy().into_owned()).collect();
