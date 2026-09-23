@@ -149,7 +149,27 @@ fn cmd_config(action: Option<String>, key: Option<String>, value: Option<String>
     }
 }
 
+fn use_heos(cfg: &SirenConfig) -> bool {
+    cfg.audio_output == "heos"
+}
+
 fn cmd_play(cfg: &SirenConfig, rest: &[String]) -> i32 {
+    if use_heos(cfg) {
+        // speaker routing: resume, or cast the top match
+        let tgt = match heos_target(cfg, None) {
+            Some(t) => t,
+            None => {
+                eprintln!("no speaker found");
+                return 1;
+            }
+        };
+        if rest.is_empty() {
+            heos::set_state(&tgt.0, tgt.1, "play");
+            println!("Playing: {}", tgt.2);
+            return 0;
+        }
+        return cmd_cast(cfg, rest, None);
+    }
     if rest.is_empty()
         && player::alive()
         && player::get("playlist-count")
@@ -517,47 +537,160 @@ fn main() -> Result<()> {
         },
         Some(Cmd::Play { query }) => cmd_play(&cfg, &query),
         Some(Cmd::Pause) => {
-            queue::cmd_pause();
-            println!("Playback paused / resumed");
-            0
+            if use_heos(&cfg) {
+                match heos_target(&cfg, None) {
+                    Some(t) => {
+                        let to = heos::toggle(&t.0, t.1);
+                        println!("{} → {to}", t.2);
+                        0
+                    }
+                    None => {
+                        eprintln!("no speaker found");
+                        1
+                    }
+                }
+            } else {
+                queue::cmd_pause();
+                println!("Playback paused / resumed");
+                0
+            }
         }
         Some(Cmd::Stop) => {
-            queue::cmd_stop();
-            println!("Playback stopped");
-            0
+            if use_heos(&cfg) {
+                match heos_target(&cfg, None) {
+                    Some(t) => {
+                        heos::set_state(&t.0, t.1, "stop");
+                        println!("{} stopped", t.2);
+                        0
+                    }
+                    None => {
+                        eprintln!("no speaker found");
+                        1
+                    }
+                }
+            } else {
+                queue::cmd_stop();
+                println!("Playback stopped");
+                0
+            }
         }
         Some(Cmd::Next) => {
-            queue::cmd_next();
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            println!("Next: {}", queue::now_label());
-            0
+            if use_heos(&cfg) {
+                match heos_target(&cfg, None) {
+                    Some(t) => {
+                        heos::play_next(&t.0, t.1);
+                        println!("Next: {}", t.2);
+                        0
+                    }
+                    None => {
+                        eprintln!("no speaker found");
+                        1
+                    }
+                }
+            } else {
+                queue::cmd_next();
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                println!("Next: {}", queue::now_label());
+                0
+            }
         }
         Some(Cmd::Prev) => {
-            queue::cmd_prev();
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            println!("Previous: {}", queue::now_label());
-            0
+            if use_heos(&cfg) {
+                match heos_target(&cfg, None) {
+                    Some(t) => {
+                        heos::play_previous(&t.0, t.1);
+                        println!("Previous: {}", t.2);
+                        0
+                    }
+                    None => {
+                        eprintln!("no speaker found");
+                        1
+                    }
+                }
+            } else {
+                queue::cmd_prev();
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                println!("Previous: {}", queue::now_label());
+                0
+            }
         }
         Some(Cmd::Now) => {
-            let label = queue::now_label();
-            if label.is_empty() {
-                println!("Not playing");
+            if use_heos(&cfg) {
+                match heos_target(&cfg, None) {
+                    Some(t) => {
+                        let mut ps = vec![heos::HeosPlayer {
+                            name: t.2.clone(),
+                            pid: t.1,
+                            model: String::new(),
+                            ip: t.0.clone(),
+                            network: String::new(),
+                            state: None,
+                            volume: None,
+                        }];
+                        heos::enrich(&mut ps);
+                        let p = &ps[0];
+                        println!(
+                            "{} — {}, {}",
+                            p.name,
+                            p.state.as_deref().unwrap_or("?"),
+                            p.volume.map(|v| format!("{v}%")).unwrap_or("?".into())
+                        );
+                        0
+                    }
+                    None => {
+                        eprintln!("no speaker found");
+                        1
+                    }
+                }
             } else {
-                println!("{label}");
+                let label = queue::now_label();
+                if label.is_empty() {
+                    println!("Not playing");
+                } else {
+                    println!("{label}");
+                }
+                0
             }
-            0
         }
         Some(Cmd::Status) => {
-            if !player::alive() {
+            if use_heos(&cfg) {
+                match heos_target(&cfg, None) {
+                    Some(t) => {
+                        let mut ps = vec![heos::HeosPlayer {
+                            name: t.2.clone(),
+                            pid: t.1,
+                            model: String::new(),
+                            ip: t.0.clone(),
+                            network: String::new(),
+                            state: None,
+                            volume: None,
+                        }];
+                        heos::enrich(&mut ps);
+                        let p = &ps[0];
+                        println!("status: {}", p.state.as_deref().unwrap_or("?"));
+                        println!("speaker: {} ({})", p.name, p.ip);
+                        println!(
+                            "vol:    {}",
+                            p.volume.map(|v| format!("{v}%")).unwrap_or("?".into())
+                        );
+                        0
+                    }
+                    None => {
+                        eprintln!("no speaker found");
+                        1
+                    }
+                }
+            } else if !player::alive() {
                 let lib = library::scan_library(&cfg);
                 println!("status: idle (no mpv)");
                 println!("library tracks: {}", lib.len());
+                0
             } else {
                 for line in queue::status_lines(&cfg) {
                     println!("{line}");
                 }
+                0
             }
-            0
         }
         Some(Cmd::Random) => {
             let lib = library::scan_library(&cfg);

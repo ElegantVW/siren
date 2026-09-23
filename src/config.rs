@@ -127,6 +127,17 @@ impl SirenConfig {
                 cfg.wave_bands = n as i32;
             }
         }
+        if let Some(s) = v.get("audio_output").and_then(|x| x.as_str()) {
+            match s.to_lowercase().as_str() {
+                "local" | "heos" => cfg.audio_output = s.to_lowercase(),
+                _ => {}
+            }
+        }
+        if let Some(s) = v.get("audio_speaker").and_then(|x| x.as_str()) {
+            if !s.trim().is_empty() {
+                cfg.audio_speaker = s.to_string();
+            }
+        }
         cfg
     }
 

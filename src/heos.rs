@@ -303,6 +303,35 @@ pub fn set_state(ip: &str, pid: i64, state: &str) -> bool {
     ok(&rpc(ip, &[format!("heos://player/set_play_state?pid={pid}&state={state}")]))
 }
 
+pub fn get_state(ip: &str, pid: i64) -> Option<String> {
+    for o in rpc(ip, &[format!("heos://player/get_play_state?pid={pid}")]) {
+        let msg = o
+            .get("heos")
+            .and_then(|h| h.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        for kv in msg.split('&') {
+            if let Some((k, v)) = kv.split_once('=') {
+                if k == "state" {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Toggle play/pause. Returns the state sent.
+pub fn toggle(ip: &str, pid: i64) -> &'static str {
+    let to = if get_state(ip, pid).as_deref() == Some("play") {
+        "pause"
+    } else {
+        "play"
+    };
+    set_state(ip, pid, to);
+    to
+}
+
 pub fn set_volume(ip: &str, pid: i64, level: i32) -> bool {
     let level = level.clamp(0, 100);
     ok(&rpc(ip, &[format!("heos://player/set_volume?pid={pid}&level={level}")]))
