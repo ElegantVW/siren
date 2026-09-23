@@ -9,6 +9,7 @@ mod library;
 mod player;
 mod playlist;
 mod queue;
+mod spectrum;
 mod trove;
 mod tui;
 
@@ -79,6 +80,10 @@ enum Cmd {
     /// Resolve a query against ~/Music (dry)
     Resolve {
         query: Vec<String>,
+    },
+    /// Debug: analyze a file's spectrum, print bars (no playback)
+    Spectrum {
+        path: String,
     },
 }
 
@@ -330,6 +335,14 @@ fn cmd_playlist(rest: &[String]) -> i32 {
     }
 }
 
+fn shellexpand(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/") {
+        format!("{}/{rest}", std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+    } else {
+        p.to_string()
+    }
+}
+
 fn heos_target(cfg: &SirenConfig, hint: Option<&str>) -> Option<(String, i64, String)> {
     let h = hint.map(|s| s.to_string()).or_else(|| {
         if cfg.audio_speaker.trim().is_empty() {
@@ -480,6 +493,7 @@ fn cmd_audio(sub: Option<AudioCmd>) -> i32 {
                     };
                     match heos::dlna_cast(&tgt.0, tgt.1, &p) {
                         Ok(()) => {
+                            heos::note_cast(&p);
                             println!("cast {} → {}", p.display(), tgt.2);
                             0
                         }
@@ -517,6 +531,7 @@ fn cmd_cast(cfg: &SirenConfig, query: &[String], speaker: Option<&str>) -> i32 {
     };
     match heos::dlna_cast(&tgt.0, tgt.1, top) {
         Ok(()) => {
+            heos::note_cast(top);
             println!("cast {} → {}", top.display(), tgt.2);
             0
         }
@@ -768,6 +783,44 @@ fn main() -> Result<()> {
         Some(Cmd::Trove { args }) => cmd_trove(&args),
         Some(Cmd::Queue { args }) => cmd_queue(&args),
         Some(Cmd::Playlist { args }) => cmd_playlist(&args),
+        Some(Cmd::Spectrum { path }) => {
+            use std::path::PathBuf;
+            let p = PathBuf::from(shellexpand(&path));
+            let t0 = std::time::Instant::now();
+            crate::spectrum::request_analyze(&p);
+            // wait for the background worker (bounded)
+            let mut spec = None;
+            for _ in 0..120 {
+                if let Some(s) = crate::spectrum::spectrum_for(&p) {
+                    spec = Some(s);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            match spec {
+                Some(s) => {
+                    println!(
+                        "frames: {}  frame_dur: {:.3}s  total: {:.1}s  (took {:.1}s)",
+                        s.frames.len(),
+                        s.frame_dur,
+                        s.duration,
+                        t0.elapsed().as_secs_f32()
+                    );
+                    for t in [5.0, 30.0, 300.0, 1800.0] {
+                        if t < s.duration {
+                            let row: String =
+                                s.at(t).iter().map(|v| crate::spectrum::bar_glyph(*v)).collect();
+                            println!("  t={t:>6.0}s {row}");
+                        }
+                    }
+                    0
+                }
+                None => {
+                    eprintln!("analyze failed");
+                    1
+                }
+            }
+        }
         Some(Cmd::Resolve { query }) => {
             let hits = library::resolve_play_args(
                 &cfg,

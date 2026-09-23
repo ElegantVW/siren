@@ -7,8 +7,10 @@
 //!   `1$4` (All Music) / `1$14` (Folders) / `64` / `1`
 
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 pub const DEFAULT_SPEAKER: &str = "Vanguarda Office";
@@ -74,30 +76,63 @@ fn split_objects(text: &str) -> Vec<Value> {
     out
 }
 
-pub fn rpc(ip: &str, uris: &[String]) -> Vec<Value> {
-    let mut stream = match TcpStream::connect_timeout(
+/// Persistent command connections (one per speaker): kills the TCP
+/// handshake-per-command latency. Serialized by mutex; never subscribed
+/// to change events, so traffic stays strict request→reply.
+static POOL: OnceLock<Mutex<HashMap<String, TcpStream>>> = OnceLock::new();
+
+fn pool() -> &'static Mutex<HashMap<String, TcpStream>> {
+    POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fresh_conn(ip: &str) -> Option<TcpStream> {
+    let s = TcpStream::connect_timeout(
         &format!("{ip}:1255").parse().unwrap(),
         Duration::from_secs(3),
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
+    )
+    .ok()?;
+    s.set_read_timeout(Some(Duration::from_millis(600))).ok()?;
+    s.set_write_timeout(Some(Duration::from_secs(3))).ok()?;
+    Some(s)
+}
+
+fn rpc_once(stream: &mut TcpStream, uris: &[String]) -> Option<Vec<Value>> {
     for u in uris {
-        if stream.write_all(format!("{u}\n").as_bytes()).is_err() {
-            return Vec::new();
-        }
+        stream.write_all(format!("{u}\n").as_bytes()).ok()?;
     }
-    stream.set_read_timeout(Some(Duration::from_millis(600))).ok();
     let mut data = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => data.extend_from_slice(&buf[..n]),
-            Err(_) => break,
+            Err(_) => break, // idle gap = end of this batch's replies
         }
     }
-    split_objects(&String::from_utf8_lossy(&data))
+    if data.is_empty() {
+        return None;
+    }
+    Some(split_objects(&String::from_utf8_lossy(&data)))
+}
+
+pub fn rpc(ip: &str, uris: &[String]) -> Vec<Value> {
+    // try pooled connection, reconnect once on failure
+    {
+        let mut pool = pool().lock().unwrap();
+        if let Some(s) = pool.get_mut(ip) {
+            if let Some(v) = rpc_once(s, uris) {
+                return v;
+            }
+            pool.remove(ip);
+        }
+    }
+    if let Some(mut s) = fresh_conn(ip) {
+        if let Some(v) = rpc_once(&mut s, uris) {
+            pool().lock().unwrap().insert(ip.to_string(), s);
+            return v;
+        }
+    }
+    Vec::new()
 }
 
 fn ok(objs: &[Value]) -> bool {
@@ -477,6 +512,33 @@ fn dlna_find(ip: &str, sid: i64, target: &std::path::Path) -> Option<(String, St
         }
     }
     None
+}
+
+/// Record a cast for the TUI's elapsed-time clock (firmware gives no
+/// position API). Readers (TUI strip) interpolate from this.
+pub fn note_cast(path: &std::path::Path) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let dir = format!("{home}/.cache/siren");
+    let _ = std::fs::create_dir_all(&dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let v = serde_json::json!({
+        "path": path.to_string_lossy(),
+        "ts": now,
+    });
+    let _ = std::fs::write(format!("{dir}/heos-now.json"), v.to_string());
+}
+
+/// Last cast recorded by any siren (CLI or TUI): (path, epoch secs).
+pub fn last_cast() -> Option<(std::path::PathBuf, f64)> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let raw = std::fs::read_to_string(format!("{home}/.cache/siren/heos-now.json")).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let p = v.get("path")?.as_str()?;
+    let ts = v.get("ts")?.as_f64()?;
+    Some((std::path::PathBuf::from(p), ts))
 }
 
 /// Cast a local file to a speaker via DLNA. Copies into /tmp/dlna when the

@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
 use std::io;
@@ -23,24 +23,16 @@ use std::time::{Duration, Instant};
 enum View {
     Browser,
     Queue,
-    Waves,
     Audio,
     Trove,
 }
-const VIEWS: [View; 5] = [
-    View::Browser,
-    View::Queue,
-    View::Waves,
-    View::Audio,
-    View::Trove,
-];
+const VIEWS: [View; 4] = [View::Browser, View::Queue, View::Audio, View::Trove];
 
 impl View {
     fn title(&self) -> &'static str {
         match self {
             View::Browser => "browser",
             View::Queue => "queue",
-            View::Waves => "waves",
             View::Audio => "audio",
             View::Trove => "trove",
         }
@@ -49,10 +41,45 @@ impl View {
         match self {
             View::Browser => "enter play · a add · c cast · / filter · S save · L load · R rm",
             View::Queue => "enter play-from · d remove · c clear",
-            View::Waves => "p pause · n/b next/prev · s shuffle · r repeat · W bands · +/- vol",
-            View::Audio => "o output · s speaker · v refresh · t test-cast · m mute · +/- vol",
+            View::Audio => "o output · s speaker · S shuffle · r repeat · p pause · v refresh · t test · m mute",
             View::Trove => "s search · enter pick vers · 1-9 dl · a all · f format · j/k move",
         }
+    }
+}
+
+/// Pause-aware elapsed clock for speaker playback (firmware has no position API).
+struct HeosClock {
+    path: Option<PathBuf>,
+    start_epoch: f64,
+    paused_acc: f64,
+    last_tick: Instant,
+}
+
+impl HeosClock {
+    /// Seconds into the current cast, or None when unknown.
+    fn tick(&mut self, playing: Option<bool>) -> Option<f64> {
+        let now_ep = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        // re-read the cast record; reset on change
+        if let Some((p, ts)) = heos::last_cast() {
+            if self.path.as_ref() != Some(&p) || (self.start_epoch - ts).abs() > 0.5 {
+                self.path = Some(p);
+                self.start_epoch = ts;
+                self.paused_acc = 0.0;
+            }
+        }
+        let dt = self.last_tick.elapsed().as_secs_f64();
+        self.last_tick = Instant::now();
+        match playing {
+            Some(false) => self.paused_acc += dt,
+            _ => {}
+        }
+        if self.path.is_none() {
+            return None;
+        }
+        Some((now_ep - self.start_epoch - self.paused_acc).max(0.0))
     }
 }
 
@@ -110,6 +137,8 @@ struct App {
     spk_pending: bool,
     spk_at: Instant,
     spk_force: bool,
+    heos_clock: HeosClock,
+    heos_elapsed: Option<f64>,
     mpv_label: String,
     mpv_pos: f64,
     mpv_dur: f64,
@@ -159,6 +188,13 @@ impl App {
             spk_pending: false,
             spk_at: Instant::now() - Duration::from_secs(99),
             spk_force: true,
+            heos_clock: HeosClock {
+                path: None,
+                start_epoch: 0.0,
+                paused_acc: 0.0,
+                last_tick: Instant::now(),
+            },
+            heos_elapsed: None,
             mpv_label: String::new(),
             mpv_pos: 0.0,
             mpv_dur: 0.0,
@@ -281,6 +317,7 @@ impl App {
                 }
                 let next = (lvl + delta as i32).clamp(0, 100);
                 if heos::set_volume(&ip, pid, next) {
+                    patch_roster(self, None, Some(next)); // optimistic
                     self.say(format!("{name} volume → {next}%"));
                 } else {
                     self.say("volume failed");
@@ -307,7 +344,18 @@ impl App {
         let (ip, pid, name) = target;
         self.say(format!("casting {} → {name}…", path_name(path)));
         match heos::dlna_cast(&ip, pid, path) {
-            Ok(()) => self.say(format!("▶ {} on {name}", path_name(path))),
+            Ok(()) => {
+                heos::note_cast(path);
+                // reset the elapsed clock + optimistic play state
+                self.heos_clock.path = Some(path.clone());
+                self.heos_clock.start_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                self.heos_clock.paused_acc = 0.0;
+                patch_roster(self, Some("play"), None);
+                self.say(format!("▶ {} on {name}", path_name(path)))
+            }
             Err(e) => self.say(format!("cast failed: {e}")),
         }
     }
@@ -383,6 +431,10 @@ fn event_loop(
             last_tick = Instant::now();
             app.poll_mpv();
             app.poll_speaker();
+            // speaker playing-state for the elapsed clock (roster may lag;
+            // actions patch it optimistically, so this stays truthful)
+            let playing = speaker_entry(app).and_then(|p| p.state).map(|s| s == "play");
+            app.heos_elapsed = app.heos_clock.tick(playing);
             poll_trove(app);
             terminal.draw(|f| draw(f, app))?;
         } else {
@@ -423,6 +475,23 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
     }
 
     match code {
+        // global transport (all views; waves tab is gone)
+        KeyCode::Char('n') => {
+            transport_next(app);
+            return false;
+        }
+        KeyCode::Char('b') => {
+            transport_prev(app);
+            return false;
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            app.adjust_volume(5);
+            return false;
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            app.adjust_volume(-5);
+            return false;
+        }
         KeyCode::Tab => {
             app.focus = (app.focus + 1) % VIEWS.len();
             if app.view() == View::Audio {
@@ -445,7 +514,6 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
         _ => match app.view() {
             View::Browser => handle_browser(app, code, mods),
             View::Queue => handle_queue(app, code, mods),
-            View::Waves => handle_waves(app, code, mods),
             View::Audio => handle_audio(app, code, mods),
             View::Trove => handle_trove(app, code, mods),
         },
@@ -967,8 +1035,6 @@ fn handle_browser(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             app.input = Some(InputMode::RmPl);
             app.input_buf.clear();
         }
-        KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_volume(5),
-        KeyCode::Char('-') | KeyCode::Char('_') => app.adjust_volume(-5),
         _ => {
             let _ = mods;
         }
@@ -1022,8 +1088,6 @@ fn handle_queue(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
             app.input = Some(InputMode::RmPl);
             app.input_buf.clear();
         }
-        KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_volume(5),
-        KeyCode::Char('-') | KeyCode::Char('_') => app.adjust_volume(-5),
         _ => {}
     }
 }
@@ -1032,6 +1096,7 @@ fn mpv_toggle_pause(app: &mut App) {
     if app.is_heos() {
         if let Some((ip, pid, name)) = app.speaker_target() {
             let to = heos::toggle(&ip, pid);
+            patch_roster(app, Some(to), None); // optimistic: show now
             app.say(format!("{name} → {to}"));
         } else {
             app.say("no speaker found");
@@ -1041,75 +1106,75 @@ fn mpv_toggle_pause(app: &mut App) {
     }
 }
 
-fn handle_waves(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
-    match code {
-        KeyCode::Char('p') | KeyCode::Char(' ') => mpv_toggle_pause(app),
-        KeyCode::Char('n') => {
-            if app.is_heos() {
-                if let Some((ip, pid, _)) = app.speaker_target() {
-                    heos::play_next(&ip, pid);
-                }
-            } else {
-                queue::cmd_next();
+/// Transport following `audio_output` (shared by global keys).
+fn transport_next(app: &mut App) {
+    if app.is_heos() {
+        if let Some((ip, pid, _)) = app.speaker_target() {
+            heos::play_next(&ip, pid);
+        }
+    } else {
+        queue::cmd_next();
+    }
+}
+
+fn transport_prev(app: &mut App) {
+    if app.is_heos() {
+        if let Some((ip, pid, _)) = app.speaker_target() {
+            heos::play_previous(&ip, pid);
+        }
+    } else {
+        queue::cmd_prev();
+    }
+}
+
+fn toggle_shuffle(app: &mut App) {
+    let cur = player::get_bool("shuffle", false);
+    player::send(&serde_json::json!(["set_property", "shuffle", !cur]));
+    app.say(format!("shuffle {}", if !cur { "on" } else { "off" }));
+}
+
+fn cycle_repeat(app: &mut App) {
+    // off → all → track → off
+    let lp = player::get("loop-playlist").and_then(|v| v.as_str().map(|s| s.to_string()));
+    let lf = player::get("loop-file").and_then(|v| v.as_str().map(|s| s.to_string()));
+    let cur = if matches!(lp.as_deref(), Some("inf") | Some("yes")) {
+        "all"
+    } else if matches!(lf.as_deref(), Some("inf") | Some("yes")) {
+        "track"
+    } else {
+        "off"
+    };
+    let nxt = match cur {
+        "off" => "all",
+        "all" => "track",
+        _ => "off",
+    };
+    player::send(&serde_json::json!(["set_property", "loop-playlist", if nxt == "all" { "inf" } else { "no" }]));
+    player::send(&serde_json::json!(["set_property", "loop-file", if nxt == "track" { "inf" } else { "no" }]));
+    app.say(format!("repeat {nxt}"));
+}
+
+/// Optimistic roster patch: show the commanded state NOW, poll confirms.
+fn patch_roster(app: &mut App, state: Option<&str>, vol: Option<i32>) {
+    let hint = app.cfg.audio_speaker.to_lowercase();
+    for p in app.audio.roster.iter_mut() {
+        if p.name.to_lowercase().contains(&hint) {
+            if let Some(s) = state {
+                p.state = Some(s.to_string());
             }
-        }
-        KeyCode::Char('b') => {
-            if app.is_heos() {
-                if let Some((ip, pid, _)) = app.speaker_target() {
-                    heos::play_previous(&ip, pid);
-                }
-            } else {
-                queue::cmd_prev();
+            if let Some(v) = vol {
+                p.volume = Some(v);
             }
+            return;
         }
-        KeyCode::Char('s') => {
-            let cur = player::get_bool("shuffle", false);
-            player::send(&serde_json::json!(["set_property", "shuffle", !cur]));
-            app.say(format!("shuffle {}", if !cur { "on" } else { "off" }));
-        }
-        KeyCode::Char('r') => {
-            // off → all → track → off
-            let lp = player::get("loop-playlist").and_then(|v| v.as_str().map(|s| s.to_string()));
-            let lf = player::get("loop-file").and_then(|v| v.as_str().map(|s| s.to_string()));
-            let cur = if matches!(lp.as_deref(), Some("inf") | Some("yes")) {
-                "all"
-            } else if matches!(lf.as_deref(), Some("inf") | Some("yes")) {
-                "track"
-            } else {
-                "off"
-            };
-            let nxt = match cur {
-                "off" => "all",
-                "all" => "track",
-                _ => "off",
-            };
-            player::send(&serde_json::json!(["set_property", "loop-playlist", if nxt == "all" { "inf" } else { "no" }]));
-            player::send(&serde_json::json!(["set_property", "loop-file", if nxt == "track" { "inf" } else { "no" }]));
-            app.say(format!("repeat {nxt}"));
-        }
-        KeyCode::Char('W') => {
-            let nxt = match app.cfg.wave_bands {
-                16 => 32,
-                32 => 8,
-                _ => 16,
-            };
-            app.cfg.wave_bands = nxt;
-            let _ = app.cfg.save();
-            app.say(format!("bands {nxt}"));
-        }
-        KeyCode::Char('w') => {
-            app.cfg.waves = !app.cfg.waves;
-            let _ = app.cfg.save();
-            app.say(format!("waves {}", if app.cfg.waves { "on" } else { "off" }));
-        }
-        KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_volume(5),
-        KeyCode::Char('-') | KeyCode::Char('_') => app.adjust_volume(-5),
-        _ => {}
     }
 }
 
 fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
     match code {
+        KeyCode::Char('p') | KeyCode::Char(' ') => mpv_toggle_pause(app),
+        KeyCode::Char('S') => toggle_shuffle(app),
+        KeyCode::Char('r') => cycle_repeat(app),
         KeyCode::Char('o') => {
             app.cfg.audio_output = if app.is_heos() { "local".into() } else { "heos".into() };
             let _ = app.cfg.save();
@@ -1160,13 +1225,12 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                 }
                 if heos::set_mute(&ip, pid, !muted) {
                     app.say(format!("{name} mute → {}", if !muted { "on" } else { "off" }));
+                    app.force_speaker_poll();
                 }
             } else {
                 app.say("no speaker found");
             }
         }
-        KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_volume(5),
-        KeyCode::Char('-') | KeyCode::Char('_') => app.adjust_volume(-5),
         _ => {}
     }
 }
@@ -1189,6 +1253,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let top_title = format!(" ✦ siren · {} · out:{out_tag} ✦ ", focus.title());
     let top_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(top_title)
         .border_style(Style::default().fg(Color::Magenta));
     let inner = top_block.inner(chunks[0]);
@@ -1196,7 +1261,6 @@ fn draw(f: &mut Frame, app: &mut App) {
     match focus {
         View::Browser => draw_browser(f, app, inner),
         View::Queue => draw_queue(f, app, inner),
-        View::Waves => draw_waves(f, app, inner),
         View::Audio => draw_audio(f, app, inner),
         View::Trove => draw_trove(f, app, inner),
     }
@@ -1204,6 +1268,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     // persistent waves strip — visible at all times, all views
     let wave_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(" ✦ waves ✦ ")
         .border_style(Style::default().fg(Color::DarkGray));
     let wave_inner = wave_block.inner(chunks[1]);
@@ -1240,13 +1305,6 @@ fn draw(f: &mut Frame, app: &mut App) {
             let hint = match focus {
                 View::Browser => format!("{} tracks · tab cycle · q quit", app.filtered().len()),
                 View::Queue => format!("{} queued · tab cycle · q quit", queue::snapshot().len()),
-                View::Waves => {
-                    if app.mpv_label.is_empty() {
-                        "idle · tab cycle · q quit".into()
-                    } else {
-                        format!("{} · tab cycle · q quit", app.mpv_label)
-                    }
-                }
                 View::Audio => format!("out:{} · spk:{} · tab cycle · q quit", app.cfg.audio_output, app.cfg.audio_speaker),
                 View::Trove => {
                     let st = if app.trove.searching {
@@ -1267,6 +1325,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     };
     let menu_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(menu_title)
         .border_style(Style::default().fg(Color::DarkGray));
     let menu_inner = menu_block.inner(chunks[2]);
@@ -1320,18 +1379,31 @@ fn draw_queue(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
 
 /// Waves body — shared by the persistent strip and the waves view.
 /// Follows `audio_output`: speaker state when heos, mpv when local.
+/// Speaker entry matching the configured speaker (or first seen).
+fn speaker_entry(app: &App) -> Option<heos::HeosPlayer> {
+    app.audio
+        .roster
+        .iter()
+        .find(|p| p.name.to_lowercase().contains(&app.cfg.audio_speaker.to_lowercase()))
+        .or_else(|| app.audio.roster.first())
+        .cloned()
+}
+
+/// Real 64-bar EQ row for a track at `secs` ("analyzing…" until decoded).
+fn eq_row(app: &App, path: &PathBuf, secs: f64) -> String {
+    crate::spectrum::request_analyze(path);
+    match crate::spectrum::spectrum_for(path) {
+        Some(spec) => spec.at(secs).iter().map(|v| crate::spectrum::bar_glyph(*v)).collect(),
+        None => "analyzing…".into(),
+    }
+}
+
+/// Waves strip body — always visible. Real spectrum (mpv time-pos local,
+/// pause-aware elapsed clock on speaker); label follows `audio_output`.
 fn waves_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if app.is_heos() {
-        let spk = app
-            .audio
-            .roster
-            .iter()
-            .find(|p| {
-                p.name.to_lowercase().contains(&app.cfg.audio_speaker.to_lowercase())
-            })
-            .or_else(|| app.audio.roster.first());
-        match spk {
+        match speaker_entry(app) {
             Some(p) => {
                 let playing = p.state.as_deref() == Some("play");
                 lines.push(Line::from(vec![
@@ -1347,10 +1419,11 @@ fn waves_lines(app: &App) -> Vec<Line<'static>> {
                         p.volume.map(|v| format!("  {v}%")).unwrap_or_default()
                     )),
                 ]));
-                lines.push(Line::from(Span::styled(
-                    "  heos output · v in audio view",
-                    Style::default().fg(Color::DarkGray),
-                )));
+                let bars = match (&app.heos_clock.path, app.heos_elapsed) {
+                    (Some(path), Some(secs)) => eq_row(app, path, secs),
+                    _ => "analyzing…".into(),
+                };
+                lines.push(Line::from(Span::raw(format!("  {bars}"))));
             }
             None => {
                 lines.push(Line::from(Span::raw(format!("  heos → {}", app.cfg.audio_speaker))));
@@ -1382,48 +1455,10 @@ fn waves_lines(app: &App) -> Vec<Line<'static>> {
         ),
         Span::raw(label),
     ]));
-    let ratio = if app.mpv_dur > 0.0 {
-        (app.mpv_pos / app.mpv_dur).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let bar_w = 24;
-    let filled = (ratio * bar_w as f64) as usize;
-    let bar: String = "█".repeat(filled) + &"░".repeat(bar_w - filled);
-    lines.push(Line::from(Span::raw(format!(
-        "  {bar} {} / {}",
-        queue::fmt_clock(app.mpv_pos),
-        queue::fmt_clock(app.mpv_dur)
-    ))));
+    let p = player::now_path();
+    let bars = if p.is_empty() { "—".into() } else { eq_row(app, &PathBuf::from(&p), app.mpv_pos) };
+    lines.push(Line::from(Span::raw(format!("  {bars}"))));
     lines
-}
-
-fn draw_waves(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
-    let mut lines = waves_lines(app);
-    if !lines.is_empty() && !app.mpv_label.is_empty() {
-        // volume bar (wave_bands wide, nod to the EQ) — view-only extra
-        let vb = app.cfg.wave_bands.max(8) as usize;
-        let vf = ((app.mpv_vol as usize * vb) / 150).min(vb);
-        let vbar: String = "█".repeat(vf) + &"░".repeat(vb - vf);
-        lines.push(Line::from(Span::raw(format!("  vol {vbar} {}%", app.mpv_vol))));
-    }
-    f.render_widget(Paragraph::new(lines), area);
-    if app.mpv_dur > 0.0 && area.height > 6 {
-        let gauge_area = ratatui::layout::Rect {
-            x: area.x,
-            y: area.y + area.height - 1,
-            width: area.width,
-            height: 1,
-        };
-        let ratio = (app.mpv_pos / app.mpv_dur).clamp(0.0, 1.0);
-        f.render_widget(
-            Gauge::default()
-                .ratio(ratio)
-                .gauge_style(Style::default().fg(Color::Magenta))
-                .label(""),
-            gauge_area,
-        );
-    }
 }
 
 fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {

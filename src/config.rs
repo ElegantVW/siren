@@ -123,7 +123,7 @@ impl SirenConfig {
             }
         }
         if let Some(n) = v.get("wave_bands").and_then(|x| x.as_i64()) {
-            if [8, 16, 32].contains(&n) {
+            if [8, 16, 32, 64].contains(&n) {
                 cfg.wave_bands = n as i32;
             }
         }
@@ -197,12 +197,13 @@ impl SirenConfig {
                 }
                 Ok(if b { "on".into() } else { "off".into() })
             }
+            // accepted for compat; the strip renders a fixed 64-bar field
             "wave_bands" => match val.trim() {
-                "8" | "16" | "32" => {
+                "8" | "16" | "32" | "64" => {
                     self.wave_bands = val.trim().parse().unwrap();
                     Ok(val.trim().to_string())
                 }
-                _ => Err("expects 8, 16 or 32".to_string()),
+                _ => Err("expects 8, 16, 32 or 64".to_string()),
             },
             "audio_output" => match val.trim().to_lowercase().as_str() {
                 "local" | "heos" => {
