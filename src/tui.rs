@@ -42,7 +42,7 @@ impl View {
             View::Browser => "enter open/play · a add · c cast · backspace up · / filter · S save · L load · R rm",
             View::Queue => "enter play-from · d remove · c clear",
             View::Audio => "o output · s speaker · S shuffle · r repeat · p pause · v refresh · t test · m mute",
-            View::Trove => "s search · enter vers · j/k · m more · a all · f format · 1-9 dl",
+            View::Trove => "s search · enter vers · d dl · j/k · m more · a all · f format",
         }
     }
 }
@@ -124,6 +124,8 @@ struct TroveState {
     fmt_opts: Vec<String>,
     fmt_rx: Option<std::sync::mpsc::Receiver<(usize, Vec<String>)>>,
     fmt_pending: bool,
+    /// first `a` arms (shows count), second consecutive `a` downloads all
+    all_armed: bool,
 }
 
 struct AudioState {
@@ -211,6 +213,7 @@ impl App {
                 fmt_opts: Vec::new(),
                 fmt_rx: None,
                 fmt_pending: false,
+                all_armed: false,
             },
             spk_rx: None,
             spk_pending: false,
@@ -813,6 +816,11 @@ fn apply_input(app: &mut App, mode: InputMode, val: &str) {
             app.trove.exhausted = false;
             app.trove.loading_more = false;
             app.trove.more_rx = None;
+            app.trove.all_armed = false;
+            app.trove.fmt_for = None;
+            app.trove.fmt_opts.clear();
+            app.trove.fmt_pending = false;
+            app.trove.fmt_rx = None;
             app.trove.searching = true;
             let (tx, rx) = std::sync::mpsc::channel();
             app.trove.search_rx = Some(rx);
@@ -888,6 +896,7 @@ fn poll_trove(app: &mut App) {
                     app.trove.total = total;
                     app.trove.sel = 0;
                     app.trove.page = 1;
+                    app.trove.all_armed = false;
                     app.trove.searching = false;
                     app.trove.search_rx = None;
                     app.trove.exhausted = trove_page_short(app.trove.docs.len(), total);
@@ -1130,13 +1139,13 @@ const SESSION_FMTS: &[&str] = &["mp3", "flac", "ogg", "wav", "opus", "m4a", "all
 
 fn handle_trove(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
     let n = app.trove.docs.len();
-    // format-choice row eats number keys first
+    // version picker is modal: digits pick a version, Esc cancels,
+    // everything else is swallowed so 1-9 never double as download keys
     if app.trove.fmt_for.is_some() {
         match code {
             KeyCode::Esc => {
                 app.trove.fmt_for = None;
                 app.trove.fmt_opts.clear();
-                return;
             }
             KeyCode::Char(c) if c.is_ascii_digit() => {
                 let k = c.to_digit(10).unwrap() as usize;
@@ -1146,10 +1155,14 @@ fn handle_trove(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                     app.trove.fmt_opts.clear();
                     trove_download(app, vec![idx], Some(f));
                 }
-                return;
             }
             _ => {}
         }
+        return;
+    }
+    // second consecutive `a` confirms download-all; anything else disarms
+    if !matches!(code, KeyCode::Char('a')) {
+        app.trove.all_armed = false;
     }
     match code {
         KeyCode::Char('j') | KeyCode::Down => {
@@ -1172,21 +1185,35 @@ fn handle_trove(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
             }
         }
         KeyCode::Enter => {
-            trove_ask_format(app, app.trove.sel);
+            if app.trove.sel < n {
+                trove_ask_format(app, app.trove.sel);
+            }
+        }
+        // instant download of the cursor row with the session format
+        KeyCode::Char('d') => {
+            if app.trove.sel < n {
+                trove_download(app, vec![app.trove.sel], None);
+            }
         }
         KeyCode::Char('a') => {
-            trove_download(app, (0..n).collect(), None);
+            if n == 0 {
+                return;
+            }
+            if app.trove.all_armed {
+                app.trove.all_armed = false;
+                trove_download(app, (0..n).collect(), None);
+            } else {
+                app.trove.all_armed = true;
+                app.say(format!(
+                    "press a again to download {n} items [{}]",
+                    app.trove.fmt
+                ));
+            }
         }
         KeyCode::Char('f') => {
             let cur = SESSION_FMTS.iter().position(|f| *f == app.trove.fmt).unwrap_or(0);
             app.trove.fmt = SESSION_FMTS[(cur + 1) % SESSION_FMTS.len()].to_string();
             app.say(format!("trove format → {}", app.trove.fmt));
-        }
-        KeyCode::Char(c) if c.is_ascii_digit() => {
-            let idx = c.to_digit(10).unwrap() as usize;
-            if idx >= 1 && idx <= n {
-                trove_download(app, vec![idx - 1], None);
-            }
         }
         _ => {}
     }
