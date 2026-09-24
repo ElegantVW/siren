@@ -62,7 +62,7 @@ impl Queue {
     pub fn validate(&mut self) -> Vec<(QueueItem, String)> {
         let mut removed = Vec::new();
         self.items.retain(|it| {
-            if Path::new(&it.path).exists() {
+            if crate::meta::is_url(&it.path) || Path::new(&it.path).exists() {
                 true
             } else {
                 removed.push((it.clone(), "missing".to_string()));
@@ -153,7 +153,10 @@ pub fn ensure_loaded() {
     let mut items = Vec::new();
     for t in arr {
         let path = t.get("path").and_then(|x| x.as_str()).unwrap_or("");
-        if path.is_empty() || !std::path::Path::new(path).exists() {
+        // streams (radio) persist as URL items — no local file to check
+        if path.is_empty()
+            || (!crate::meta::is_url(path) && !std::path::Path::new(path).exists())
+        {
             continue;
         }
         items.push(QueueItem {
@@ -365,6 +368,25 @@ pub fn cmd_pause() {
 pub fn now_label() -> String {
     let p = player::now_path();
     if !p.is_empty() {
+        // streams: mpv path is the URL — the queued item holds the name
+        // (persisted queue.json, so fresh `siren now` processes work too)
+        if crate::meta::is_url(&p) {
+            let q = queue();
+            if let Some(it) = q.items.iter().find(|it| it.path == p) {
+                if !it.display.is_empty() {
+                    return it.display.clone();
+                }
+            }
+            drop(q);
+            let lbl = LAST_LABEL
+                .get_or_init(|| Mutex::new(String::new()))
+                .lock()
+                .unwrap()
+                .clone();
+            if !lbl.is_empty() {
+                return lbl;
+            }
+        }
         return display_of(&p);
     }
     LAST_LABEL
@@ -466,7 +488,12 @@ pub fn cli_list() -> i32 {
     }
     for (i, it) in q.items.iter().enumerate() {
         let mark = if i == 0 { "▶" } else { " " };
-        let d = crate::meta::display_sync(&it.path);
+        // stored labels win (streams keep station names); files re-probe
+        let d = if it.display.is_empty() {
+            crate::meta::display_sync(&it.path)
+        } else {
+            it.display.clone()
+        };
         println!("  {mark} {:3}. {d}", i + 1);
     }
     0
@@ -482,7 +509,7 @@ pub fn cli_play() -> i32 {
         let mut kept = Vec::new();
         let mut gone = Vec::new();
         for it in q.items.drain(..) {
-            if Path::new(&it.path).exists() {
+            if crate::meta::is_url(&it.path) || Path::new(&it.path).exists() {
                 kept.push(it);
             } else {
                 gone.push(it);

@@ -18,8 +18,8 @@ Python `faeOS/bin/siren` is archived (tests/rollback only).
 ## TUI (target)
 
 Two boxes + a persistent waves strip. Top = content view (Tab cycles
-browser → queue → audio → trove). Bottom = context menu of the focused
-view (Option A):
+browser → queue → audio → trove → radio). Bottom = context menu of the
+focused view (Option A):
 
 | Focus   | Bottom menu                          |
 |---------|--------------------------------------|
@@ -27,6 +27,7 @@ view (Option A):
 | queue   | play-from · remove · clear            |
 | audio   | output local\|heos · speaker · vol · test-cast |
 | trove   | search · pick version · download      |
+| radio   | play · country · search · fav · more  |
 
 ## Audio (target)
 
@@ -61,10 +62,32 @@ siren trove get <identifier>
 siren trove about
 ```
 
-TUI: 4th Tab stop (`trove`), `s` search · `enter` pick version · `j/k` +
-auto-prefetch near the end · `m` more · `1-9` dl · `a` all · `f` session
-format · mouse wheel + click select, double-click acts. Search, metadata
-and downloads run in background threads.
+TUI: 4th Tab stop (`trove`), `s` search · `enter` pick version · `d`
+download cursor · `j/k` + auto-prefetch near the end · `m` more · `a`
+all (double-press) · `f` session format · mouse wheel + click select,
+double-click acts. Search, metadata and downloads run in background
+threads.
+
+## Radio
+
+Community stations (radio-browser.info, keyless), same output channel
+as music — local mpv or speaker `play_stream`:
+
+```
+siren radio countries         list countries (a-z)
+siren radio stations Portugal stations for a country
+siren radio search lofi       search by name
+siren radio play <words>      play top match
+siren radio fav               list favorites
+siren radio fav <words>       toggle favorite
+```
+
+TUI: 5th Tab stop (`radio`). `Enter` with no country opens the country
+picker (a-z, cached a week); `Enter`/`d` plays the cursor row, `c`
+re-picks country, `s` searches, `f` toggles favorite (★ pinned on top),
+`m` more. Favorites + last country persist in
+`~/.config/siren/radio.json`. Streams ride the queue as URL items
+(station name as label); speaker `play_stream` verified live.
 Guards: `.part` resume, skip-if-exists, 40-file cap, 32MB confirm,
 `TROVE_MAX_TOTAL`. Lands in `~/Music/trove/<identifier>`.
 

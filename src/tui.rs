@@ -2,7 +2,7 @@
 //! Tab cycles browser → queue → waves → audio. Waves stays on top.
 //! Playback stays mpv-over-IPC; audio view + `c` drive the HEOS speaker.
 
-use crate::{config::SirenConfig, heos, library, player, playlist, queue};
+use crate::{config::SirenConfig, heos, library, player, playlist, queue, radio};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind},
     execute,
@@ -25,8 +25,15 @@ enum View {
     Queue,
     Audio,
     Trove,
+    Radio,
 }
-const VIEWS: [View; 4] = [View::Browser, View::Queue, View::Audio, View::Trove];
+const VIEWS: [View; 5] = [
+    View::Browser,
+    View::Queue,
+    View::Audio,
+    View::Trove,
+    View::Radio,
+];
 
 impl View {
     fn title(&self) -> &'static str {
@@ -35,6 +42,7 @@ impl View {
             View::Queue => "queue",
             View::Audio => "audio",
             View::Trove => "trove",
+            View::Radio => "radio",
         }
     }
     fn menu(&self) -> &'static str {
@@ -43,6 +51,7 @@ impl View {
             View::Queue => "enter play-from · d remove · c clear",
             View::Audio => "o output · s speaker · S shuffle · r repeat · p pause · v refresh · t test · m mute",
             View::Trove => "s search · enter vers · d dl · j/k · m more · a all · f format",
+            View::Radio => "enter play · d play · c country · s search · f fav · m more · j/k",
         }
     }
 }
@@ -97,6 +106,7 @@ enum InputMode {
     LoadPl,
     RmPl,
     TroveSearch,
+    RadioSearch,
 }
 
 struct TroveState {
@@ -134,6 +144,27 @@ struct AudioState {
     last_poll: Instant,
 }
 
+struct RadioState {
+    country: Option<String>,
+    query: String,
+    stations: Vec<radio::Station>,
+    sel: usize,
+    /// pages fetched (1-based; 0 = none yet)
+    page: u32,
+    loading: bool,
+    rx: Option<std::sync::mpsc::Receiver<Result<Vec<radio::Station>, String>>>,
+    loading_more: bool,
+    more_rx: Option<std::sync::mpsc::Receiver<Result<Vec<radio::Station>, String>>>,
+    exhausted: bool,
+    /// country picker open (Enter with no country, or `c`)
+    picking: bool,
+    countries: Vec<radio::Country>,
+    pick_sel: usize,
+    countries_loading: bool,
+    countries_rx: Option<std::sync::mpsc::Receiver<Result<Vec<radio::Country>, String>>>,
+    favs: Vec<radio::Station>,
+}
+
 struct App {
     cfg: SirenConfig,
     focus: usize,
@@ -151,6 +182,7 @@ struct App {
     msg_at: Instant,
     audio: AudioState,
     trove: TroveState,
+    radio: RadioState,
     spk_rx: Option<std::sync::mpsc::Receiver<(Vec<heos::HeosPlayer>, bool)>>,
     spk_pending: bool,
     spk_at: Instant,
@@ -214,6 +246,24 @@ impl App {
                 fmt_rx: None,
                 fmt_pending: false,
                 all_armed: false,
+            },
+            radio: RadioState {
+                country: radio::last_country(),
+                query: String::new(),
+                stations: Vec::new(),
+                sel: 0,
+                page: 0,
+                loading: false,
+                rx: None,
+                loading_more: false,
+                more_rx: None,
+                exhausted: false,
+                picking: false,
+                countries: Vec::new(),
+                pick_sel: 0,
+                countries_loading: false,
+                countries_rx: None,
+                favs: radio::favs(),
             },
             spk_rx: None,
             spk_pending: false,
@@ -537,11 +587,13 @@ fn event_loop(
             let playing = speaker_entry(app).and_then(|p| p.state).map(|s| s == "play");
             app.heos_elapsed = app.heos_clock.tick(playing);
             poll_trove(app);
+            poll_radio(app);
             terminal.draw(|f| draw(f, app))?;
         } else {
             // harvest background results without a full redraw
             app.poll_speaker();
             poll_trove(app);
+            poll_radio(app);
         }
     }
 }
@@ -598,6 +650,15 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             if app.view() == View::Audio {
                 app.force_speaker_poll();
             }
+            if app.view() == View::Radio {
+                app.radio.favs = radio::favs();
+                if app.radio.stations.is_empty()
+                    && !app.radio.loading
+                    && (app.radio.country.is_some() || !app.radio.query.trim().is_empty())
+                {
+                    radio_fetch(app, 1);
+                }
+            }
         }
         KeyCode::BackTab => {
             app.focus = (app.focus + VIEWS.len() - 1) % VIEWS.len();
@@ -608,6 +669,11 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             if app.view() == View::Trove && app.trove.fmt_for.is_some() {
                 app.trove.fmt_for = None;
                 app.trove.fmt_opts.clear();
+                return false;
+            }
+            // radio country picker eats Esc first (cancel picker, don't quit)
+            if app.view() == View::Radio && app.radio.picking {
+                app.radio.picking = false;
                 return false;
             }
             // browser filter: Esc clears search, back to directory
@@ -623,6 +689,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             View::Queue => handle_queue(app, code, mods),
             View::Audio => handle_audio(app, code, mods),
             View::Trove => handle_trove(app, code, mods),
+            View::Radio => handle_radio(app, code, mods),
         },
     }
     false
@@ -675,6 +742,23 @@ fn scroll_by(app: &mut App, delta: isize) {
             }
             let s = app.trove.sel as isize + delta;
             app.trove.sel = s.clamp(0, n as isize - 1) as usize;
+        }
+        View::Radio => {
+            if app.radio.picking {
+                let n = app.radio.countries.len();
+                if n == 0 {
+                    return;
+                }
+                let s = app.radio.pick_sel as isize + delta;
+                app.radio.pick_sel = s.clamp(0, n as isize - 1) as usize;
+                return;
+            }
+            let n = radio_len(app);
+            if n == 0 {
+                return;
+            }
+            let s = app.radio.sel as isize + delta;
+            app.radio.sel = s.clamp(0, n as isize - 1) as usize;
         }
         _ => {}
     }
@@ -736,6 +820,40 @@ fn click_at(app: &mut App, row: u16) -> bool {
                 }
             }
         }
+        View::Radio => {
+            // 1 row per entry, no title row
+            let idx = (row as usize).saturating_sub(1);
+            if app.radio.picking {
+                if idx < app.radio.countries.len() {
+                    app.radio.pick_sel = idx;
+                    if double {
+                        if let Some(c) = app.radio.countries.get(idx).cloned() {
+                            app.radio.picking = false;
+                            app.radio.country = Some(c.name.clone());
+                            app.radio.query.clear();
+                            app.radio.stations.clear();
+                            app.radio.sel = 0;
+                            app.radio.page = 0;
+                            app.radio.exhausted = false;
+                            radio::set_country(&c.name);
+                            app.say(format!("radio → {}", c.name));
+                            radio_fetch(app, 1);
+                        }
+                    }
+                    return true;
+                }
+                return false;
+            }
+            if idx < radio_len(app) {
+                app.radio.sel = idx;
+                if double {
+                    if let Some((st, _)) = radio_row(app, idx) {
+                        radio_play(app, &st);
+                    }
+                }
+                return true;
+            }
+        }
         _ => {}
     }
     false
@@ -766,26 +884,14 @@ fn apply_input(app: &mut App, mode: InputMode, val: &str) {
                 app.say(format!("Playlist not found: {}", val.trim()));
             } else {
                 queue::replace(tracks);
-                if app.is_heos() {
-                    let paths: Vec<PathBuf> = queue::snapshot()
-                        .iter()
-                        .map(|t| PathBuf::from(&t.path))
-                        .collect();
-                    let tgt = match app.speaker_target() {
-                        Some(t) => t,
-                        None => {
-                            app.say("no speaker found");
-                            return;
+                match crate::output::play_from(&app.cfg, 0) {
+                    Ok(_) => {
+                        if app.is_heos() {
+                            patch_roster(app, Some("play"), None);
                         }
-                    };
-                    let (ok, n) = heos::dlna_cast_many(&tgt.0, tgt.1, &paths);
-                    if ok > 0 {
-                        heos::note_cast(&paths[0]);
-                        patch_roster(app, Some("play"), None);
+                        app.say(format!("Playing playlist: {name}"));
                     }
-                    app.say(format!("Playing playlist: {name} ({ok}/{n})"));
-                } else if queue::play_queue_from(0, false) {
-                    app.say(format!("Playing playlist: {name}"));
+                    Err(e) => app.say(e),
                 }
             }
         }
@@ -795,6 +901,23 @@ fn apply_input(app: &mut App, mode: InputMode, val: &str) {
             } else {
                 app.say(format!("Playlist not found: {}", val.trim()));
             }
+        }
+        InputMode::RadioSearch => {
+            let q = val.trim().to_string();
+            app.radio.query = q;
+            app.radio.stations.clear();
+            app.radio.sel = 0;
+            app.radio.page = 0;
+            app.radio.exhausted = false;
+            app.radio.favs = radio::favs();
+            if app.radio.query.is_empty() {
+                // empty search → back to the country list
+                if app.radio.country.is_some() {
+                    radio_fetch(app, 1);
+                }
+                return;
+            }
+            radio_fetch(app, 1);
         }
         InputMode::TroveSearch => {
             let q = val.trim().to_string();
@@ -1219,6 +1342,283 @@ fn handle_trove(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
     }
 }
 
+/// Radio rows: favorites pinned on top (★), then browse results with
+/// fav dupes removed. One shared list so cursor, click and draw agree.
+fn radio_visible(app: &App) -> Vec<(radio::Station, bool)> {
+    let mut out: Vec<(radio::Station, bool)> = Vec::new();
+    for s in &app.radio.favs {
+        out.push((s.clone(), true));
+    }
+    for s in &app.radio.stations {
+        if app.radio.favs.iter().any(|x| {
+            (!x.uuid.is_empty() && x.uuid == s.uuid) || x.url == s.url
+        }) {
+            continue;
+        }
+        out.push((s.clone(), false));
+    }
+    out
+}
+
+fn radio_len(app: &App) -> usize {
+    radio_visible(app).len()
+}
+
+fn radio_row(app: &App, idx: usize) -> Option<(radio::Station, bool)> {
+    radio_visible(app).into_iter().nth(idx)
+}
+
+/// Fetch page `page` (1-based) for the current country/query in background.
+fn radio_fetch(app: &mut App, page: u32) {
+    if app.radio.loading || app.radio.loading_more {
+        return;
+    }
+    let country = app.radio.country.clone();
+    let query = app.radio.query.clone();
+    if query.trim().is_empty() && country.is_none() {
+        return;
+    }
+    let offset = ((page.max(1) - 1) as usize) * radio::PAGE_SIZE;
+    if page <= 1 {
+        app.radio.loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.radio.rx = Some(rx);
+        std::thread::spawn(move || {
+            let res = if query.trim().is_empty() {
+                radio::by_country(&country.unwrap_or_default(), radio::PAGE_SIZE, offset)
+            } else {
+                radio::search(&query, radio::PAGE_SIZE, offset)
+            };
+            let _ = tx.send(res);
+        });
+    } else {
+        app.radio.loading_more = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.radio.more_rx = Some(rx);
+        std::thread::spawn(move || {
+            let res = if query.trim().is_empty() {
+                radio::by_country(&country.unwrap_or_default(), radio::PAGE_SIZE, offset)
+            } else {
+                radio::search(&query, radio::PAGE_SIZE, offset)
+            };
+            let _ = tx.send(res);
+        });
+    }
+}
+
+fn radio_open_picker(app: &mut App) {
+    app.radio.picking = true;
+    app.radio.pick_sel = 0;
+    if !app.radio.countries.is_empty() || app.radio.countries_loading {
+        return;
+    }
+    app.radio.countries_loading = true;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.radio.countries_rx = Some(rx);
+    std::thread::spawn(move || {
+        let _ = tx.send(radio::countries());
+    });
+}
+
+/// Stage a station on the queue and play it through the one output.
+fn radio_play(app: &mut App, st: &radio::Station) {
+    queue::replace(vec![radio::to_queue_item(st)]);
+    match crate::output::play_from(&app.cfg, 0) {
+        Ok(m) => {
+            if app.is_heos() {
+                patch_roster(app, Some("play"), None);
+            }
+            app.say(format!("{} · {m}", st.name));
+        }
+        Err(e) => app.say(e),
+    }
+}
+
+/// Harvest finished radio threads + prefetch near the end (non-blocking).
+fn poll_radio(app: &mut App) {
+    if app.radio.countries_loading {
+        if let Some(rx) = app.radio.countries_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(list)) => {
+                    app.radio.countries = list;
+                    app.radio.countries_loading = false;
+                    app.radio.countries_rx = None;
+                }
+                Ok(Err(e)) => {
+                    app.radio.countries_loading = false;
+                    app.radio.countries_rx = None;
+                    app.say(format!("countries failed: {e}"));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.radio.countries_loading = false;
+                    app.radio.countries_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        } else {
+            app.radio.countries_loading = false;
+        }
+    }
+    if app.radio.loading {
+        if let Some(rx) = app.radio.rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(chunk)) => {
+                    app.radio.exhausted = chunk.len() < radio::PAGE_SIZE;
+                    app.radio.stations = chunk;
+                    app.radio.sel = 0;
+                    app.radio.page = 1;
+                    app.radio.loading = false;
+                    app.radio.rx = None;
+                }
+                Ok(Err(e)) => {
+                    app.radio.loading = false;
+                    app.radio.rx = None;
+                    app.say(format!("radio failed: {e}"));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.radio.loading = false;
+                    app.radio.rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        } else {
+            app.radio.loading = false;
+        }
+    }
+    if app.radio.loading_more {
+        if let Some(rx) = app.radio.more_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok(chunk)) => {
+                    let short = chunk.len() < radio::PAGE_SIZE;
+                    let mut added = 0;
+                    for s in chunk {
+                        if !app.radio.stations.iter().any(|x| {
+                            (!x.uuid.is_empty() && x.uuid == s.uuid) || x.url == s.url
+                        }) {
+                            app.radio.stations.push(s);
+                            added += 1;
+                        }
+                    }
+                    app.radio.page = app.radio.page.saturating_add(1);
+                    app.radio.loading_more = false;
+                    app.radio.more_rx = None;
+                    if short || added == 0 {
+                        app.radio.exhausted = true;
+                    }
+                }
+                Ok(Err(e)) => {
+                    app.radio.loading_more = false;
+                    app.radio.more_rx = None;
+                    app.radio.exhausted = true;
+                    app.say(format!("more failed: {e}"));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.radio.loading_more = false;
+                    app.radio.more_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        } else {
+            app.radio.loading_more = false;
+        }
+    }
+    // prefetch before the cursor hits the end (favs pin the top;
+    // only browse results page)
+    if !app.radio.loading
+        && !app.radio.loading_more
+        && !app.radio.exhausted
+        && !app.radio.picking
+        && !app.radio.stations.is_empty()
+    {
+        let n = radio_len(app);
+        if app.radio.sel + radio::PREFETCH_WITHIN >= n {
+            radio_fetch(app, app.radio.page + 1);
+        }
+    }
+}
+
+fn handle_radio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
+    // country picker is modal: Enter picks, Esc cancels
+    if app.radio.picking {
+        match code {
+            KeyCode::Esc => {
+                app.radio.picking = false;
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !app.radio.countries.is_empty() {
+                    app.radio.pick_sel =
+                        (app.radio.pick_sel + 1).min(app.radio.countries.len() - 1);
+                }
+                return;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.radio.pick_sel = app.radio.pick_sel.saturating_sub(1);
+                return;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(c) = app.radio.countries.get(app.radio.pick_sel).cloned() {
+                    app.radio.picking = false;
+                    app.radio.country = Some(c.name.clone());
+                    app.radio.query.clear();
+                    app.radio.stations.clear();
+                    app.radio.sel = 0;
+                    app.radio.page = 0;
+                    app.radio.exhausted = false;
+                    radio::set_country(&c.name);
+                    app.say(format!("radio → {}", c.name));
+                    radio_fetch(app, 1);
+                }
+                return;
+            }
+            _ => return,
+        }
+    }
+    let n = radio_len(app);
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            if n > 0 {
+                app.radio.sel = (app.radio.sel + 1).min(n - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.radio.sel = app.radio.sel.saturating_sub(1);
+        }
+        KeyCode::Enter | KeyCode::Char('d') | KeyCode::Char(' ') => {
+            if app.radio.country.is_none() && app.radio.query.trim().is_empty() {
+                radio_open_picker(app);
+                return;
+            }
+            if let Some((st, _)) = radio_row(app, app.radio.sel) {
+                radio_play(app, &st);
+            }
+        }
+        KeyCode::Char('c') => radio_open_picker(app),
+        KeyCode::Char('s') => {
+            app.input = Some(InputMode::RadioSearch);
+            app.input_buf.clear();
+        }
+        KeyCode::Char('f') => {
+            if let Some((st, _)) = radio_row(app, app.radio.sel) {
+                if radio::toggle_fav(&st) {
+                    app.say(format!("fav: {}", st.name));
+                } else {
+                    app.say(format!("unfaved: {}", st.name));
+                }
+                app.radio.favs = radio::favs();
+            }
+        }
+        KeyCode::Char('m') => {
+            if app.radio.exhausted {
+                app.say("end of results");
+            } else {
+                radio_fetch(app, app.radio.page + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Enter / double-click: open dir, or play the selected file.
 fn browser_activate(app: &mut App) {
     let searching = !app.filter.trim().is_empty();
@@ -1503,32 +1903,16 @@ fn cycle_repeat(app: &mut App) {
     app.say(format!("repeat {nxt}"));
 }
 
-/// Play queue from `index`, following `audio_output` (speaker = cast all
-/// in order, first play-now + rest append; local = mpv mirror).
+/// Play queue from `index` through the one output channel.
 fn play_queue_output(app: &mut App, index: usize) {
-    if app.is_heos() {
-        let items = queue::snapshot();
-        if index >= items.len() {
-            return;
-        }
-        let paths: Vec<PathBuf> =
-            items[index..].iter().map(|t| PathBuf::from(&t.path)).collect();
-        let tgt = match app.speaker_target() {
-            Some(t) => t,
-            None => {
-                app.say("no speaker found");
-                return;
+    match crate::output::play_from(&app.cfg, index) {
+        Ok(m) => {
+            if app.is_heos() {
+                patch_roster(app, Some("play"), None);
             }
-        };
-        app.say(format!("casting {} track(s) → {}…", paths.len(), tgt.2));
-        let (ok, n) = heos::dlna_cast_many(&tgt.0, tgt.1, &paths);
-        if ok > 0 {
-            heos::note_cast(&paths[0]);
-            patch_roster(app, Some("play"), None);
+            app.say(m);
         }
-        app.say(format!("playing queue ({ok}/{n} on {})", tgt.2));
-    } else if queue::play_queue_from(index, false) {
-        app.say("playing from queue");
+        Err(e) => app.say(e),
     }
 }
 
@@ -1641,6 +2025,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Queue => draw_queue(f, app, inner),
         View::Audio => draw_audio(f, app, inner),
         View::Trove => draw_trove(f, app, inner),
+        View::Radio => draw_radio(f, app, inner),
     }
 
     // persistent waves strip — visible at all times, all views
@@ -1661,6 +2046,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             InputMode::LoadPl => "load playlist",
             InputMode::RmPl => "remove playlist",
             InputMode::TroveSearch => "trove search (music|live|ccmixter + words)",
+            InputMode::RadioSearch => "radio search (station name)",
         };
         (
             format!(" ✦ {prompt} ✦ "),
@@ -1705,6 +2091,25 @@ fn draw(f: &mut Frame, app: &mut App) {
                         format!("{} / {}", app.trove.docs.len(), app.trove.total)
                     };
                     format!("{st} · fmt:{} · tab cycle · q quit", app.trove.fmt)
+                }
+                View::Radio => {
+                    let where_ = if app.radio.query.trim().is_empty() {
+                        app.radio.country.clone().unwrap_or_else(|| "no country".into())
+                    } else {
+                        format!("search: {}", app.radio.query)
+                    };
+                    let st = if app.radio.loading {
+                        "loading…".to_string()
+                    } else if app.radio.loading_more {
+                        format!("{}+…", radio_len(app))
+                    } else if radio_len(app) == 0 {
+                        "enter picks a country".to_string()
+                    } else if app.radio.exhausted {
+                        format!("{} · end", radio_len(app))
+                    } else {
+                        format!("{}", radio_len(app))
+                    };
+                    format!("{where_} · {st} · favs:{} · tab cycle · q quit", app.radio.favs.len())
                 }
             };
             lines.push(Line::from(Span::styled(format!("  {hint}"), Style::default().fg(Color::DarkGray))));
@@ -1766,7 +2171,12 @@ fn draw_queue(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         .iter()
         .enumerate()
         .map(|(i, it)| {
-            let d = crate::meta::display(&it.path);
+            // stored labels win (streams keep station names); files re-probe
+            let d = if it.display.is_empty() {
+                crate::meta::display(&it.path)
+            } else {
+                it.display.clone()
+            };
             let mark = if i == 0 { "▶ " } else { "  " };
             ListItem::new(Line::from(Span::raw(format!("{mark}{:3}. {d}", i + 1))))
         })
@@ -1801,7 +2211,11 @@ fn speaker_entry(app: &App) -> Option<heos::HeosPlayer> {
 }
 
 /// Real 64-bar EQ row for a track at `secs` ("analyzing…" until decoded).
+/// Live streams have no local file to decode — say so instead of spinning.
 fn eq_row(app: &App, path: &PathBuf, secs: f64) -> String {
+    if crate::meta::is_url(&path.to_string_lossy()) {
+        return "· live stream ·".into();
+    }
     crate::spectrum::request_analyze(path);
     match crate::spectrum::spectrum_for(path) {
         Some(spec) => spec.at(secs).iter().map(|v| crate::spectrum::bar_glyph(*v)).collect(),
@@ -1968,6 +2382,87 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             0,
             ListItem::new(Line::from(Span::styled(title, Style::default().fg(Color::Gray)))),
         );
+    }
+    let list = List::new(rows)
+        .highlight_style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+        .highlight_symbol("❯ ");
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_radio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let mut rows: Vec<ListItem> = Vec::new();
+    if app.radio.picking {
+        // modal country list, alphabetical
+        if app.radio.countries_loading && app.radio.countries.is_empty() {
+            rows.push(ListItem::new(Line::from(Span::styled(
+                "  reading countries…",
+                Style::default().fg(Color::DarkGray),
+            ))));
+        }
+        for c in &app.radio.countries {
+            rows.push(ListItem::new(Line::from(Span::raw(format!(
+                "  {} ({})",
+                c.name, c.count
+            )))));
+        }
+        let mut state = ListState::default();
+        if !rows.is_empty() {
+            state.select(Some(app.radio.pick_sel.min(rows.len() - 1)));
+        }
+        let list = List::new(rows)
+            .highlight_style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+            .highlight_symbol("❯ ");
+        f.render_stateful_widget(list, area, &mut state);
+        return;
+    }
+    if app.radio.loading && app.radio.stations.is_empty() && app.radio.favs.is_empty() {
+        rows.push(ListItem::new(Line::from(Span::styled(
+            "  tuning…",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
+    if radio_len(app) == 0 && !app.radio.loading {
+        rows.push(ListItem::new(Line::from(Span::styled(
+            "  press enter to pick a country",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
+    for (s, fav) in radio_visible(app) {
+        if fav {
+            rows.push(ListItem::new(Line::from(vec![
+                Span::raw("★ "),
+                Span::styled(s.name.clone(), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("  [{}]", s.country),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])));
+            continue;
+        }
+        let bit = if s.bitrate > 0 {
+            format!(" {}k", s.bitrate)
+        } else {
+            String::new()
+        };
+        rows.push(ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::raw(format!("{}{}  [{}]", s.name, bit, s.codec)),
+        ])));
+    }
+    if app.radio.loading_more {
+        rows.push(ListItem::new(Line::from(Span::styled(
+            "  loading more…",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    } else if app.radio.exhausted && radio_len(app) > 0 {
+        rows.push(ListItem::new(Line::from(Span::styled(
+            "  — end —",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
+    let mut state = ListState::default();
+    if radio_len(app) > 0 {
+        state.select(Some(app.radio.sel.min(rows.len().saturating_sub(1))));
     }
     let list = List::new(rows)
         .highlight_style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))

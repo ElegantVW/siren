@@ -474,6 +474,21 @@ pub fn set_mute(ip: &str, pid: i64, on: bool) -> bool {
     ))
 }
 
+/// Play a remote stream URL on the speaker (radio). `url` is
+/// percent-encoded (HEOS parses the querystring). One stream at a time;
+/// the speaker stops queue playback. Verify at low volume.
+pub fn play_stream(ip: &str, pid: i64, url: &str) -> bool {
+    let mut enc = String::with_capacity(url.len());
+    for b in url.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            enc.push(b as char);
+        } else {
+            enc.push_str(&format!("%{b:02X}"));
+        }
+    }
+    ok(&rpc(ip, &[format!("heos://player/play_stream?pid={pid}&url={enc}")]))
+}
+
 pub fn play_next(ip: &str, pid: i64) -> bool {
     ok(&rpc(ip, &[format!("heos://player/play_next?pid={pid}")]))
 }
@@ -669,6 +684,32 @@ pub fn note_cast(path: &std::path::Path) {
         "ts": now,
     });
     let _ = std::fs::write(format!("{dir}/heos-now.json"), v.to_string());
+}
+
+/// Record a stream cast (radio): same file, `path` holds the URL so old
+/// readers keep working, `title` carries the station name.
+pub fn note_stream(url: &str, title: &str) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let dir = format!("{home}/.cache/siren");
+    let _ = std::fs::create_dir_all(&dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let v = serde_json::json!({
+        "path": url,
+        "title": title,
+        "ts": now,
+    });
+    let _ = std::fs::write(format!("{dir}/heos-now.json"), v.to_string());
+}
+
+/// Station title for the current cast, if it was a stream.
+pub fn last_cast_title() -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let raw = std::fs::read_to_string(format!("{home}/.cache/siren/heos-now.json")).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    v.get("title").and_then(|t| t.as_str()).map(|s| s.to_string())
 }
 
 /// Last cast recorded by any siren (CLI or TUI): (path, epoch secs).

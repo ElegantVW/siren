@@ -248,6 +248,18 @@ fn format_tags(artist: &str, title: &str, path: &Path) -> String {
     }
 }
 
+/// Stream URLs have no local tags — never probe, just show the tail.
+pub fn is_url(path: &str) -> bool {
+    let p = path.strip_prefix("file://").unwrap_or(path);
+    p.starts_with("http://") || p.starts_with("https://")
+}
+
+fn url_tail(path: &str) -> String {
+    let p = path.strip_prefix("file://").unwrap_or(path);
+    let tail = p.rsplit('/').next().unwrap_or(p);
+    if tail.is_empty() { p.to_string() } else { tail.to_string() }
+}
+
 fn as_path(path: &str) -> &Path {
     Path::new(path.strip_prefix("file://").unwrap_or(path))
 }
@@ -263,6 +275,9 @@ pub fn display_cached(path: &str) -> String {
 
 /// "Artist - Title" or stem fallback. Never blocks; warms misses (cap 2).
 pub fn display(path: &str) -> String {
+    if is_url(path) {
+        return url_tail(path);
+    }
     let pb = as_path(path);
     match lookup(pb) {
         Some((a, t)) => format_tags(&a, &t, pb),
@@ -276,6 +291,9 @@ pub fn display(path: &str) -> String {
 /// Block on ffprobe for this one path. CLI one-shots need this so the
 /// process doesn't exit before a worker can save.
 pub fn display_sync(path: &str) -> String {
+    if is_url(path) {
+        return url_tail(path);
+    }
     let pb = as_path(path);
     if let Some((a, t)) = lookup(pb) {
         return format_tags(&a, &t, pb);
@@ -287,6 +305,9 @@ pub fn display_sync(path: &str) -> String {
 
 /// (artist, title) for records; empty when unknown. Never blocks.
 pub fn tags_for(path: &str) -> (String, String) {
+    if is_url(path) {
+        return Default::default();
+    }
     let pb = as_path(path);
     match lookup(pb) {
         Some(hit) => hit,
@@ -299,6 +320,9 @@ pub fn tags_for(path: &str) -> (String, String) {
 
 /// Blocking tags (CLI add). Empty strings when the file has none.
 pub fn tags_for_sync(path: &str) -> (String, String) {
+    if is_url(path) {
+        return Default::default();
+    }
     let pb = as_path(path);
     if let Some(hit) = lookup(pb) {
         return hit;

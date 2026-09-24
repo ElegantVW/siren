@@ -7,7 +7,9 @@ mod config;
 mod heos;
 mod library;
 mod meta;
+mod output;
 mod player;
+mod radio;
 mod playlist;
 mod queue;
 mod spectrum;
@@ -106,6 +108,10 @@ enum Cmd {
     /// Debug: analyze a file's spectrum, print bars (no playback)
     Spectrum {
         path: String,
+    },
+    /// Community radio (radio-browser.info, keyless)
+    Radio {
+        args: Vec<String>,
     },
 }
 
@@ -260,43 +266,16 @@ fn cmd_playlist_load(name: &str) -> i32 {
     // mirror Python play_playlist: replace QUEUE, play from 0
     queue::replace(tracks);
     let cfg = SirenConfig::load();
-    if use_heos(&cfg) {
-        let paths: Vec<std::path::PathBuf> =
-            queue::snapshot().iter().map(|t| std::path::PathBuf::from(&t.path)).collect();
-        return play_paths_heos(&cfg, &paths, Some(name));
-    }
-    if queue::play_queue_from(0, false) {
-        println!("Playing playlist: {name}");
-        0
-    } else {
-        println!("Playlist not found: {name}");
-        1
-    }
-}
-
-/// Play local paths on the speaker in order (first play-now, rest append).
-fn play_paths_heos(cfg: &SirenConfig, paths: &[std::path::PathBuf], what: Option<&str>) -> i32 {
-    if paths.is_empty() {
-        println!("Queue empty.");
-        return 1;
-    }
-    let tgt = match heos_target(cfg, None) {
-        Some(t) => t,
-        None => {
-            eprintln!("no speaker found");
-            return 1;
+    match output::play_from(&cfg, 0) {
+        Ok(_) => {
+            println!("Playing playlist: {name}");
+            0
         }
-    };
-    println!("casting {} track(s) → {}…", paths.len(), tgt.2);
-    let (ok, n) = heos::dlna_cast_many(&tgt.0, tgt.1, paths);
-    if ok > 0 {
-        heos::note_cast(&paths[0]);
+        Err(e) => {
+            println!("{e}");
+            1
+        }
     }
-    match what {
-        Some(name) => println!("Playing playlist: {name} ({ok}/{n} on {})", tgt.2),
-        None => println!("Playing queue ({ok}/{n} on {})", tgt.2),
-    }
-    if ok == 0 { 1 } else { 0 }
 }
 
 fn cmd_queue(rest: &[String]) -> i32 {
@@ -314,17 +293,16 @@ fn cmd_queue(rest: &[String]) -> i32 {
         }
         "list" | "l" | "ls" => queue::cli_list(),
         "clear" | "c" => queue::cli_clear(),
-        "play" | "p" => {
-            if use_heos(&cfg) {
-                let paths: Vec<std::path::PathBuf> = queue::snapshot()
-                    .iter()
-                    .map(|t| std::path::PathBuf::from(&t.path))
-                    .collect();
-                play_paths_heos(&cfg, &paths, None)
-            } else {
-                queue::cli_play()
+        "play" | "p" => match output::play_from(&cfg, 0) {
+            Ok(m) => {
+                println!("{m}");
+                0
             }
-        }
+            Err(e) => {
+                println!("{e}");
+                1
+            }
+        },
         "next" | "n" => {
             if use_heos(&cfg) {
                 match heos_target(&cfg, None) {
@@ -994,6 +972,163 @@ fn cmd_trove(args: &[String]) -> i32 {
     trove::run_trove(n, &words, None, format)
 }
 
+/// `siren radio …` — community stations, same output channel as music.
+fn cmd_radio(args: &[String]) -> i32 {
+    let sub = args.first().map(|s| s.to_lowercase()).unwrap_or_default();
+    match sub.as_str() {
+        "countries" | "country" | "c" => match radio::countries() {
+            Ok(list) => {
+                for c in &list {
+                    println!("  {} ({})", c.name, c.count);
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("radio countries failed: {e}");
+                1
+            }
+        },
+        "search" | "s" => {
+            let q = args[1..].join(" ");
+            if q.trim().is_empty() {
+                eprintln!("usage: siren radio search <words>");
+                return 2;
+            }
+            match radio::search(&q, radio::PAGE_SIZE, 0) {
+                Ok(stations) if stations.is_empty() => {
+                    println!("No stations match: {q}");
+                    1
+                }
+                Ok(stations) => {
+                    for (i, s) in stations.iter().enumerate() {
+                        let bit = if s.bitrate > 0 {
+                            format!(" {}k", s.bitrate)
+                        } else {
+                            String::new()
+                        };
+                        println!("  {:>2}.  {}{}  [{}]", i + 1, s.name, bit, s.country);
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("radio search failed: {e}");
+                    1
+                }
+            }
+        }
+        "stations" | "top" | "t" => {
+            let country = args.get(1).cloned().or_else(radio::last_country);
+            let Some(country) = country else {
+                eprintln!("usage: siren radio stations <country> (or pick one in the TUI)");
+                return 2;
+            };
+            match radio::by_country(&country, radio::PAGE_SIZE, 0) {
+                Ok(stations) if stations.is_empty() => {
+                    println!("No stations in: {country}");
+                    1
+                }
+                Ok(stations) => {
+                    for (i, s) in stations.iter().enumerate() {
+                        println!("  {:>2}.  {}  [{}]", i + 1, s.name, s.codec);
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("radio stations failed: {e}");
+                    1
+                }
+            }
+        }
+        "play" | "p" => {
+            let q = args[1..].join(" ");
+            if q.trim().is_empty() {
+                eprintln!("usage: siren radio play <words>");
+                return 2;
+            }
+            let stations = match radio::search(&q, 5, 0) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("radio search failed: {e}");
+                    return 1;
+                }
+            };
+            let Some(st) = stations.first() else {
+                println!("No stations match: {q}");
+                return 1;
+            };
+            queue::replace(vec![radio::to_queue_item(st)]);
+            let cfg = SirenConfig::load();
+            match output::play_from(&cfg, 0) {
+                Ok(m) => {
+                    println!("{m}");
+                    0
+                }
+                Err(e) => {
+                    println!("{e}");
+                    1
+                }
+            }
+        }
+        "fav" | "favs" | "f" => {
+            if args.len() == 1 {
+                let favs = radio::favs();
+                if favs.is_empty() {
+                    println!("(no favorites — siren radio fav <words>)");
+                    return 0;
+                }
+                for (i, s) in favs.iter().enumerate() {
+                    println!("  {:>2}.  {}  [{}]", i + 1, s.name, s.country);
+                }
+                return 0;
+            }
+            let q = args[1..].join(" ");
+            let stations = match radio::search(&q, 5, 0) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("radio search failed: {e}");
+                    return 1;
+                }
+            };
+            let Some(st) = stations.first() else {
+                println!("No stations match: {q}");
+                return 1;
+            };
+            if radio::toggle_fav(st) {
+                println!("fav: {}", st.name);
+            } else {
+                println!("unfaved: {}", st.name);
+            }
+            0
+        }
+        "about" | "help" | "-h" | "--help" | "" => {
+            for line in radio::about_text() {
+                println!("  {line}");
+            }
+            0
+        }
+        _ => {
+            // bare words → search
+            let q = args.join(" ");
+            match radio::search(&q, radio::PAGE_SIZE, 0) {
+                Ok(stations) if stations.is_empty() => {
+                    println!("No stations match: {q}");
+                    1
+                }
+                Ok(stations) => {
+                    for (i, s) in stations.iter().enumerate() {
+                        println!("  {:>2}.  {}  [{}]", i + 1, s.name, s.country);
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("radio search failed: {e}");
+                    1
+                }
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = SirenConfig::load();
@@ -1220,6 +1355,7 @@ fn main() -> Result<()> {
             cmd_cast(&cfg, &query, speaker.as_deref(), next, append)
         }
         Some(Cmd::Trove { args }) => cmd_trove(&args),
+        Some(Cmd::Radio { args }) => cmd_radio(&args),
         Some(Cmd::Sleep { args }) => cmd_sleep(&args),
         Some(Cmd::Queue { args }) => cmd_queue(&args),
         Some(Cmd::Playlist { args }) => cmd_playlist(&args),

@@ -20,7 +20,7 @@ low volume).
 | Safety | Volume changes print the new level. Test casts at ≤20%. `add_to_queue` cids keep raw `$` (never %-encode). |
 | Secrets | None. LAN-only, no tokens. |
 | State | `~/.config/siren/config.json` (library, output, speaker). DLNA server stays external (minidlna). |
-| Scope | Trove, tags, dir-browser landed. Python `faeOS/bin/siren` is archived (tests/rollback only). |
+| Scope | Trove, tags, dir-browser, radio landed. One output channel (`output.rs`): sources stage queue items, output routes local mpv / speaker DLNA / speaker stream. Python `faeOS/bin/siren` is archived (tests/rollback only). |
 
 ## Iteration rule
 
