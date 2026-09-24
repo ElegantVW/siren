@@ -79,9 +79,35 @@ fn state_path() -> std::path::PathBuf {
     std::path::PathBuf::from(base).join("radio.json")
 }
 
+/// Lowercase + fold Latin diacritics so "Rádio" matches "radio".
+/// Apostrophes fold away ("80's" matches "80s").
+pub fn norm(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.trim().to_lowercase().chars() {
+        if c == '\'' || c == '’' || c == '`' {
+            continue;
+        }
+        out.push(match c {
+            'á' | 'à' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' | 'ø' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' => 'u',
+            'ç' => 'c',
+            'ñ' => 'n',
+            'ý' | 'ÿ' => 'y',
+            'š' => 's',
+            'ž' => 'z',
+            'ß' => 's',
+            _ => c,
+        });
+    }
+    out
+}
+
 fn by_name(mut v: Vec<Station>) -> Vec<Station> {
     // trim: entries like " M80…" (leading space) otherwise sort first
-    v.sort_by_key(|s| s.name.trim().to_lowercase());
+    v.sort_by_key(|s| norm(&s.name));
     v
 }
 
@@ -238,7 +264,7 @@ pub fn search(query: &str, limit: usize, offset: usize) -> Result<Vec<Station>, 
             Err(e) => return Err(e),
         }
     }
-    merged.sort_by_key(|s| s.name.trim().to_lowercase());
+    merged.sort_by_key(|s| norm(&s.name));
     merged.truncate(limit);
     Ok(merged)
 }
@@ -296,34 +322,40 @@ pub fn merge_unique(dst: &mut Vec<Station>, chunk: Vec<Station>) -> usize {
 /// Best match for `play`/`fav`: exact → prefix → substring on the name,
 /// then tags. Alphabetical only breaks ties (token-fallback merges can
 /// otherwise surface "# ..." junk first).
+/// 0 exact · 1 prefix · 2 substring · 3 all tokens · 4 tags · 5 miss.
+/// Accent-insensitive ("radio" hits "Rádio").
+pub fn match_rank(query: &str, name: &str, tags: &str) -> u8 {
+    let q = norm(query);
+    let n = norm(name);
+    if n == q {
+        0
+    } else if n.starts_with(&q) {
+        1
+    } else if n.contains(&q) {
+        2
+    } else if !q.is_empty() && q.split_whitespace().all(|t| n.contains(t)) {
+        3
+    } else if tags.to_lowercase().contains(&q) {
+        4
+    } else {
+        5
+    }
+}
+
 pub fn best_match(query: &str, stations: &[Station]) -> Option<Station> {
-    let q = query.trim().to_lowercase();
+    let q = norm(query);
     if q.is_empty() {
         return stations.first().cloned();
     }
     let mut scored: Vec<(u8, &Station)> = Vec::new();
     for s in stations {
-        let name = s.name.trim().to_lowercase();
-        let rank = if name == q {
-            0
-        } else if name.starts_with(&q) {
-            1
-        } else if name.contains(&q) {
-            2
-        } else if q.split_whitespace().all(|t| name.contains(t)) {
-            3
-        } else if s.tags.to_lowercase().contains(&q) {
-            4
-        } else {
-            5
-        };
-        scored.push((rank, s));
+        scored.push((match_rank(&q, &s.name, &s.tags), s));
     }
     scored.sort_by(|a, b| {
         a.0.cmp(&b.0)
             // shorter = more specific ("M80 Rádio – 80s" beats "M80 Radio Macau - 80s")
-            .then(a.1.name.trim().len().cmp(&b.1.name.trim().len()))
-            .then(a.1.name.trim().to_lowercase().cmp(&b.1.name.trim().to_lowercase()))
+            .then(norm(&a.1.name).len().cmp(&norm(&b.1.name).len()))
+            .then(norm(&a.1.name).cmp(&norm(&b.1.name)))
     });
     scored.into_iter().next().map(|(_, s)| s.clone())
 }
@@ -381,7 +413,7 @@ pub fn set_country(name: &str) {
 
 pub fn favs() -> Vec<Station> {
     let mut f = load_state().favs;
-    f.sort_by_key(|s| s.name.trim().to_lowercase());
+    f.sort_by_key(|s| norm(&s.name));
     f
 }
 

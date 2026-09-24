@@ -97,6 +97,10 @@ fn fresh_conn(ip: &str) -> Option<TcpStream> {
 }
 
 fn rpc_once(stream: &mut TcpStream, uris: &[String]) -> Option<Vec<Value>> {
+    rpc_once_wait(stream, uris, 25)
+}
+
+fn rpc_once_wait(stream: &mut TcpStream, uris: &[String], rounds: u32) -> Option<Vec<Value>> {
     for u in uris {
         stream.write_all(format!("{u}\n").as_bytes()).ok()?;
     }
@@ -116,12 +120,25 @@ fn rpc_once(stream: &mut TcpStream, uris: &[String]) -> Option<Vec<Value>> {
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 let text = String::from_utf8_lossy(&data);
-                if split_objects(&text).len() >= uris.len() {
+                // "command under process" is a stub, not a reply — async
+                // commands (browse/search) deliver the payload later
+                let finals = split_objects(&text)
+                    .iter()
+                    .filter(|o| {
+                        let msg = o
+                            .get("heos")
+                            .and_then(|h| h.get("message"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("");
+                        !msg.contains("command under process")
+                    })
+                    .count();
+                if finals >= uris.len() {
                     break;
                 }
                 quiet_rounds += 1;
-                if quiet_rounds >= 25 {
-                    break; // ~3s deadline
+                if quiet_rounds >= rounds {
+                    break;
                 }
             }
             Err(_) => break,
@@ -134,18 +151,24 @@ fn rpc_once(stream: &mut TcpStream, uris: &[String]) -> Option<Vec<Value>> {
 }
 
 pub fn rpc(ip: &str, uris: &[String]) -> Vec<Value> {
+    rpc_wait(ip, uris, 25)
+}
+
+/// Same, with a longer quiet deadline (rounds × 120ms). TuneIn search
+/// payloads can lag several seconds behind their "under process" stub.
+pub fn rpc_wait(ip: &str, uris: &[String], rounds: u32) -> Vec<Value> {
     // try pooled connection, reconnect once on failure
     {
         let mut pool = pool().lock().unwrap();
         if let Some(s) = pool.get_mut(ip) {
-            if let Some(v) = rpc_once(s, uris) {
+            if let Some(v) = rpc_once_wait(s, uris, rounds) {
                 return v;
             }
             pool.remove(ip);
         }
     }
     if let Some(mut s) = fresh_conn(ip) {
-        if let Some(v) = rpc_once(&mut s, uris) {
+        if let Some(v) = rpc_once_wait(&mut s, uris, rounds) {
             pool().lock().unwrap().insert(ip.to_string(), s);
             return v;
         }
@@ -474,12 +497,12 @@ pub fn set_mute(ip: &str, pid: i64, on: bool) -> bool {
     ))
 }
 
-/// NOTE (2026-09-24, verified live): `player/play_stream` is a dead end
-/// on this HEOS 1 unit — accepted (`success`) then always back to `stop`
-/// within seconds. Proven with MP3 + AAC, WAN + LAN URLs, with and
-/// without a `set_play_state play` kick. Its TuneIn/Deezer/Tidal/etc.
-/// all report `available:false` (need app logins), so only DLNA-queue
-/// playback (files) sustains. Radio stays local-only until that changes.
+/// NOTE (2026-09-24, verified live): `player/play_stream` with a raw URL
+/// is a dead end on this HEOS 1 unit — accepted then back to `stop`.
+/// But TuneIn browses fine without login (`available:false` lies), and
+/// `browse/play_stream?pid&sid=3&mid=` SUSTAINS (Batida FM, M80 80s both
+/// held `play` past 10s). So speaker radio goes through TuneIn, never
+/// raw URLs.
 pub fn play_next(ip: &str, pid: i64) -> bool {
     ok(&rpc(ip, &[format!("heos://player/play_next?pid={pid}")]))
 }
@@ -675,6 +698,120 @@ pub fn note_cast(path: &std::path::Path) {
         "ts": now,
     });
     let _ = std::fs::write(format!("{dir}/heos-now.json"), v.to_string());
+}
+
+/// A TuneIn station hit (search `scid=4`): `mid` plays via
+/// `browse/play_stream` with NO cid.
+#[derive(Debug, Clone, Default)]
+pub struct TuneinHit {
+    pub mid: String,
+    pub name: String,
+}
+
+/// Search TuneIn stations (no login needed, verified live).
+pub fn tunein_search(ip: &str, query: &str) -> Vec<TuneinHit> {
+    let mut enc = String::with_capacity(query.len());
+    for b in query.trim().bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            enc.push(b as char);
+        } else if b == b' ' {
+            enc.push_str("%20");
+        } else {
+            enc.push_str(&format!("%{b:02X}"));
+        }
+    }
+    let mut out = Vec::new();
+    // Patient read on a fresh connection: TuneIn answers the search stub
+    // fast, then delivers the payload up to seconds later and closes.
+    // (The shared rpc() quiet-gap loop exits on the stub.)
+    let t0 = std::time::Instant::now();
+    let objs = match fresh_conn(ip) {
+        Some(mut s) => {
+            use std::io::{Read, Write};
+            let cmd = format!("heos://browse/search?sid=3&scid=4&search={enc}\n");
+            s.write_all(cmd.as_bytes()).ok();
+            s.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                .ok();
+            let mut data = Vec::new();
+            let mut buf = [0u8; 65536];
+            let mut quiet_since_data = t0;
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) => break, // server closed: reply complete
+                    Ok(n) => {
+                        data.extend_from_slice(&buf[..n]);
+                        quiet_since_data = std::time::Instant::now();
+                    }
+                    Err(_) => {
+                        if !data.is_empty()
+                            && quiet_since_data.elapsed().as_secs() >= 2
+                        {
+                            break;
+                        }
+                        if t0.elapsed().as_secs() > 12 {
+                            break;
+                        }
+                    }
+                }
+            }
+            split_objects(&String::from_utf8_lossy(&data))
+        }
+        None => Vec::new(),
+    };
+    for o in objs {
+        if let Some(arr) = o.get("payload").and_then(|p| p.as_array()) {
+            for it in arr {
+                let mid = it.get("mid").and_then(|x| x.as_str()).unwrap_or("");
+                let name = it.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                let playable = it.get("playable").and_then(|x| x.as_str()).unwrap_or("yes");
+                if mid.is_empty() || name.is_empty() || playable != "yes" {
+                    continue;
+                }
+                out.push(TuneinHit {
+                    mid: mid.into(),
+                    name: name.into(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Play a TuneIn hit on the speaker. True = command accepted
+/// (state turns `play` a few seconds later; verified live).
+pub fn tunein_play(ip: &str, pid: i64, hit: &TuneinHit) -> bool {
+    ok(&rpc(
+        ip,
+        &[format!(
+            "heos://browse/play_stream?pid={pid}&sid=3&mid={}",
+            hit.mid
+        )],
+    ))
+}
+
+/// Record a radio play for the elapsed clock + now displays.
+pub fn note_radio(url: &str, title: &str) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let dir = format!("{home}/.cache/siren");
+    let _ = std::fs::create_dir_all(&dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let v = serde_json::json!({
+        "path": url,
+        "title": title,
+        "ts": now,
+    });
+    let _ = std::fs::write(format!("{dir}/heos-now.json"), v.to_string());
+}
+
+/// Station title for the current radio play, if any.
+pub fn last_radio_title() -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let raw = std::fs::read_to_string(format!("{home}/.cache/siren/heos-now.json")).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    v.get("title").and_then(|t| t.as_str()).map(|s| s.to_string())
 }
 
 /// Last cast recorded by any siren (CLI or TUI): (path, epoch secs).

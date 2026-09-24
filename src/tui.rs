@@ -2123,15 +2123,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                     } else {
                         format!("{}", radio_len(app))
                     };
-                    let radio_note = if app.is_heos() {
-                        " · radio needs out:local"
-                    } else {
-                        ""
-                    };
-                    format!(
-                        "{where_} · {st} · favs:{}{radio_note} · tab cycle · q quit",
-                        app.radio.favs.len()
-                    )
+                    format!("{where_} · {st} · favs:{} · tab cycle · q quit", app.radio.favs.len())
                 }
             };
             lines.push(Line::from(Span::styled(format!("  {hint}"), Style::default().fg(Color::DarkGray))));

@@ -87,10 +87,10 @@ picker (a-z, cached a week); `Enter`/`d` plays the cursor row, `c`
 re-picks country, `s` searches, `f` toggles favorite (★ pinned on top),
 `A` favorites any stream URL, `m` more. Favorites + last country persist
 in `~/.config/siren/radio.json`. Streams ride the queue as URL items
-(station name as label). Radio is local-only on this unit: the speaker
-accepts `play_stream` then drops it (MP3/AAC, WAN/LAN all verified to
-`stop`), and its TuneIn/etc. read `available:false` without app logins —
-files still cast fine.
+(station name as label). Speaker radio rides TuneIn (no login): raw-URL
+`play_stream` won't hold on this unit (verified dead 5 ways), but
+`browse/play_stream` with a TuneIn `mid` sustains — output maps the
+station name to TuneIn live. Local radio is plain mpv.
 Guards: `.part` resume, skip-if-exists, 40-file cap, 32MB confirm,
 `TROVE_MAX_TOTAL`. Lands in `~/Music/trove/<identifier>`.
 
