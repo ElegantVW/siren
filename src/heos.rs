@@ -877,7 +877,29 @@ pub fn dlna_cast(ip: &str, pid: i64, path: &std::path::Path, aid: i64) -> Result
     let sid = sid.ok_or_else(|| {
         "DLNA VANGUARDA-DLNA not found — is minidlna on 192.168.8.186:8200 running?".to_string()
     })?;
-    match dlna_find(ip, sid, &target) {
+    // Fresh files (downloads, transcodes) may not be indexed yet — the
+    // rescan nudge above can't signal root's minidlnad, so poll a while.
+    // Only for recent files; genuine misses still fail fast.
+    let fresh = target
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.elapsed().ok())
+        .map(|e| e.as_secs() < 15 * 60)
+        .unwrap_or(false);
+    let mut found = dlna_find(ip, sid, &target);
+    if found.is_none() && fresh {
+        std::thread::sleep(Duration::from_secs(5));
+        for _ in 0..11 {
+            found = dlna_find(ip, sid, &target);
+            if found.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+
+    match found {
         Some((cid, mid)) => {
             let aid = aid.clamp(1, 4);
             // RAW $ in cid/mid (never %-encode) — firmware rejects %24

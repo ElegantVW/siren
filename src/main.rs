@@ -113,6 +113,11 @@ enum Cmd {
     Radio {
         args: Vec<String>,
     },
+    /// Play a video's audio (YouTube etc. via yt-dlp): local or speaker
+    Video {
+        /// Video URL or "ytsearch:query"
+        url: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1144,6 +1149,104 @@ fn cmd_radio(args: &[String]) -> i32 {
     }
 }
 
+/// `siren video <url|ytsearch:query>` — fetch audio, cache, play it
+/// through the output channel (local mpv, or DLNA-cast to the speaker).
+/// Live pages can't cast (speaker needs finite files) — verified.
+fn cmd_video(args: &[String]) -> i32 {
+    let query = args.join(" ");
+    if query.trim().is_empty() {
+        eprintln!("usage: siren video <url> | <ytsearch:query>");
+        return 2;
+    }
+    let is_url = query.starts_with("http://") || query.starts_with("https://");
+    if !is_url && !query.starts_with("ytsearch:") {
+        eprintln!("need a url, or prefix a search with ytsearch:");
+        return 2;
+    }
+    println!("fetching audio…");
+    let title = video_title(&query);
+    let out = std::process::Command::new("yt-dlp")
+        .args([
+            "-x",
+            "--audio-format",
+            "mp3",
+            "--audio-quality",
+            "5",
+            "--no-playlist",
+            "--print",
+            "after_move:filepath",
+            "--paths",
+            &format!("{}/.cache/siren/videos", std::env::var("HOME").unwrap_or_default()),
+            &query,
+        ])
+        .output()
+        .map_err(|e| format!("yt-dlp missing/failed: {e}"));
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    if !out.status.success() {
+        eprintln!(
+            "yt-dlp failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .next()
+                .unwrap_or("?")
+        );
+        return 1;
+    }
+    let path = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .last()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if path.is_empty() || !std::path::Path::new(&path).exists() {
+        eprintln!("no file after download");
+        return 1;
+    }
+    let title = title.unwrap_or_else(|| {
+        std::path::Path::new(&path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone())
+    });
+    let (artist, _) = crate::meta::tags_for_sync(&path);
+    queue::replace(vec![queue::QueueItem {
+        path: path.clone(),
+        display: title.clone(),
+        title,
+        artist,
+        duration: 0.0,
+    }]);
+    let cfg = SirenConfig::load();
+    match output::play_from(&cfg, 0) {
+        Ok(m) => {
+            println!("{m}");
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+/// Video title from yt-dlp (best effort, ~2s); None on failure.
+fn video_title(query: &str) -> Option<String> {
+    let out = std::process::Command::new("yt-dlp")
+        .args(["--no-playlist", "--get-title", "--socket-timeout", "10", query])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if t.is_empty() { None } else { Some(t) }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = SirenConfig::load();
@@ -1371,6 +1474,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Trove { args }) => cmd_trove(&args),
         Some(Cmd::Radio { args }) => cmd_radio(&args),
+        Some(Cmd::Video { url }) => cmd_video(&url),
         Some(Cmd::Sleep { args }) => cmd_sleep(&args),
         Some(Cmd::Queue { args }) => cmd_queue(&args),
         Some(Cmd::Playlist { args }) => cmd_playlist(&args),
