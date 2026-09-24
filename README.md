@@ -51,17 +51,20 @@ with raw `$` in cid/mid.
 
 ## Trove
 
-Free & legal music (Internet Archive), zero new Rust deps (system `curl`):
+Free & legal music (Internet Archive + ccMixter), zero new Rust deps (system `curl`):
 
 ```
-siren trove 10 music lofi   # interactive search + pick
+siren trove music lofi      # 20, then [m] more (infinite scroll)
+siren trove live grateful   # Live Music Archive (etree)
+siren trove ccmixter lofi   # ccMixter remixes (needs Referer, handled)
 siren trove get <identifier>
 siren trove about
 ```
 
-TUI: 5th Tab stop (`trove`), `s` search · `enter` pick version · `1-9` dl ·
-`a` all · `f` session format · mouse wheel + click select, double-click
-acts. Search, metadata and downloads run in background threads.
+TUI: 4th Tab stop (`trove`), `s` search · `enter` pick version · `j/k` +
+auto-prefetch near the end · `m` more · `1-9` dl · `a` all · `f` session
+format · mouse wheel + click select, double-click acts. Search, metadata
+and downloads run in background threads.
 Guards: `.part` resume, skip-if-exists, 40-file cap, 32MB confirm,
 `TROVE_MAX_TOTAL`. Lands in `~/Music/trove/<identifier>`.
 

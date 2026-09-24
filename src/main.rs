@@ -82,8 +82,9 @@ enum Cmd {
         #[arg(long)]
         append: bool,
     },
-    /// Free & legal music (Internet Archive)
+    /// Free & legal music (Internet Archive + ccMixter)
     Trove {
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         args: Vec<String>,
     },
     /// Sleep timer: `siren sleep 30` stops playback in 30min, `off` cancels
@@ -965,7 +966,7 @@ fn trove_format_arg(args: &[String]) -> (Option<String>, Vec<String>) {
 fn cmd_trove(args: &[String]) -> i32 {
     let (format, args) = trove_format_arg(args);
     if args.is_empty() {
-        return trove::run_trove(10, &[], None, format);
+        return trove::run_trove(trove::PAGE_SIZE, &[], None, format);
     }
     let sub = args[0].to_lowercase();
     if sub == "get" || sub == "g" {
@@ -983,7 +984,7 @@ fn cmd_trove(args: &[String]) -> i32 {
     }
     // optional leading count, then kind detection inside run_trove
     let mut words: Vec<String> = args;
-    let mut n = 10u32;
+    let mut n = trove::PAGE_SIZE;
     if let Some(first) = words.first() {
         if let Ok(v) = first.parse::<u32>() {
             n = v;

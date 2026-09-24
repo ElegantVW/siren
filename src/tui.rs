@@ -42,7 +42,7 @@ impl View {
             View::Browser => "enter open/play · a add · c cast · backspace up · / filter · S save · L load · R rm",
             View::Queue => "enter play-from · d remove · c clear",
             View::Audio => "o output · s speaker · S shuffle · r repeat · p pause · v refresh · t test · m mute",
-            View::Trove => "s search · enter pick vers · 1-9 dl · a all · f format · j/k move",
+            View::Trove => "s search · enter vers · j/k · m more · a all · f format · 1-9 dl",
         }
     }
 }
@@ -101,11 +101,17 @@ enum InputMode {
 
 struct TroveState {
     query: String,
+    kind: Option<String>,
+    words: Vec<String>,
     docs: Vec<crate::trove::Doc>,
     total: u64,
     sel: usize,
+    page: u32,
     searching: bool,
-    search_rx: Option<std::sync::mpsc::Receiver<Result<(Vec<crate::trove::Doc>, u64, String), String>>>,
+    search_rx: Option<std::sync::mpsc::Receiver<Result<(Vec<crate::trove::Doc>, u64), String>>>,
+    loading_more: bool,
+    more_rx: Option<std::sync::mpsc::Receiver<Result<(Vec<crate::trove::Doc>, u64), String>>>,
+    exhausted: bool,
     dl_active: bool,
     dl_rx: Option<std::sync::mpsc::Receiver<DlMsg>>,
     log: Vec<String>,
@@ -185,11 +191,17 @@ impl App {
             },
             trove: TroveState {
                 query: String::new(),
+                kind: None,
+                words: Vec::new(),
                 docs: Vec::new(),
                 total: 0,
                 sel: 0,
+                page: 0,
                 searching: false,
                 search_rx: None,
+                loading_more: false,
+                more_rx: None,
+                exhausted: false,
                 dl_active: false,
                 dl_rx: None,
                 log: Vec::new(),
@@ -786,28 +798,84 @@ fn apply_input(app: &mut App, mode: InputMode, val: &str) {
             if q.is_empty() {
                 return;
             }
+            let mut words: Vec<String> =
+                q.split_whitespace().map(|s| s.to_string()).collect();
+            let mut kind: Option<String> = None;
+            if !words.is_empty() && crate::trove::is_kind_token(&words[0]) {
+                kind = Some(words.remove(0));
+            }
             app.trove.query = q.clone();
+            app.trove.kind = kind.clone();
+            app.trove.words = words.clone();
             app.trove.docs.clear();
             app.trove.sel = 0;
+            app.trove.page = 0;
+            app.trove.exhausted = false;
+            app.trove.loading_more = false;
+            app.trove.more_rx = None;
             app.trove.searching = true;
             let (tx, rx) = std::sync::mpsc::channel();
             app.trove.search_rx = Some(rx);
             std::thread::spawn(move || {
-                // kind-first-token + default 10 rows, like CLI
-                let mut words: Vec<String> =
-                    q.split_whitespace().map(|s| s.to_string()).collect();
-                let mut kind: Option<String> = None;
-                if !words.is_empty() && crate::trove::is_kind_token(&words[0]) {
-                    kind = Some(words.remove(0));
-                }
-                let query = crate::trove::build_query(kind.as_deref(), &words);
-                let res = crate::trove::search(&query, 10, 1)
-                    .map(|(docs, n)| (docs, n, query))
-                    .map_err(|e| e);
+                let res = crate::trove::search_page(
+                    kind.as_deref(),
+                    &words,
+                    crate::trove::PAGE_SIZE,
+                    1,
+                );
                 let _ = tx.send(res);
             });
         }
     }
+}
+
+fn trove_page_short(got: usize, total: u64) -> bool {
+    if got < crate::trove::PAGE_SIZE as usize {
+        return true;
+    }
+    total > 0 && got as u64 >= total
+}
+
+fn trove_maybe_prefetch(app: &mut App) {
+    if app.trove.searching || app.trove.loading_more || app.trove.exhausted {
+        return;
+    }
+    if app.trove.docs.is_empty() || app.trove.query.is_empty() {
+        return;
+    }
+    let n = app.trove.docs.len();
+    if n > 0 && app.trove.total > 0 && n as u64 >= app.trove.total {
+        app.trove.exhausted = true;
+        return;
+    }
+    if app.trove.sel + crate::trove::PREFETCH_WITHIN < n {
+        return;
+    }
+    trove_fetch_more(app);
+}
+
+fn trove_fetch_more(app: &mut App) {
+    if app.trove.searching || app.trove.loading_more || app.trove.exhausted {
+        return;
+    }
+    if app.trove.query.is_empty() {
+        return;
+    }
+    let kind = app.trove.kind.clone();
+    let words = app.trove.words.clone();
+    let page = app.trove.page + 1;
+    app.trove.loading_more = true;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.trove.more_rx = Some(rx);
+    std::thread::spawn(move || {
+        let res = crate::trove::search_page(
+            kind.as_deref(),
+            &words,
+            crate::trove::PAGE_SIZE,
+            page,
+        );
+        let _ = tx.send(res);
+    });
 }
 
 /// Harvest finished trove search/download threads (non-blocking).
@@ -815,12 +883,14 @@ fn poll_trove(app: &mut App) {
     if app.trove.searching {
         if let Some(rx) = app.trove.search_rx.as_ref() {
             match rx.try_recv() {
-                Ok(Ok((docs, total, _query))) => {
+                Ok(Ok((docs, total))) => {
                     app.trove.docs = docs;
                     app.trove.total = total;
                     app.trove.sel = 0;
+                    app.trove.page = 1;
                     app.trove.searching = false;
                     app.trove.search_rx = None;
+                    app.trove.exhausted = trove_page_short(app.trove.docs.len(), total);
                     app.say(format!(
                         "{} hits ({} total)",
                         app.trove.docs.len(),
@@ -842,6 +912,48 @@ fn poll_trove(app: &mut App) {
             app.trove.searching = false;
         }
     }
+    if app.trove.loading_more {
+        if let Some(rx) = app.trove.more_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(Ok((chunk, total))) => {
+                    let added = chunk.len();
+                    if total > 0 {
+                        app.trove.total = total;
+                    }
+                    crate::trove::append_unique(&mut app.trove.docs, chunk);
+                    app.trove.page = app.trove.page.saturating_add(1);
+                    app.trove.loading_more = false;
+                    app.trove.more_rx = None;
+                    if added < crate::trove::PAGE_SIZE as usize
+                        || (app.trove.total > 0 && app.trove.docs.len() as u64 >= app.trove.total)
+                    {
+                        app.trove.exhausted = true;
+                    }
+                    if added > 0 {
+                        app.say(format!(
+                            "{} shown ({} total)",
+                            app.trove.docs.len(),
+                            app.trove.total
+                        ));
+                    }
+                }
+                Ok(Err(e)) => {
+                    app.trove.loading_more = false;
+                    app.trove.more_rx = None;
+                    app.trove.exhausted = true;
+                    app.say(format!("more failed: {e}"));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.trove.loading_more = false;
+                    app.trove.more_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        } else {
+            app.trove.loading_more = false;
+        }
+    }
+    trove_maybe_prefetch(app);
     if app.trove.dl_active {
         if let Some(rx) = app.trove.dl_rx.as_ref() {
             loop {
@@ -1051,6 +1163,13 @@ fn handle_trove(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
         KeyCode::Char('s') => {
             app.input = Some(InputMode::TroveSearch);
             app.input_buf.clear();
+        }
+        KeyCode::Char('m') => {
+            if app.trove.exhausted {
+                app.say("end of results");
+            } else {
+                trove_fetch_more(app);
+            }
         }
         KeyCode::Enter => {
             trove_ask_format(app, app.trove.sel);
@@ -1514,7 +1633,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             InputMode::SavePl => "save playlist as",
             InputMode::LoadPl => "load playlist",
             InputMode::RmPl => "remove playlist",
-            InputMode::TroveSearch => "trove search (kind + words)",
+            InputMode::TroveSearch => "trove search (music|live|ccmixter + words)",
         };
         (
             format!(" ✦ {prompt} ✦ "),
@@ -1546,13 +1665,17 @@ fn draw(f: &mut Frame, app: &mut App) {
                 View::Audio => format!("out:{} · spk:{} · tab cycle · q quit", app.cfg.audio_output, app.cfg.audio_speaker),
                 View::Trove => {
                     let st = if app.trove.searching {
-                        "searching…"
+                        "searching…".to_string()
+                    } else if app.trove.loading_more {
+                        format!("{}+… / {}", app.trove.docs.len(), app.trove.total)
                     } else if app.trove.dl_active {
-                        "downloading…"
+                        "downloading…".to_string()
                     } else if app.trove.docs.is_empty() {
-                        "s to search"
+                        "s to search".to_string()
+                    } else if app.trove.exhausted {
+                        format!("{} / {} · end", app.trove.docs.len(), app.trove.total)
                     } else {
-                        "enter vers · 1-9 dl · a all"
+                        format!("{} / {}", app.trove.docs.len(), app.trove.total)
                     };
                     format!("{st} · fmt:{} · tab cycle · q quit", app.trove.fmt)
                 }
@@ -1748,6 +1871,17 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             Style::default().fg(Color::DarkGray),
         ))));
     }
+    if app.trove.loading_more {
+        rows.push(ListItem::new(Line::from(Span::styled(
+            "  loading more…",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    } else if app.trove.exhausted && !app.trove.docs.is_empty() {
+        rows.push(ListItem::new(Line::from(Span::styled(
+            "  — end —",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
     if let Some(idx) = app.trove.fmt_for {
         if let Some(d) = app.trove.docs.get(idx) {
             let opts: Vec<String> = app
@@ -1788,8 +1922,15 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let title = if app.trove.query.is_empty() {
         String::new()
     } else {
+        let extra = if app.trove.loading_more {
+            " · loading more…"
+        } else if app.trove.exhausted {
+            " · end"
+        } else {
+            ""
+        };
         format!(
-            "  {} hits ({} total) for “{}”",
+            "  {} / {} for “{}”{extra}",
             app.trove.docs.len(),
             app.trove.total,
             app.trove.query

@@ -1,19 +1,24 @@
-//! Trove — free & legal music from the Internet Archive.
+//! Trove — free & legal music (Internet Archive + ccMixter).
 //!
-//! Mirrors `faeOS/bin/ia.py` (543 lines): same query language, same
-//! destinations, same guards (resume, skip-if-exists, 40-file cap,
-//! 32MB confirm, TROVE_MAX_TOTAL). HTTP via system `curl` — zero new
-//! Rust dependencies (std can't do HTTPS alone).
-//!
+//! HTTP via system `curl` — zero new Rust dependencies.
 //! Music scope: audio kinds by default; `get` works for anything.
+//!
+//! Paging: `search`/`search_page` take (rows, page). TUI prefetches the
+//! next page before the cursor hits the end; CLI has `[m] more`.
 
 use serde_json::Value;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-const UA: &str = "siren-trove/1.0 (legal archive.org client; +https://archive.org)";
+const UA: &str = "siren-trove/1.0 (legal archive.org + ccmixter client)";
 const IA_SEARCH: &str = "https://archive.org/advancedsearch.php";
+const CC_QUERY: &str = "https://ccmixter.org/api/query";
+
+/// TUI page size. CLI `siren trove N …` still overrides (clamped 1–50).
+pub const PAGE_SIZE: u32 = 20;
+/// Prefetch the next page when the cursor is this close to the end.
+pub const PREFETCH_WITHIN: usize = 6;
 
 fn audio_dir() -> PathBuf {
     std::env::var("TROVE_AUDIO_DIR")
@@ -55,6 +60,7 @@ fn kind_map(kind: &str) -> Option<(&'static str, &'static str)> {
         "album" => ("audio", "(subject:(album) OR subject:(music) OR collection:(netlabels))"),
         "podcast" | "podcasts" | "shows" => ("audio", "(subject:(podcast) OR collection:(podcasts) OR title:(podcast))"),
         "audiobook" | "audiobooks" => ("audio", "(collection:(librivoxaudio) OR subject:(audiobook) OR creator:(LibriVox))"),
+        "live" | "etree" | "lma" | "jam" => ("etree", "collection:(etree)"),
         "movie" => ("movies", "(subject:(feature) OR subject:(film) OR collection:(feature_films))"),
         "movies" => ("movies", "(subject:(feature) OR collection:(feature_films))"),
         "films" => ("movies", "(subject:(film) OR collection:(feature_films))"),
@@ -65,9 +71,20 @@ fn kind_map(kind: &str) -> Option<(&'static str, &'static str)> {
     })
 }
 
+pub fn is_ccmixter_kind(s: &str) -> bool {
+    matches!(
+        s.to_lowercase().as_str(),
+        "ccmixter" | "cc" | "remix" | "remixes" | "mixter"
+    )
+}
+
 pub fn is_kind_token(s: &str) -> bool {
     let lo = s.to_lowercase();
-    kind_map(&lo).is_some() || lo == "audio" || lo == "films"
+    kind_map(&lo).is_some() || lo == "audio" || lo == "films" || is_ccmixter_kind(&lo)
+}
+
+pub fn is_ccmixter_ident(ident: &str) -> bool {
+    ident.starts_with("ccmixter:")
 }
 
 pub fn build_query(kind: Option<&str>, terms: &[String]) -> String {
@@ -131,6 +148,13 @@ fn first_str(v: &Value, key: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Source {
+    #[default]
+    Archive,
+    CcMixter,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Doc {
     pub identifier: String,
@@ -139,6 +163,7 @@ pub struct Doc {
     pub year: String,
     pub mediatype: String,
     pub downloads: String,
+    pub source: Source,
 }
 
 fn to_doc(v: &Value) -> Doc {
@@ -149,7 +174,26 @@ fn to_doc(v: &Value) -> Doc {
         year: first_str(v, "year"),
         mediatype: first_str(v, "mediatype"),
         downloads: first_str(v, "downloads"),
+        source: Source::Archive,
     }
+}
+
+/// Dispatch search: ccMixter kinds hit ccmixter.org, everything else IA.
+pub fn search_page(
+    kind: Option<&str>,
+    terms: &[String],
+    rows: u32,
+    page: u32,
+) -> Result<(Vec<Doc>, u64), String> {
+    let rows = rows.clamp(1, 50);
+    let page = page.max(1);
+    if kind.map(is_ccmixter_kind).unwrap_or(false) {
+        let q = terms.join(" ");
+        let offset = (page - 1) * rows;
+        return search_ccmixter(&q, rows, offset);
+    }
+    let query = build_query(kind, terms);
+    search(&query, rows, page)
 }
 
 /// Search archive.org. Returns (docs, num_found).
@@ -172,6 +216,76 @@ pub fn search(query: &str, rows: u32, page: u32) -> Result<(Vec<Doc>, u64), Stri
         .unwrap_or_default();
     let n = resp.get("numFound").and_then(|x| x.as_u64()).unwrap_or(0);
     Ok((docs, n))
+}
+
+fn search_ccmixter(q: &str, rows: u32, offset: u32) -> Result<(Vec<Doc>, u64), String> {
+    let mut base = format!("{CC_QUERY}?datasource=uploads&search_type=any");
+    if !q.trim().is_empty() {
+        base.push_str("&search=");
+        base.push_str(&percent_encode(q.trim()));
+    }
+    let total = {
+        let text = curl_text(&format!("{base}&f=count"))?;
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        match v {
+            Value::Number(n) => n.as_u64().unwrap_or(0),
+            Value::Array(a) => a.first().and_then(|x| x.as_u64()).unwrap_or(0),
+            _ => 0,
+        }
+    };
+    // ccmixter chokes curl past ~100KB per response (limit 20+); fetch in
+    // 10s and concat so one logical page is still PAGE_SIZE rows.
+    let mut docs: Vec<Doc> = Vec::new();
+    let mut off = offset;
+    let end = offset + rows;
+    while off < end {
+        let lim = (end - off).min(10);
+        let text = curl_text(&format!("{base}&f=json&limit={lim}&offset={off}"))?;
+        let v: Value = serde_json::from_str(&text).map_err(|e| format!("json: {e}"))?;
+        let arr = v.as_array().cloned().unwrap_or_default();
+        let n = arr.len();
+        docs.extend(arr.iter().filter_map(cc_to_doc));
+        off += lim;
+        if (n as u32) < lim {
+            break;
+        }
+    }
+    Ok((docs, total))
+}
+
+fn cc_to_doc(v: &Value) -> Option<Doc> {
+    let id = v.get("upload_id")?.as_u64().or_else(|| {
+        v.get("upload_id")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+    })?;
+    let title = first_str(v, "upload_name");
+    let creator = {
+        let real = first_str(v, "user_real_name");
+        if real.is_empty() {
+            first_str(v, "user_name")
+        } else {
+            real
+        }
+    };
+    Some(Doc {
+        identifier: format!("ccmixter:{id}"),
+        title,
+        creator,
+        year: String::new(),
+        mediatype: "ccmixter".into(),
+        downloads: first_str(v, "upload_num_scores"),
+        source: Source::CcMixter,
+    })
+}
+
+/// Append `src` onto `dst`, skipping duplicate identifiers.
+pub fn append_unique(dst: &mut Vec<Doc>, src: Vec<Doc>) {
+    for d in src {
+        if !dst.iter().any(|x| x.identifier == d.identifier) {
+            dst.push(d);
+        }
+    }
 }
 
 fn percent_encode(s: &str) -> String {
@@ -239,6 +353,19 @@ fn ext_of(name: &str) -> Option<String> {
 
 /// Distinct audio formats an item offers, in preference order.
 pub fn available_formats(ident: &str, mediatype: &str) -> Result<Vec<String>, String> {
+    if is_ccmixter_ident(ident) {
+        let targets = pick_ccmixter_targets(ident, None)?;
+        let mut have: Vec<String> = Vec::new();
+        for t in &targets {
+            if let Some(e) = ext_of(&t.name) {
+                if AUDIO_EXT.contains(&format!(".{e}").as_str()) && !have.contains(&e) {
+                    have.push(e);
+                }
+            }
+        }
+        have.sort_by_key(|e| FORMAT_ORDER.iter().position(|o| o == e).unwrap_or(99));
+        return Ok(have);
+    }
     let meta = item_meta(ident)?;
     let files = meta.get("files").and_then(|f| f.as_array()).cloned().unwrap_or_default();
     let mut have: Vec<String> = Vec::new();
@@ -271,9 +398,66 @@ pub fn plan_download(ident: &str, mediatype: &str) -> Result<(Vec<Target>, Vec<S
     Ok((targets, fmts))
 }
 
+fn pick_ccmixter_targets(ident: &str, format: Option<&str>) -> Result<Vec<Target>, String> {
+    let id = ident.strip_prefix("ccmixter:").unwrap_or(ident);
+    let text = curl_text(&format!("{CC_QUERY}?f=json&ids={id}"))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("json: {e}"))?;
+    let item = v
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .ok_or_else(|| format!("ccmixter item not found: {id}"))?;
+    let files = item
+        .get("files")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let dest_dir = audio_dir().join(sanitize_ident(&format!("ccmixter-{id}")));
+    let want = format.map(|s| s.to_lowercase());
+    let mut targets = Vec::new();
+    for f in &files {
+        let name = f.get("file_name").and_then(|x| x.as_str()).unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let url = f
+            .get("download_url")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if url.is_empty() {
+            continue;
+        }
+        let ext = ext_of(name).unwrap_or_default();
+        let is_audio = AUDIO_EXT.contains(&format!(".{ext}").as_str());
+        if let Some(w) = &want {
+            if w != "all" && ext != *w {
+                continue;
+            }
+        } else if !is_audio {
+            continue;
+        }
+        let size = f.get("file_rawsize").and_then(|s| s.as_u64()).unwrap_or(0);
+        let base = name.rsplit('/').next().unwrap_or(name).to_string();
+        targets.push(Target {
+            url,
+            name: base,
+            dir: dest_dir.clone(),
+            size,
+        });
+        if targets.len() >= 40 {
+            break;
+        }
+    }
+    Ok(targets)
+}
+
 /// (url, filename, dest_dir, size) — video decided by mediatype.
 /// `format`: Some(ext) keeps one file per song (stem-dedupe); None/"all" keeps everything.
 pub fn pick_targets(ident: &str, mediatype: &str, format: Option<&str>) -> Result<Vec<Target>, String> {
+    if is_ccmixter_ident(ident) {
+        return pick_ccmixter_targets(ident, format);
+    }
     let meta = item_meta(ident)?;
     let files = meta.get("files").and_then(|f| f.as_array()).cloned().unwrap_or_default();
     let mt = if mediatype.is_empty() {
@@ -440,15 +624,13 @@ pub fn download_file(
     } else {
         &["-fL", "--retry", "2", "--retry-delay", "2", "--max-time", "0", "-C", "-", "--progress-bar"]
     };
-    let mut child = match Command::new("curl")
-        .args(meter_args)
-        .arg("-A")
-        .arg(UA)
-        .arg("-o")
-        .arg(&part)
-        .arg(url)
-        .stderr(Stdio::inherit())
-        .spawn()
+    let mut cmd = Command::new("curl");
+    cmd.args(meter_args).arg("-A").arg(UA);
+    // ccmixter hotlink-guards /content/* (403 without a same-origin Referer)
+    if url.contains("ccmixter.org") {
+        cmd.arg("-e").arg("https://ccmixter.org/");
+    }
+    let mut child = match cmd.arg("-o").arg(&part).arg(url).stderr(Stdio::inherit()).spawn()
     {
         Ok(c) => c,
         Err(e) => {
@@ -616,23 +798,52 @@ pub fn run_trove(
     if k.is_none() && !words.is_empty() && is_kind_token(&words[0]) {
         k = Some(words.remove(0));
     }
+    let mut page = 1u32;
+    let mut docs: Vec<Doc> = Vec::new();
+    let mut num_found = 0u64;
     loop {
-        let query = build_query(k.as_deref(), &words);
-        eprintln!("  searching archive.org …");
-        let short = query.chars().take(120).collect::<String>();
-        eprintln!("  q: {short}{}", if query.len() > 120 { "…" } else { "" });
+        let where_ = if k.as_deref().map(is_ccmixter_kind).unwrap_or(false) {
+            "ccmixter.org"
+        } else {
+            "archive.org"
+        };
+        if page == 1 {
+            eprintln!("  searching {where_} …");
+        } else {
+            eprintln!("  more from {where_} (page {page}) …");
+        }
         let t0 = std::time::Instant::now();
-        let (docs, num_found) = match search(&query, n, 1) {
-            Ok(r) => r,
+        match search_page(k.as_deref(), &words, n, page) {
+            Ok((chunk, total)) => {
+                num_found = total;
+                let before = docs.len();
+                append_unique(&mut docs, chunk);
+                eprintln!(
+                    "  got {} hits ({} total) in {:.1}s",
+                    docs.len() - before,
+                    num_found,
+                    t0.elapsed().as_secs_f32()
+                );
+            }
             Err(e) => {
                 eprintln!("  search failed: {e}");
                 eprintln!("  tip: ether net checks the weave");
                 return 1;
             }
+        }
+        let qlabel = if k.as_deref().map(is_ccmixter_kind).unwrap_or(false) {
+            format!("ccmixter {}", words.join(" "))
+        } else {
+            build_query(k.as_deref(), &words)
         };
-        eprintln!("  got {} hits ({num_found} total) in {:.1}s", docs.len(), t0.elapsed().as_secs_f32());
-        match interactive_list(&docs, num_found, &query, format.clone()) {
+        let more = (num_found > 0 && (docs.len() as u64) < num_found)
+            || (num_found == 0 && docs.len() >= (page * n) as usize);
+        match interactive_list(&docs, num_found, &qlabel, format.clone(), more) {
             Loop::Quit => return 0,
+            Loop::More => {
+                page += 1;
+                continue;
+            }
             Loop::Again => {
                 eprint!("new search words (or empty to keep): ");
                 let _ = io::stderr().flush();
@@ -649,6 +860,9 @@ pub fn run_trove(
                         words = parts;
                     }
                 }
+                page = 1;
+                docs.clear();
+                num_found = 0;
             }
             Loop::Done => return 0,
         }
@@ -658,6 +872,7 @@ pub fn run_trove(
 enum Loop {
     Quit,
     Again,
+    More,
     Done,
 }
 
@@ -666,6 +881,7 @@ fn interactive_list(
     num_found: u64,
     query: &str,
     format: Option<String>,
+    more: bool,
 ) -> Loop {
     println!();
     println!("  query:   {query}");
@@ -681,7 +897,11 @@ fn interactive_list(
         println!("  {l2}");
         println!();
     }
-    println!("  [1-N] download   [a] download all listed   [s] search again   [q] quit");
+    if more {
+        println!("  [1-N] download   [a] all listed   [m] more   [s] search again   [q] quit");
+    } else {
+        println!("  [1-N] download   [a] all listed   [s] search again   [q] quit");
+    }
     println!();
     loop {
         eprint!("trove> ");
@@ -694,6 +914,7 @@ fn interactive_list(
         match choice.trim().to_lowercase().as_str() {
             "q" | "quit" | "exit" => return Loop::Quit,
             "s" | "search" | "again" | "r" => return Loop::Again,
+            "m" | "more" | "n" | "next" if more => return Loop::More,
             "a" | "all" => {
                 for d in docs {
                     let f = format.clone().or_else(|| choose_format(&d.identifier, &d.mediatype));
@@ -708,12 +929,12 @@ fn interactive_list(
                     let d = &docs[n - 1];
                     let f = format.clone().or_else(|| choose_format(&d.identifier, &d.mediatype));
                     do_download(&d.identifier, &d.mediatype, &d.title, f.as_deref());
-                    println!("Another number, [s] search again, or [q] quit?");
+                    println!("Another number, [m] more, [s] search again, or [q] quit?");
                     continue;
                 }
-                println!("Pick a number, a, s, or q.");
+                println!("Pick a number, a, m, s, or q.");
             }
-            _ => println!("Pick a number, a, s, or q."),
+            _ => println!("Pick a number, a, m, s, or q."),
         }
     }
 }
@@ -745,9 +966,11 @@ pub fn run_get(identifier: &str, format: Option<String>) -> i32 {
 pub fn about_text() -> Vec<String> {
     vec![
         "siren trove — free & legal media".into(),
-        "(Internet Archive)".into(),
+        "(Internet Archive + ccMixter)".into(),
         "".into(),
-        "  siren trove 10 music lofi      search + pick".into(),
+        "  siren trove music lofi          search + pick (20, then [m] more)".into(),
+        "  siren trove live grateful       Live Music Archive (etree)".into(),
+        "  siren trove ccmixter lofi       ccMixter remixes".into(),
         "  siren trove podcast history     kind + terms".into(),
         "  siren trove get <identifier>    download one item".into(),
         "  --format mp3|flac|ogg|all      pick a version (else it asks)".into(),
