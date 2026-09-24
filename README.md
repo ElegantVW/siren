@@ -85,9 +85,12 @@ siren radio fav <words>       toggle favorite
 TUI: 5th Tab stop (`radio`). `Enter` with no country opens the country
 picker (a-z, cached a week); `Enter`/`d` plays the cursor row, `c`
 re-picks country, `s` searches, `f` toggles favorite (★ pinned on top),
-`m` more. Favorites + last country persist in
-`~/.config/siren/radio.json`. Streams ride the queue as URL items
-(station name as label); speaker `play_stream` verified live.
+`A` favorites any stream URL, `m` more. Favorites + last country persist
+in `~/.config/siren/radio.json`. Streams ride the queue as URL items
+(station name as label). Radio is local-only on this unit: the speaker
+accepts `play_stream` then drops it (MP3/AAC, WAN/LAN all verified to
+`stop`), and its TuneIn/etc. read `available:false` without app logins —
+files still cast fine.
 Guards: `.part` resume, skip-if-exists, 40-file cap, 32MB confirm,
 `TROVE_MAX_TOTAL`. Lands in `~/Music/trove/<identifier>`.
 

@@ -5,7 +5,8 @@
 //! routes by `audio_output` + item kind:
 //! - local files → mpv playlist mirror (files and stream URLs alike)
 //! - speaker files → DLNA cast in order (play-now + appends)
-//! - speaker streams (radio) → `play_stream` (one at a time)
+//! - speaker streams → refused with a clear message: this HEOS 1 unit
+//!   won't hold `play_stream` (verified), so radio is local-only
 //!
 //! Stream items are queue items whose path is an `http(s)` URL with the
 //! station name in `display`.
@@ -39,17 +40,14 @@ pub fn play_from(cfg: &SirenConfig, index: usize) -> Result<String, String> {
     let (ip, pid, name) = speaker_target(cfg).ok_or_else(|| "no speaker found".to_string())?;
     let slice = &items[index..];
     if crate::meta::is_url(&slice[0].path) {
-        let title = if slice[0].display.is_empty() {
-            slice[0].path.clone()
-        } else {
-            slice[0].display.clone()
-        };
-        if heos::play_stream(&ip, pid, &slice[0].path) {
-            heos::note_stream(&slice[0].path, &title);
-            Ok(format!("▶ {title} on {name}"))
-        } else {
-            Err(format!("stream failed: {title}"))
-        }
+        // Truthful: this unit accepts play_stream then drops it (verified
+        // 5 ways: MP3/AAC, WAN/LAN, with and without a play kick — always
+        // back to stop), and its TuneIn/Deezer/etc. all read
+        // available:false without app logins. Radio is local-only here.
+        let _ = (&ip, pid, &name);
+        return Err(
+            "radio needs output local on this unit (the speaker won't hold streams)".into(),
+        );
     } else {
         // files cast in order; stray streams after files can't ride DLNA
         let files: Vec<std::path::PathBuf> = slice

@@ -51,7 +51,7 @@ impl View {
             View::Queue => "enter play-from · d remove · c clear",
             View::Audio => "o output · s speaker · S shuffle · r repeat · p pause · v refresh · t test · m mute",
             View::Trove => "s search · enter vers · d dl · j/k · m more · a all · f format",
-            View::Radio => "enter play · d play · c country · s search · f fav · m more · j/k",
+            View::Radio => "enter play · d play · c country · s search · f fav · A add url · m more · j/k",
         }
     }
 }
@@ -107,6 +107,7 @@ enum InputMode {
     RmPl,
     TroveSearch,
     RadioSearch,
+    RadioAdd,
 }
 
 struct TroveState {
@@ -902,6 +903,22 @@ fn apply_input(app: &mut App, mode: InputMode, val: &str) {
                 app.say(format!("Playlist not found: {}", val.trim()));
             }
         }
+        InputMode::RadioAdd => {
+            // "url [name...]" — favorites any stream, directory or not
+            let mut parts = val.split_whitespace();
+            let Some(url) = parts.next() else {
+                app.say("need a stream url");
+                return;
+            };
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                app.say("need an http(s) stream url");
+                return;
+            }
+            let name: String = parts.collect::<Vec<_>>().join(" ");
+            let st = radio::add_url(url, &name);
+            app.radio.favs = radio::favs();
+            app.say(format!("fav: {}", st.name));
+        }
         InputMode::RadioSearch => {
             let q = val.trim().to_string();
             app.radio.query = q;
@@ -1490,19 +1507,11 @@ fn poll_radio(app: &mut App) {
             match rx.try_recv() {
                 Ok(Ok(chunk)) => {
                     let short = chunk.len() < radio::PAGE_SIZE;
-                    let mut added = 0;
-                    for s in chunk {
-                        if !app.radio.stations.iter().any(|x| {
-                            (!x.uuid.is_empty() && x.uuid == s.uuid) || x.url == s.url
-                        }) {
-                            app.radio.stations.push(s);
-                            added += 1;
-                        }
-                    }
+                    let changed = radio::merge_unique(&mut app.radio.stations, chunk);
                     app.radio.page = app.radio.page.saturating_add(1);
                     app.radio.loading_more = false;
                     app.radio.more_rx = None;
-                    if short || added == 0 {
+                    if short || changed == 0 {
                         app.radio.exhausted = true;
                     }
                 }
@@ -1614,6 +1623,10 @@ fn handle_radio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
             } else {
                 radio_fetch(app, app.radio.page + 1);
             }
+        }
+        KeyCode::Char('A') => {
+            app.input = Some(InputMode::RadioAdd);
+            app.input_buf.clear();
         }
         _ => {}
     }
@@ -2047,6 +2060,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             InputMode::RmPl => "remove playlist",
             InputMode::TroveSearch => "trove search (music|live|ccmixter + words)",
             InputMode::RadioSearch => "radio search (station name)",
+            InputMode::RadioAdd => "radio add (stream url [name])",
         };
         (
             format!(" ✦ {prompt} ✦ "),
@@ -2109,7 +2123,15 @@ fn draw(f: &mut Frame, app: &mut App) {
                     } else {
                         format!("{}", radio_len(app))
                     };
-                    format!("{where_} · {st} · favs:{} · tab cycle · q quit", app.radio.favs.len())
+                    let radio_note = if app.is_heos() {
+                        " · radio needs out:local"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{where_} · {st} · favs:{}{radio_note} · tab cycle · q quit",
+                        app.radio.favs.len()
+                    )
                 }
             };
             lines.push(Line::from(Span::styled(format!("  {hint}"), Style::default().fg(Color::DarkGray))));

@@ -1045,18 +1045,19 @@ fn cmd_radio(args: &[String]) -> i32 {
                 eprintln!("usage: siren radio play <words>");
                 return 2;
             }
-            let stations = match radio::search(&q, 5, 0) {
+            let stations = match radio::search_many(&q, 60) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("radio search failed: {e}");
                     return 1;
                 }
             };
-            let Some(st) = stations.first() else {
+            let Some(st) = radio::best_match(&q, &stations) else {
                 println!("No stations match: {q}");
                 return 1;
             };
-            queue::replace(vec![radio::to_queue_item(st)]);
+            queue::replace(vec![radio::to_queue_item(&st)]);
+            println!("tuning: {} ({})", st.name, st.url);
             let cfg = SirenConfig::load();
             match output::play_from(&cfg, 0) {
                 Ok(m) => {
@@ -1082,22 +1083,36 @@ fn cmd_radio(args: &[String]) -> i32 {
                 return 0;
             }
             let q = args[1..].join(" ");
-            let stations = match radio::search(&q, 5, 0) {
+            let stations = match radio::search_many(&q, 60) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("radio search failed: {e}");
                     return 1;
                 }
             };
-            let Some(st) = stations.first() else {
+            let Some(st) = radio::best_match(&q, &stations) else {
                 println!("No stations match: {q}");
                 return 1;
             };
-            if radio::toggle_fav(st) {
+            if radio::toggle_fav(&st) {
                 println!("fav: {}", st.name);
             } else {
                 println!("unfaved: {}", st.name);
             }
+            0
+        }
+        "add" | "url" => {
+            let Some(url) = args.get(1).cloned() else {
+                eprintln!("usage: siren radio add <stream-url> [name]");
+                return 2;
+            };
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                eprintln!("need an http(s) stream url");
+                return 2;
+            }
+            let name = args[2..].join(" ");
+            let st = radio::add_url(&url, &name);
+            println!("fav: {} ({})", st.name, st.url);
             0
         }
         "about" | "help" | "-h" | "--help" | "" => {

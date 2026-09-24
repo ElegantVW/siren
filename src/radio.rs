@@ -80,7 +80,8 @@ fn state_path() -> std::path::PathBuf {
 }
 
 fn by_name(mut v: Vec<Station>) -> Vec<Station> {
-    v.sort_by_key(|s| s.name.to_lowercase());
+    // trim: entries like " M80…" (leading space) otherwise sort first
+    v.sort_by_key(|s| s.name.trim().to_lowercase());
     v
 }
 
@@ -94,12 +95,8 @@ fn to_station(v: &serde_json::Value) -> Option<Station> {
     if url.is_empty() || (!url.starts_with("http://") && !url.starts_with("https://")) {
         return None;
     }
-    // prefer stations that checked out OK (missing field = keep)
-    if let Some(ok) = v.get("lastcheckok").and_then(|x| x.as_i64()) {
-        if ok == 0 {
-            return None;
-        }
-    }
+    // No health filtering: the directory's automated check is flaky and
+    // hides working stations. Dead links fail loudly per-station instead.
     Some(Station {
         uuid: v.get("stationuuid").and_then(|x| x.as_str()).unwrap_or("").into(),
         name: v.get("name").and_then(|x| x.as_str()).unwrap_or(url).trim().into(),
@@ -236,20 +233,99 @@ pub fn search(query: &str, limit: usize, offset: usize) -> Result<Vec<Station>, 
     for tok in query.split_whitespace() {
         match one(tok, limit, 0) {
             Ok(chunk) => {
-                for s in chunk {
-                    if !merged.iter().any(|m: &Station| {
-                        (!m.uuid.is_empty() && m.uuid == s.uuid) || m.url == s.url
-                    }) {
-                        merged.push(s);
-                    }
-                }
+                merge_unique(&mut merged, chunk);
             }
             Err(e) => return Err(e),
         }
     }
-    merged.sort_by_key(|s| s.name.to_lowercase());
+    merged.sort_by_key(|s| s.name.trim().to_lowercase());
     merged.truncate(limit);
     Ok(merged)
+}
+
+/// Deeper candidate pool for `play`/`fav`: the first alphabetical page
+/// often cuts off the right station, and the endpoint only orders by
+/// name — so phrase pages plus one page per token, merged + deduped.
+pub fn search_many(query: &str, total: usize) -> Result<Vec<Station>, String> {
+    let total = total.clamp(1, 80);
+    let mut out: Vec<Station> = Vec::new();
+    let mut offset = 0;
+    for _ in 0..3 {
+        let chunk = search(query, 20, offset)?;
+        let n = chunk.len();
+        merge_unique(&mut out, chunk);
+        if n < 20 {
+            break;
+        }
+        offset += 20;
+    }
+    if query.trim().contains(' ') {
+        for tok in query.split_whitespace() {
+            if out.len() >= total {
+                break;
+            }
+            merge_unique(&mut out, search(tok, 20, 0)?);
+        }
+    }
+    out.truncate(total);
+    Ok(out)
+}
+
+/// Merge stations, skipping dupes (same uuid/url). On conflict the
+/// shorter name wins — directory dupes like "M80 Radio Macau - 80s" vs
+/// "M80 Rádio – 80s" share one URL, and the concise label is the keeper.
+/// Returns changed count (added + replaced).
+pub fn merge_unique(dst: &mut Vec<Station>, chunk: Vec<Station>) -> usize {
+    let mut changed = 0;
+    for s in chunk {
+        if let Some(pos) = dst.iter().position(|m: &Station| {
+            (!m.uuid.is_empty() && m.uuid == s.uuid) || m.url == s.url
+        }) {
+            if s.name.trim().len() < dst[pos].name.trim().len() {
+                dst[pos] = s;
+                changed += 1;
+            }
+        } else {
+            dst.push(s);
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// Best match for `play`/`fav`: exact → prefix → substring on the name,
+/// then tags. Alphabetical only breaks ties (token-fallback merges can
+/// otherwise surface "# ..." junk first).
+pub fn best_match(query: &str, stations: &[Station]) -> Option<Station> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return stations.first().cloned();
+    }
+    let mut scored: Vec<(u8, &Station)> = Vec::new();
+    for s in stations {
+        let name = s.name.trim().to_lowercase();
+        let rank = if name == q {
+            0
+        } else if name.starts_with(&q) {
+            1
+        } else if name.contains(&q) {
+            2
+        } else if q.split_whitespace().all(|t| name.contains(t)) {
+            3
+        } else if s.tags.to_lowercase().contains(&q) {
+            4
+        } else {
+            5
+        };
+        scored.push((rank, s));
+    }
+    scored.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            // shorter = more specific ("M80 Rádio – 80s" beats "M80 Radio Macau - 80s")
+            .then(a.1.name.trim().len().cmp(&b.1.name.trim().len()))
+            .then(a.1.name.trim().to_lowercase().cmp(&b.1.name.trim().to_lowercase()))
+    });
+    scored.into_iter().next().map(|(_, s)| s.clone())
 }
 
 pub fn to_queue_item(s: &Station) -> crate::queue::QueueItem {
@@ -305,8 +381,38 @@ pub fn set_country(name: &str) {
 
 pub fn favs() -> Vec<Station> {
     let mut f = load_state().favs;
-    f.sort_by_key(|s| s.name.to_lowercase());
+    f.sort_by_key(|s| s.name.trim().to_lowercase());
     f
+}
+
+/// Favorite a raw stream URL (directory or not). Name defaults to the host.
+pub fn add_url(url: &str, name: &str) -> Station {
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url);
+    let st = Station {
+        uuid: String::new(),
+        name: if name.trim().is_empty() {
+            host.to_string()
+        } else {
+            name.trim().to_string()
+        },
+        url: url.to_string(),
+        codec: String::new(),
+        bitrate: 0,
+        tags: String::new(),
+        country: String::new(),
+    };
+    let mut state = load_state();
+    if !state.favs.iter().any(|f| f.url == st.url) {
+        state.favs.push(st.clone());
+        save_state(&state);
+    }
+    st
 }
 
 /// Toggle favorite by station uuid. Returns true when now a fav.
@@ -338,6 +444,7 @@ pub fn about_text() -> Vec<String> {
         "  siren radio play <words>      play top match (output channel)".into(),
         "  siren radio fav               list favorites".into(),
         "  siren radio fav <words>       toggle favorite".into(),
+        "  siren radio add <url> [name]  favorite any stream url".into(),
         "".into(),
         "TUI: Tab to radio, Enter picks a country, Enter plays.".into(),
     ]
