@@ -1,9 +1,8 @@
 //! Library scan + fuzzy resolve — mirrors Python `scan_library`,
 //! `resolve_library`, `fuzzy_score`, `resolve_play_args`.
 //!
-//! Simplification (documented): the Python scorer also matches against
-//! `meta_display` (cached audio tags). Rust v1 matches against the path
-//! plus the file stem; tag matching lands with the metadata-cache slice.
+//! Fuzzy scorer matches path, file stem, and cached tags (`meta`).
+//! Tag lookup is cache-only here so resolve never spawns ffprobe.
 
 use crate::config::SirenConfig;
 use std::path::{Path, PathBuf};
@@ -135,10 +134,13 @@ pub fn resolve_library(cfg: &SirenConfig, query: &str) -> Vec<PathBuf> {
     for p in lib {
         let path_s = p.to_string_lossy().into_owned();
         let (mut best_t, mut best_b) = fuzzy_score(query, &path_s);
-        let (t2, b2) = fuzzy_score(query, &stem_of(&p));
-        if t2 > best_t || (t2 == best_t && b2 > best_b) {
-            best_t = t2;
-            best_b = b2;
+        // tags second (cache-only read inside; warms in background)
+        for alt in [stem_of(&p), crate::meta::display_cached(&path_s)] {
+            let (t2, b2) = fuzzy_score(query, &alt);
+            if t2 > best_t || (t2 == best_t && b2 > best_b) {
+                best_t = t2;
+                best_b = b2;
+            }
         }
         if best_t > 0 {
             scored.push((best_t, best_b, p));

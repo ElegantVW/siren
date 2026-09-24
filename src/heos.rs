@@ -686,6 +686,11 @@ pub fn last_cast() -> Option<(std::path::PathBuf, f64)> {
 pub fn dlna_cast_many(ip: &str, pid: i64, paths: &[std::path::PathBuf]) -> (usize, usize) {
     let mut ok = 0;
     for (i, p) in paths.iter().enumerate() {
+        if i > 0 {
+            // HEOS 1 CLI server wedges if add_to_queue is hammered; 1.5s
+            // between appends keeps port 1255 alive (verified live).
+            std::thread::sleep(Duration::from_millis(1500));
+        }
         let aid = if i == 0 { 1 } else { 3 };
         if dlna_cast(ip, pid, p, aid).is_ok() {
             ok += 1;

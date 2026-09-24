@@ -39,7 +39,7 @@ impl View {
     }
     fn menu(&self) -> &'static str {
         match self {
-            View::Browser => "enter play · a add · c cast · / filter · S save · L load · R rm",
+            View::Browser => "enter open/play · a add · c cast · backspace up · / filter · S save · L load · R rm",
             View::Queue => "enter play-from · d remove · c clear",
             View::Audio => "o output · s speaker · S shuffle · r repeat · p pause · v refresh · t test · m mute",
             View::Trove => "s search · enter pick vers · 1-9 dl · a all · f format · j/k move",
@@ -83,6 +83,13 @@ impl HeosClock {
     }
 }
 
+#[derive(Clone)]
+struct BrowserEntry {
+    path: PathBuf,
+    is_dir: bool,
+    display: String,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum InputMode {
     Filter,
@@ -124,6 +131,9 @@ struct App {
     focus: usize,
     lib_cache: Vec<PathBuf>,
     lib_at: Instant,
+    /// directory browser state (empty filter): current dir + entries
+    bcwd: PathBuf,
+    bentries: Vec<BrowserEntry>,
     browser_sel: usize,
     queue_sel: usize,
     filter: String,
@@ -151,11 +161,16 @@ impl App {
         let cfg = SirenConfig::load();
         queue::ensure_loaded();
         let lib = library::scan_library(&cfg);
-        Self {
+        let first_root = library::library_roots(&cfg).into_iter().next().unwrap_or_else(|| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+        });
+        let mut app = Self {
             cfg,
             focus: 0,
             lib_cache: lib,
             lib_at: Instant::now(),
+            bcwd: first_root,
+            bentries: Vec::new(),
             browser_sel: 0,
             queue_sel: 0,
             filter: String::new(),
@@ -201,6 +216,51 @@ impl App {
             mpv_dur: 0.0,
             mpv_paused: false,
             mpv_vol: 75,
+        };
+        app.rebuild_browser();
+        app
+    }
+
+    /// Rebuild directory entries for `bcwd` (dirs first, then audio files).
+    fn rebuild_browser(&mut self) {
+        let mut dirs: Vec<BrowserEntry> = Vec::new();
+        let mut files: Vec<BrowserEntry> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.bcwd) {
+            let mut names: Vec<PathBuf> =
+                rd.filter_map(|e| e.ok().map(|x| x.path())).collect();
+            names.sort();
+            for p in names {
+                let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                if name.starts_with('.') {
+                    continue;
+                }
+                if p.is_dir() {
+                    dirs.push(BrowserEntry {
+                        path: p,
+                        is_dir: true,
+                        display: format!("{name}/"),
+                    });
+                } else if p.is_file() {
+                    let lo = p.to_string_lossy().to_lowercase();
+                    if crate::library::AUDIO_EXT.iter().any(|e| lo.ends_with(e)) {
+                        crate::meta::warm(&p);
+                        let display = crate::meta::display(&p.to_string_lossy());
+                        files.push(BrowserEntry {
+                            path: p,
+                            is_dir: false,
+                            display,
+                        });
+                    }
+                }
+            }
+        }
+        dirs.extend(files);
+        self.bentries = dirs;
+        // clamp selection into the new list
+        if !self.bentries.is_empty() {
+            self.browser_sel = self.browser_sel.min(self.bentries.len() - 1);
+        } else {
+            self.browser_sel = 0;
         }
     }
 
@@ -224,12 +284,30 @@ impl App {
         self.msg_at = Instant::now();
     }
 
+    /// Files for search mode; in dir mode use `bentries` (includes dirs).
     fn filtered(&mut self) -> Vec<PathBuf> {
         if self.filter.trim().is_empty() {
-            return self.lib().to_vec();
+            return self
+                .bentries
+                .iter()
+                .filter(|e| !e.is_dir)
+                .map(|e| e.path.clone())
+                .collect();
         }
         // resolve re-scans internally; acceptable on filter keystrokes only
         library::resolve_library(&self.cfg, &self.filter)
+    }
+
+    /// Short printable cwd (~/Music/trove/…).
+    fn cwd_display(&self) -> String {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let s = self.bcwd.to_string_lossy().into_owned();
+        if !home.is_empty() {
+            if let Some(rest) = s.strip_prefix(&home) {
+                return format!("~{rest}");
+            }
+        }
+        s
     }
 
     fn poll_mpv(&mut self) {
@@ -362,6 +440,14 @@ impl App {
     }
 
     fn browser_selected(&mut self) -> Option<PathBuf> {
+        if self.filter.trim().is_empty() {
+            // dir mode: dirs navigate, only files select
+            return self
+                .bentries
+                .get(self.browser_sel)
+                .filter(|e| !e.is_dir)
+                .map(|e| e.path.clone());
+        }
         self.filtered().get(self.browser_sel).cloned()
     }
 }
@@ -373,9 +459,8 @@ fn path_name(p: &PathBuf) -> String {
 }
 
 fn stem_name(p: &PathBuf) -> String {
-    p.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path_name(p))
+    // tags (cached, never blocks) with stem fallback
+    crate::meta::display(&p.to_string_lossy())
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -510,6 +595,12 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
                 app.trove.fmt_opts.clear();
                 return false;
             }
+            // browser filter: Esc clears search, back to directory
+            if app.view() == View::Browser && !app.filter.is_empty() {
+                app.filter.clear();
+                app.browser_sel = 0;
+                return false;
+            }
             return true;
         }
         _ => match app.view() {
@@ -547,7 +638,7 @@ fn handle_mouse(app: &mut App, me: crossterm::event::MouseEvent) -> bool {
 fn scroll_by(app: &mut App, delta: isize) {
     match app.view() {
         View::Browser => {
-            let n = app.filtered().len();
+            let n = browser_row_count(app);
             if n == 0 {
                 return;
             }
@@ -594,19 +685,12 @@ fn click_at(app: &mut App, row: u16) -> bool {
     drop(last);
     match app.view() {
         View::Browser => {
-            let n = app.filtered().len();
+            let n = browser_row_count(app);
             let idx = (row as usize).saturating_sub(1);
             if idx < n {
                 app.browser_sel = idx;
                 if double {
-                    if let Some(p) = app.browser_selected() {
-                        if app.is_heos() {
-                            app.cast_path(&p);
-                        } else {
-                            let s = p.to_string_lossy().into_owned();
-                            queue::start_playlist(&app.cfg, &[s], false);
-                        }
-                    }
+                    browser_activate(app);
                 }
                 return true;
             }
@@ -989,8 +1073,107 @@ fn handle_trove(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
     }
 }
 
+/// Enter / double-click: open dir, or play the selected file.
+fn browser_activate(app: &mut App) {
+    let searching = !app.filter.trim().is_empty();
+    if searching {
+        if let Some(p) = app.browser_selected() {
+            if app.is_heos() {
+                app.cast_path(&p);
+            } else {
+                let s = p.to_string_lossy().into_owned();
+                queue::start_playlist(&app.cfg, &[s], false);
+            }
+        }
+        return;
+    }
+    match app.bentries.get(app.browser_sel).cloned() {
+        Some(e) if e.is_dir => {
+            app.bcwd = e.path;
+            app.browser_sel = 0;
+            app.rebuild_browser();
+        }
+        Some(e) => {
+            if app.is_heos() {
+                app.cast_path(&e.path);
+            } else {
+                let s = e.path.to_string_lossy().into_owned();
+                queue::start_playlist(&app.cfg, &[s], false);
+            }
+        }
+        None => {}
+    }
+}
+
+/// Rows in the browser view (search hits or cwd entries).
+fn browser_row_count(app: &mut App) -> usize {
+    if app.filter.trim().is_empty() {
+        app.bentries.len()
+    } else {
+        app.filtered().len()
+    }
+}
+
+/// Queue one file in the TUI session queue.
+fn tui_queue_add(app: &mut App, p: &PathBuf) {
+    let s = p.to_string_lossy().into_owned();
+    let mut v = queue::snapshot();
+    let (artist, title) = crate::meta::tags_for(&s);
+    v.push(queue::QueueItem {
+        path: s.clone(),
+        display: stem_name(p),
+        title,
+        artist,
+        duration: 0.0,
+    });
+    queue::replace(v);
+    app.say(format!("queued {}", path_name(p)));
+}
+
+/// Queue every audio file under a directory (recursive, sorted).
+fn tui_queue_add_dir(app: &mut App, dir: &PathBuf) {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![dir.clone()];
+    while let Some(d) = stack.pop() {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&d)
+            .map(|rd| rd.filter_map(|e| e.ok().map(|x| x.path())).collect())
+            .unwrap_or_default();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.is_file() {
+                let lo = p.to_string_lossy().to_lowercase();
+                if crate::library::AUDIO_EXT.iter().any(|e| lo.ends_with(e)) {
+                    files.push(p);
+                }
+            }
+        }
+    }
+    files.sort();
+    let mut v = queue::snapshot();
+    for p in &files {
+        let s = p.to_string_lossy().into_owned();
+        if v.iter().any(|it| it.path == s) {
+            continue;
+        }
+        let (artist, title) = crate::meta::tags_for(&s);
+        v.push(queue::QueueItem {
+            path: s,
+            display: stem_name(p),
+            title,
+            artist,
+            duration: 0.0,
+        });
+    }
+    let n = files.len();
+    queue::replace(v);
+    app.say(format!("queued {n} track(s) from {}", path_name(dir)));
+}
+
 fn handle_browser(app: &mut App, code: KeyCode, mods: KeyModifiers) {
-    let n = app.filtered().len();
+    let searching = !app.filter.trim().is_empty();
+    let n = browser_row_count(app);
     match code {
         KeyCode::Char('j') | KeyCode::Down => {
             if n > 0 {
@@ -1000,15 +1183,21 @@ fn handle_browser(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('k') | KeyCode::Up => {
             app.browser_sel = app.browser_sel.saturating_sub(1);
         }
-        KeyCode::Enter | KeyCode::Char('p') | KeyCode::Char(' ') => {
-            if let Some(p) = app.browser_selected() {
-                if app.is_heos() {
-                    app.cast_path(&p);
-                } else {
-                    let s = p.to_string_lossy().into_owned();
-                    queue::start_playlist(&app.cfg, &[s], false);
+        KeyCode::Backspace => {
+            if searching {
+                return;
+            }
+            // up one level (stop at filesystem root)
+            if let Some(parent) = app.bcwd.parent() {
+                if parent != app.bcwd {
+                    app.bcwd = parent.to_path_buf();
+                    app.browser_sel = 0;
+                    app.rebuild_browser();
                 }
             }
+        }
+        KeyCode::Enter | KeyCode::Char('p') | KeyCode::Char(' ') => {
+            browser_activate(app);
         }
         KeyCode::Char('o') => {
             if let Some(p) = app.browser_selected() {
@@ -1017,20 +1206,16 @@ fn handle_browser(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             }
         }
         KeyCode::Char('a') => {
-            if let Some(p) = app.browser_selected() {
-                let s = p.to_string_lossy().into_owned();
-                // in-TUI session queue
-                let items = queue::snapshot();
-                let mut v = items;
-                v.push(queue::QueueItem {
-                    path: s.clone(),
-                    display: stem_name(&p),
-                    title: String::new(),
-                    artist: String::new(),
-                    duration: 0.0,
-                });
-                queue::replace(v);
-                app.say(format!("queued {}", path_name(&p)));
+            if searching {
+                if let Some(p) = app.browser_selected() {
+                    tui_queue_add(app, &p);
+                }
+                return;
+            }
+            match app.bentries.get(app.browser_sel).cloned() {
+                Some(e) if e.is_dir => tui_queue_add_dir(app, &e.path),
+                Some(e) => tui_queue_add(app, &e.path),
+                None => {}
             }
         }
         KeyCode::Char('c') => {
@@ -1350,7 +1535,13 @@ fn draw(f: &mut Frame, app: &mut App) {
             ]));
         } else {
             let hint = match focus {
-                View::Browser => format!("{} tracks · tab cycle · q quit", app.filtered().len()),
+                View::Browser => {
+                    if app.filter.trim().is_empty() {
+                        format!("{} · {} entries · tab cycle · q quit", app.cwd_display(), app.bentries.len())
+                    } else {
+                        format!("{} tracks · tab cycle · q quit", app.filtered().len())
+                    }
+                }
                 View::Queue => format!("{} queued · tab cycle · q quit", queue::snapshot().len()),
                 View::Audio => format!("out:{} · spk:{} · tab cycle · q quit", app.cfg.audio_output, app.cfg.audio_speaker),
                 View::Trove => {
@@ -1381,11 +1572,34 @@ fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_browser(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
-    let items = app.filtered();
-    let rows: Vec<ListItem> = items
-        .iter()
-        .map(|p| ListItem::new(Line::from(Span::raw(format!("  {}", stem_name(p))))))
-        .collect();
+    // search mode: flat fuzzy hits. dir mode: cwd entries (dirs + files).
+    let rows: Vec<ListItem> = if app.filter.trim().is_empty() {
+        app.bentries
+            .iter()
+            .map(|e| {
+                let (mark, style) = if e.is_dir {
+                    ("▸ ", Style::default().fg(Color::Cyan))
+                } else {
+                    ("  ", Style::default())
+                };
+                let label = if e.is_dir {
+                    e.display.clone()
+                } else {
+                    crate::meta::display(&e.path.to_string_lossy())
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw(mark),
+                    Span::styled(label, style),
+                ]))
+            })
+            .collect()
+    } else {
+        let items = app.filtered();
+        items
+            .iter()
+            .map(|p| ListItem::new(Line::from(Span::raw(format!("  {}", stem_name(p))))))
+            .collect()
+    };
     let mut state = ListState::default();
     if !rows.is_empty() {
         state.select(Some(app.browser_sel.min(rows.len() - 1)));
@@ -1402,7 +1616,7 @@ fn draw_queue(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         .iter()
         .enumerate()
         .map(|(i, it)| {
-            let d = if it.display.is_empty() { stem_name(&PathBuf::from(&it.path)) } else { it.display.clone() };
+            let d = crate::meta::display(&it.path);
             let mark = if i == 0 { "▶ " } else { "  " };
             ListItem::new(Line::from(Span::raw(format!("{mark}{:3}. {d}", i + 1))))
         })

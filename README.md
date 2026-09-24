@@ -5,9 +5,9 @@ network-speaker control, in one remote.
 
 **Status:** default engine (v0.1.0, cut over 2026-09-23). Ported: config,
 library/fuzzy, mpv IPC, queue/playlist, transport CLI, two-box TUI,
-audio menu + `cast`, trove (CLI + TUI) — all live-verified.
-`~/bin/siren` is the thin launcher; Python `faeOS/bin/siren` is fallback
-until parity sign-off (mutagen tags, dir-browser nav deferred).
+audio menu + `cast`, trove (CLI + TUI), tags (`ffprobe`), directory
+browser — all live-verified. `~/bin/siren` is the thin launcher.
+Python `faeOS/bin/siren` is archived (tests/rollback only).
 
 ## Layout
 
@@ -17,15 +17,16 @@ until parity sign-off (mutagen tags, dir-browser nav deferred).
 
 ## TUI (target)
 
-Two boxes. Top = content view (Tab cycles browser → queue → waves → audio;
-waves stays on top). Bottom = context menu of the focused view (Option A):
+Two boxes + a persistent waves strip. Top = content view (Tab cycles
+browser → queue → audio → trove). Bottom = context menu of the focused
+view (Option A):
 
 | Focus   | Bottom menu                          |
 |---------|--------------------------------------|
-| browser | play · add to queue · cast to speaker |
-| queue   | play · remove · move · clear          |
-| waves   | pause · next · bands · +/-            |
+| browser | open/play · add · cast · backspace up · / filter |
+| queue   | play-from · remove · clear            |
 | audio   | output local\|heos · speaker · vol · test-cast |
+| trove   | search · pick version · download      |
 
 ## Audio (target)
 

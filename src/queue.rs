@@ -2,9 +2,7 @@
 //! `play_queue_from`, `start_playlist`, `cmd_next/prev/stop/pause`,
 //! `now_label`, `cmd_status` (`faeOS/bin/siren`).
 //!
-//! Simplification (documented): item `display` uses the file stem.
-//! Python snapshots mutagen tags; tag display lands with the
-//! metadata-cache slice.
+//! Item labels prefer cached/sync tags (`meta`); stem is the fallback.
 
 use crate::config::SirenConfig;
 use crate::player;
@@ -27,12 +25,8 @@ pub struct QueueItem {
 }
 
 pub fn display_of(path: &str) -> String {
-    let p = path.strip_prefix("file://").unwrap_or(path);
-    Path::new(p)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| p.to_string())
+    // tags (cached, never blocks) with stem fallback
+    crate::meta::display(path)
 }
 
 fn basename(p: &str) -> &str {
@@ -48,11 +42,12 @@ pub struct Queue {
 
 impl Queue {
     pub fn add(&mut self, path: &str, prepend: bool) -> usize {
+        let (artist, title) = crate::meta::tags_for_sync(path);
         let item = QueueItem {
             path: path.to_string(),
-            display: display_of(path),
-            title: String::new(),
-            artist: String::new(),
+            display: crate::meta::display_sync(path),
+            title,
+            artist,
             duration: 0.0,
         };
         if prepend {
@@ -471,11 +466,7 @@ pub fn cli_list() -> i32 {
     }
     for (i, it) in q.items.iter().enumerate() {
         let mark = if i == 0 { "▶" } else { " " };
-        let d = if it.display.is_empty() {
-            display_of(&it.path)
-        } else {
-            it.display.clone()
-        };
+        let d = crate::meta::display_sync(&it.path);
         println!("  {mark} {:3}. {d}", i + 1);
     }
     0

@@ -1,11 +1,12 @@
 //! siren — the Aether's music vessel (faeOS media player).
 //!
 //! Port slices landed: config, library/fuzzy, mpv IPC, queue/playlist,
-//! transport CLI. Still Python-only: TUI, audio menu, trove (out of v1).
+//! transport CLI, two-box TUI, audio/HEOS, trove, tags, dir browser.
 
 mod config;
 mod heos;
 mod library;
+mod meta;
 mod player;
 mod playlist;
 mod queue;

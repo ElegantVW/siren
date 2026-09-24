@@ -24,8 +24,7 @@ if [[ "${1:-}" == "install" ]]; then
 
   install_launcher "$HOME/bin/siren"
   if [[ -d "$HOME/faeOS/bin" ]]; then
-    echo "note: ~/faeOS/bin/siren is still the live python player — not overwritten."
-    echo "  cutover happens at parity sign-off (launcher swap then)."
+    echo "note: ~/faeOS/bin/siren is the archived python player — not overwritten."
   fi
 
   if [[ -w /usr/local/bin ]] || sudo -n true 2>/dev/null; then
