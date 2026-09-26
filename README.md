@@ -9,6 +9,19 @@ audio menu + `cast`, trove (CLI + TUI), tags (`ffprobe`), directory
 browser — all live-verified. `~/bin/siren` is the thin launcher.
 Python `faeOS/bin/siren` is archived (tests/rollback only).
 
+## Look
+
+![Siren browser](assets/screenshots/siren-tui.png)
+![Siren queue](assets/screenshots/siren-queue.png)
+
+```
+~~~~~~~
+ ~~~~~ 
+~~~~~~~
+ ~~~~~ 
+~~~~~~~
+```
+
 ## Layout
 
 - `src/` — rust engine (`cargo build --release`)
