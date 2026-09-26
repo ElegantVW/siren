@@ -1,6 +1,6 @@
 ![Siren hero](assets/hero/siren.svg)
 
-# Siren — the Aether's music vessel
+# Siren — the Aether's music vessel 🎵
 
 faeOS first-party media player. mpv-backed local playback plus HEOS
 network-speaker control, in one remote.
