@@ -7,6 +7,6 @@
 <text x="360" y="191" fill="#8EC4C8"> ~~~~~ </text>
 <text x="360" y="221" fill="#8EC4C8">~~~~~~~</text>
 </g>
-<text x="360" y="307" fill="#F0E4EE" font-family="Fraunces, Georgia, serif" font-size="36" text-anchor="middle">Siren</text>
+<text x="360" y="307" fill="#F0E4EE" font-family="DejaVu Sans Mono, Menlo, Consolas, monospace" font-size="30" font-weight="bold" text-anchor="middle">Siren</text>
 <text x="360" y="337" fill="#6B6FA8" font-family="DejaVu Sans Mono, monospace" font-size="16" text-anchor="middle">music vessel, never blasts</text>
 </svg>
