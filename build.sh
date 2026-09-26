@@ -9,6 +9,11 @@ echo "built: $BIN"
 ls -la "$BIN"
 
 if [[ "${1:-}" == "install" ]]; then
+  # DEPS: mpv (local playback over IPC). HEOS/minidlna only for casting.
+  if ! command -v mpv >/dev/null 2>&1; then
+    echo "siren: WARNING — mpv not found; local playback will fail." >&2
+    echo "siren:   next:  sudo pacman -S mpv" >&2
+  fi
   LIB="$HOME/.local/lib/faeos"
   WRAP_SRC="$ROOT/scripts/siren"
   mkdir -p "$LIB" "$HOME/bin"
