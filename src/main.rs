@@ -13,6 +13,7 @@ mod radio;
 mod playlist;
 mod queue;
 mod spectrum;
+mod stream;
 mod trove;
 mod tui;
 

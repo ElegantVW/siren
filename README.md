@@ -64,6 +64,12 @@ speaker as leader, `u` ungroups, `G` toggles group mute, `,`/`.` adjust
 group volume. HEOS natively syncs grouped speakers — verified 1–2ms
 drift.
 
+**Live stream** (audio view, `W`): siren captures the `Siren_Master`
+null sink (the PipeWire default — every client lands there), encodes
+mp3 via ffmpeg, serves it on `:8899/siren.mp3`, and feeds the group
+leader over UPnP `SetAVTransportURI`. Members follow via group sync.
+No TuneIn, no Denon servers — one local stream, both speakers, in sync.
+
 ## Audio
 
 Siren owns its audio routing (`~/.config/siren/config.json`):

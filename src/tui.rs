@@ -49,7 +49,7 @@ impl View {
         match self {
             View::Browser => "enter open/play · a add · c cast · backspace up · / filter · S save · L load · R rm",
             View::Queue => "enter play-from · d remove · C clear",
-            View::Audio => "o output · S speaker · r repeat · p pause · v refresh · t test · m mute · g group",
+            View::Audio => "o output · S speaker · r repeat · p pause · v refresh · t test · m mute · g group · W stream",
             View::Trove => "s search · enter vers · D dl · j/k · M more · A all · F format",
             View::Radio => "enter play · C country · s search · f fav · A add url · M more · j/k",
         }
@@ -195,6 +195,8 @@ struct App {
     group_muted: bool,
     group_volume: i32,
     show_help: bool,
+    stream_port: u16,
+    stream_msg: String,
     mpv_label: String,
     mpv_pos: f64,
     mpv_dur: f64,
@@ -287,6 +289,8 @@ impl App {
             group_muted: false,
             group_volume: 50,
             show_help: false,
+            stream_port: crate::stream::DEFAULT_PORT,
+            stream_msg: String::new(),
             mpv_label: String::new(),
             mpv_pos: 0.0,
             mpv_dur: 0.0,
@@ -2097,6 +2101,37 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                 app.say("no group — press g to group");
             }
         }
+        KeyCode::Char('W') => {
+            // start/stop the live stream: encoder+server, then feed group leader
+            if crate::stream::running() {
+                crate::stream::stop();
+                app.stream_msg = "stream stopped".into();
+                app.say("stream stopped");
+            } else if !crate::stream::start(app.stream_port) {
+                app.stream_msg = "stream failed to start".into();
+                app.say("stream failed to start");
+            } else {
+                let url = match crate::heos::local_ip() {
+                    Some(ip) => crate::stream::url(&ip, app.stream_port),
+                    None => format!("http://127.0.0.1:{}/siren.mp3", app.stream_port),
+                };
+                match app.speaker_target() {
+                    Some((sip, _, name)) => {
+                        if crate::stream::play_stream(&sip, &url) {
+                            app.stream_msg = format!("streaming → {name}");
+                            app.say(format!("streaming → {name}"));
+                        } else {
+                            app.stream_msg = "stream up, feed failed".into();
+                            app.say("stream up, feed failed");
+                        }
+                    }
+                    None => {
+                        app.stream_msg = format!("stream up at {url} (no speaker)");
+                        app.say("stream up (no speaker to feed)");
+                    }
+                }
+            }
+        }
         KeyCode::Char('m') => {
             if let Some((ip, pid, name)) = app.speaker_target() {
                 // read mute, flip
@@ -2181,6 +2216,7 @@ fn draw_help(f: &mut Frame, app: &mut App) {
             ("u", "ungroup"),
             ("G", "group mute toggle"),
             (" ,  .", "group volume -/+"),
+            ("W", "start/stop live stream → group"),
         ]),
         View::Trove => ("trove", &[
             ("s", "search"),
@@ -2805,6 +2841,31 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             "  group   none  (g group all · u ungroup)",
             Style::default().fg(Color::Rgb(138, 138, 150)),
         )));
+    }
+    // live stream state
+    {
+        let up = crate::stream::running();
+        let master = crate::stream::master_is_default();
+        let n = crate::stream::master_clients();
+        lines.push(Line::from(vec![
+            Span::raw("  stream  "),
+            Span::styled(
+                if up { "live" } else { "down" },
+                Style::default().fg(if up { Color::Rgb(61, 214, 140) } else { Color::Rgb(138, 138, 150) }).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "   master:{}  clients:{}",
+                if master { "default" } else { "NOT default" },
+                n,
+            )),
+            Span::styled("   (W start/stop)", Style::default().fg(Color::Rgb(138, 138, 150))),
+        ]));
+        if !app.stream_msg.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", app.stream_msg),
+                Style::default().fg(Color::Rgb(192, 192, 200)),
+            )));
+        }
     }
     lines.push(Line::from(Span::styled(
         format!(
