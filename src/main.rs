@@ -12,6 +12,7 @@ mod player;
 mod radio;
 mod playlist;
 mod queue;
+mod mixer;
 mod spectrum;
 mod stream;
 mod trove;

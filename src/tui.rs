@@ -49,7 +49,7 @@ impl View {
         match self {
             View::Browser => "enter open/play · a add · c cast · backspace up · / filter · S save · L load · R rm",
             View::Queue => "enter play-from · d remove · C clear",
-            View::Audio => "o output · S speaker · r repeat · p pause · v refresh · t test · m mute · g group · W stream",
+            View::Audio => "o output · S speaker · j/k src · m mute · -/+ vol · g group · W stream",
             View::Trove => "s search · enter vers · D dl · j/k · M more · A all · F format",
             View::Radio => "enter play · C country · s search · f fav · A add url · M more · j/k",
         }
@@ -197,6 +197,9 @@ struct App {
     show_help: bool,
     stream_port: u16,
     stream_msg: String,
+    mixer: Vec<crate::mixer::SinkInput>,
+    mixer_sel: usize,
+    mixer_at: Instant,
     mpv_label: String,
     mpv_pos: f64,
     mpv_dur: f64,
@@ -291,6 +294,9 @@ impl App {
             show_help: false,
             stream_port: crate::stream::DEFAULT_PORT,
             stream_msg: String::new(),
+            mixer: Vec::new(),
+            mixer_sel: 0,
+            mixer_at: Instant::now() - Duration::from_secs(99),
             mpv_label: String::new(),
             mpv_pos: 0.0,
             mpv_dur: 0.0,
@@ -407,6 +413,22 @@ impl App {
 
     /// Speaker poll runs in a background thread — never blocks draw/input.
     /// Cadence 10s, or forced (view enter, `s`/`v` keys).
+    fn poll_mixer(&mut self) {
+        if self.mixer_at.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.mixer_at = Instant::now();
+        self.mixer = crate::mixer::list_inputs();
+        if !self.mixer.is_empty() {
+            self.mixer_sel = self.mixer_sel.min(self.mixer.len() - 1);
+        }
+    }
+
+    fn poll_mixer_force(&mut self) {
+        self.mixer_at = Instant::now() - Duration::from_secs(99);
+        self.poll_mixer();
+    }
+
     fn poll_groups(&mut self) {
         if self.group_at.elapsed() < Duration::from_secs(4) {
             return;
@@ -570,7 +592,17 @@ pub fn run() -> anyhow::Result<()> {
 
     let mut app = App::new();
     app.poll_mpv();
+    // auto-start the live stream: every client lands in Siren_Master,
+    // we encode it and feed the HEOS group. Stopped on exit below.
+    if !crate::stream::running() {
+        if crate::stream::start(app.stream_port) {
+            app.stream_msg = format!("stream live on :{}", app.stream_port);
+        } else {
+            app.stream_msg = "stream failed to start".into();
+        }
+    }
     let res = event_loop(&mut terminal, &mut app);
+    crate::stream::stop();
 
     disable_raw_mode()?;
     if mouse_on {
@@ -611,6 +643,7 @@ fn event_loop(
             app.poll_mpv();
             app.poll_speaker();
             app.poll_groups();
+            app.poll_mixer();
             // speaker playing-state for the elapsed clock (roster may lag;
             // actions patch it optimistically, so this stays truthful)
             let playing = speaker_entry(app).and_then(|p| p.state).map(|s| s == "play");
@@ -2132,8 +2165,26 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                 }
             }
         }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !app.mixer.is_empty() {
+                app.mixer_sel = (app.mixer_sel + 1).min(app.mixer.len() - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.mixer_sel = app.mixer_sel.saturating_sub(1);
+        }
         KeyCode::Char('m') => {
-            if let Some((ip, pid, name)) = app.speaker_target() {
+            // mixer mute takes priority when sources exist; speaker mute otherwise
+            if !app.mixer.is_empty() {
+                if let Some(src) = app.mixer.get(app.mixer_sel) {
+                    let id = src.id;
+                    let name = format!("{} ({})", src.app, src.media);
+                    if crate::mixer::set_mute(id, !src.muted) {
+                        app.say(format!("{} mute → {}", name, if !src.muted { "on" } else { "off" }));
+                        app.poll_mixer_force();
+                    }
+                }
+            } else if let Some((ip, pid, name)) = app.speaker_target() {
                 // read mute, flip
                 let mut muted = false;
                 for o in heos::rpc(&ip, &[format!("heos://player/get_mute?pid={pid}")]) {
@@ -2148,6 +2199,26 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                 }
             } else {
                 app.say("no speaker found");
+            }
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            if let Some(src) = app.mixer.get(app.mixer_sel) {
+                let id = src.id;
+                let vol = src.volume_pct.saturating_sub(5);
+                if crate::mixer::set_volume(id, vol) {
+                    app.say(format!("{} volume → {vol}%", src.app));
+                    app.poll_mixer_force();
+                }
+            }
+        }
+        KeyCode::Char('=') | KeyCode::Char('+') => {
+            if let Some(src) = app.mixer.get(app.mixer_sel) {
+                let id = src.id;
+                let vol = (src.volume_pct + 5).min(150);
+                if crate::mixer::set_volume(id, vol) {
+                    app.say(format!("{} volume → {vol}%", src.app));
+                    app.poll_mixer_force();
+                }
             }
         }
         _ => {}
@@ -2211,7 +2282,9 @@ fn draw_help(f: &mut Frame, app: &mut App) {
             ("p / space", "pause/resume"),
             ("v", "refresh speakers"),
             ("t", "test cast"),
-            ("m", "mute toggle"),
+            ("m", "mute source (or speaker if none)"),
+            ("j / k", "select source"),
+            ("- / +", "source volume"),
             ("g", "group all speakers"),
             ("u", "ungroup"),
             ("G", "group mute toggle"),
@@ -2864,6 +2937,45 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             lines.push(Line::from(Span::styled(
                 format!("    {}", app.stream_msg),
                 Style::default().fg(Color::Rgb(192, 192, 200)),
+            )));
+        }
+    }
+    // per-source mixer
+    {
+        lines.push(Line::from(Span::styled(
+            "  ── sources ───────────────────────────",
+            Style::default().fg(Color::Rgb(138, 138, 150)),
+        )));
+        if app.mixer.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "    (nothing playing)",
+                Style::default().fg(Color::Rgb(138, 138, 150)),
+            )));
+        } else {
+            for (i, src) in app.mixer.iter().enumerate() {
+                let sel = i == app.mixer_sel;
+                let marker = if sel { "▶" } else { " " };
+                lines.push(Line::from(vec![
+                    Span::raw(format!("  {marker} ")),
+                    Span::styled(
+                        format!("{} ", src.app),
+                        Style::default()
+                            .fg(if sel { Color::Rgb(142, 196, 200) } else { Color::Rgb(192, 192, 200) })
+                            .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
+                    ),
+                    Span::styled(
+                        format!("{}%{} ", src.volume_pct, if src.muted { " MUTED" } else { "" }),
+                        Style::default().fg(if src.muted { Color::Rgb(255, 176, 32) } else { Color::Rgb(61, 214, 140) }),
+                    ),
+                    Span::styled(
+                        src.media.clone(),
+                        Style::default().fg(Color::Rgb(138, 138, 150)),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(Span::styled(
+                "    (j/k select · m mute · -/+ volume)",
+                Style::default().fg(Color::Rgb(138, 138, 150)),
             )));
         }
     }

@@ -64,6 +64,10 @@ speaker as leader, `u` ungroups, `G` toggles group mute, `,`/`.` adjust
 group volume. HEOS natively syncs grouped speakers — verified 1–2ms
 drift.
 
+**Mixer** (audio view): every live source listed with app, volume,
+muted state. `j/k` select, `m` mute/unmute one source, `-/+` adjust its
+volume. The loopback is filtered out (infrastructure, not a source).
+
 **Live stream** (audio view, `W`): siren captures the `Siren_Master`
 null sink (the PipeWire default — every client lands there), encodes
 mp3 via ffmpeg, serves it on `:8899/siren.mp3`, and feeds the group
