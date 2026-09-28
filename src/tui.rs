@@ -48,10 +48,10 @@ impl View {
     fn menu(&self) -> &'static str {
         match self {
             View::Browser => "enter open/play · a add · c cast · backspace up · / filter · S save · L load · R rm",
-            View::Queue => "enter play-from · d remove · c clear",
-            View::Audio => "o output · s speaker · S shuffle · r repeat · p pause · v refresh · t test · m mute",
-            View::Trove => "s search · enter vers · d dl · j/k · m more · a all · f format",
-            View::Radio => "enter play · d play · c country · s search · f fav · A add url · m more · j/k",
+            View::Queue => "enter play-from · d remove · C clear",
+            View::Audio => "o output · S speaker · r repeat · p pause · v refresh · t test · m mute · g group",
+            View::Trove => "s search · enter vers · D dl · j/k · M more · A all · F format",
+            View::Radio => "enter play · C country · s search · f fav · A add url · M more · j/k",
         }
     }
 }
@@ -190,6 +190,11 @@ struct App {
     spk_force: bool,
     heos_clock: HeosClock,
     heos_elapsed: Option<f64>,
+    groups: Vec<heos::HeosGroup>,
+    group_at: Instant,
+    group_muted: bool,
+    group_volume: i32,
+    show_help: bool,
     mpv_label: String,
     mpv_pos: f64,
     mpv_dur: f64,
@@ -277,6 +282,11 @@ impl App {
                 last_tick: Instant::now(),
             },
             heos_elapsed: None,
+            groups: Vec::new(),
+            group_at: Instant::now() - Duration::from_secs(99),
+            group_muted: false,
+            group_volume: 50,
+            show_help: false,
             mpv_label: String::new(),
             mpv_pos: 0.0,
             mpv_dur: 0.0,
@@ -393,6 +403,19 @@ impl App {
 
     /// Speaker poll runs in a background thread — never blocks draw/input.
     /// Cadence 10s, or forced (view enter, `s`/`v` keys).
+    fn poll_groups(&mut self) {
+        if self.group_at.elapsed() < Duration::from_secs(4) {
+            return;
+        }
+        self.group_at = Instant::now();
+        if !self.is_heos() {
+            return;
+        }
+        if let Some((ip, _, _)) = self.speaker_target() {
+            self.groups = heos::get_groups(&ip);
+        }
+    }
+
     fn poll_speaker(&mut self) {
         // harvest finished poll
         if self.spk_pending {
@@ -583,6 +606,7 @@ fn event_loop(
             last_tick = Instant::now();
             app.poll_mpv();
             app.poll_speaker();
+            app.poll_groups();
             // speaker playing-state for the elapsed clock (roster may lag;
             // actions patch it optimistically, so this stays truthful)
             let playing = speaker_entry(app).and_then(|p| p.state).map(|s| s == "play");
@@ -601,6 +625,15 @@ fn event_loop(
 
 /// True = quit.
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
+    // help overlay toggles on 'h' (or closes on any key when open)
+    if app.show_help {
+        app.show_help = false;
+        return false;
+    }
+    if code == KeyCode::Char('h') {
+        app.show_help = true;
+        return false;
+    }
     // input mode eats everything except Esc/Enter
     if let Some(mode) = app.input {
         match code {
@@ -1301,7 +1334,7 @@ fn handle_trove(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
         return;
     }
     // second consecutive `a` confirms download-all; anything else disarms
-    if !matches!(code, KeyCode::Char('a')) {
+    if !matches!(code, KeyCode::Char('A')) {
         app.trove.all_armed = false;
     }
     match code {
@@ -1317,7 +1350,7 @@ fn handle_trove(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
             app.input = Some(InputMode::TroveSearch);
             app.input_buf.clear();
         }
-        KeyCode::Char('m') => {
+        KeyCode::Char('M') => {
             if app.trove.exhausted {
                 app.say("end of results");
             } else {
@@ -1330,12 +1363,12 @@ fn handle_trove(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
             }
         }
         // instant download of the cursor row with the session format
-        KeyCode::Char('d') => {
+        KeyCode::Char('D') => {
             if app.trove.sel < n {
                 trove_download(app, vec![app.trove.sel], None);
             }
         }
-        KeyCode::Char('a') => {
+        KeyCode::Char('A') => {
             if n == 0 {
                 return;
             }
@@ -1593,7 +1626,7 @@ fn handle_radio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
         KeyCode::Char('k') | KeyCode::Up => {
             app.radio.sel = app.radio.sel.saturating_sub(1);
         }
-        KeyCode::Enter | KeyCode::Char('d') | KeyCode::Char(' ') => {
+        KeyCode::Enter | KeyCode::Char(' ') => {
             if app.radio.country.is_none() && app.radio.query.trim().is_empty() {
                 radio_open_picker(app);
                 return;
@@ -1602,7 +1635,7 @@ fn handle_radio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                 radio_play(app, &st);
             }
         }
-        KeyCode::Char('c') => radio_open_picker(app),
+        KeyCode::Char('C') => radio_open_picker(app),
         KeyCode::Char('s') => {
             app.input = Some(InputMode::RadioSearch);
             app.input_buf.clear();
@@ -1617,7 +1650,7 @@ fn handle_radio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                 app.radio.favs = radio::favs();
             }
         }
-        KeyCode::Char('m') => {
+        KeyCode::Char('M') => {
             if app.radio.exhausted {
                 app.say("end of results");
             } else {
@@ -1833,7 +1866,7 @@ fn handle_queue(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                 app.queue_sel = app.queue_sel.saturating_sub(1);
             }
         }
-        KeyCode::Char('c') => {
+        KeyCode::Char('C') => {
             queue::replace(Vec::new());
             queue::maybe_resync_queue();
             app.say("Queue cleared.");
@@ -1955,7 +1988,7 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
             let _ = app.cfg.save();
             app.say(format!("output → {}", app.cfg.audio_output));
         }
-        KeyCode::Char('s') => {
+        KeyCode::Char('S') => {
             app.force_speaker_poll();
             app.poll_speaker();
             if app.audio.roster.is_empty() {
@@ -1988,6 +2021,82 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                 None => app.say("nothing to cast"),
             }
         }
+        KeyCode::Char('g') => {
+            // group every speaker on the network, current speaker as leader
+            if let Some((ip, leader, name)) = app.speaker_target() {
+                let members: Vec<i64> = app
+                    .audio
+                    .roster
+                    .iter()
+                    .filter(|p| p.pid != leader)
+                    .map(|p| p.pid)
+                    .collect();
+                if members.is_empty() {
+                    app.say("no other speakers to group");
+                } else if heos::set_group(&ip, leader, &members) {
+                    app.say(format!("grouped {} speaker(s) under {name}", members.len() + 1));
+                    app.poll_groups();
+                } else {
+                    app.say("group failed");
+                }
+            } else {
+                app.say("no speaker found");
+            }
+        }
+        KeyCode::Char('u') => {
+            if let Some((ip, leader, name)) = app.speaker_target() {
+                if heos::ungroup(&ip, leader) {
+                    app.say(format!("ungrouped {name}"));
+                    app.poll_groups();
+                } else {
+                    app.say("ungroup failed");
+                }
+            } else {
+                app.say("no speaker found");
+            }
+        }
+        KeyCode::Char('G') => {
+            let gid = app.groups.first().map(|g| g.gid);
+            if let Some(gid) = gid {
+                if let Some((ip, _, _)) = app.speaker_target() {
+                    let muted = app.group_muted;
+                    if heos::group_set_mute(&ip, gid, !muted) {
+                        app.group_muted = !muted;
+                        app.say(format!("group mute → {}", if !muted { "on" } else { "off" }));
+                    }
+                }
+            } else {
+                app.say("no group — press g to group");
+            }
+        }
+        KeyCode::Char(',') | KeyCode::Char('<') => {
+            let gid = app.groups.first().map(|g| g.gid);
+            if let Some(gid) = gid {
+                if let Some((ip, _, _)) = app.speaker_target() {
+                    let cur = app.group_volume;
+                    if heos::group_set_volume(&ip, gid, cur - 5) {
+                        app.group_volume = cur - 5;
+                        app.say(format!("group volume → {}", cur - 5));
+                    }
+                }
+            } else {
+                app.say("no group — press g to group");
+            }
+        }
+        KeyCode::Char('.') | KeyCode::Char('>') => {
+            let gid = app.groups.first().map(|g| g.gid);
+            if let Some(gid) = gid {
+                if let Some((ip, _, _)) = app.speaker_target() {
+                    let cur = app.group_volume;
+                    if heos::group_set_volume(&ip, gid, cur + 5) {
+                        app.group_volume = cur + 5;
+                        app.say(format!("group volume → {}", cur + 5));
+                    }
+                }
+            } else {
+                app.say("no group — press g to group");
+            }
+        }
         KeyCode::Char('m') => {
             if let Some((ip, pid, name)) = app.speaker_target() {
                 // read mute, flip
@@ -2012,12 +2121,117 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
 
 // ---- drawing ----
 
+/// Full-screen help overlay. Shows every key for the current view.
+fn draw_help(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let accent = Color::Rgb(142, 196, 200);
+    let ok = Color::Rgb(61, 214, 140);
+    let dim = Color::Rgb(138, 138, 150);
+    let silver = Color::Rgb(192, 192, 200);
+
+    let mut lines = vec![
+        Line::from(Span::styled("  ✦ siren help ✦", Style::default().fg(accent).add_modifier(Modifier::BOLD))),
+        Line::from(Span::raw("")),
+    ];
+
+    // global keys
+    lines.push(Line::from(Span::styled("  global", Style::default().fg(silver).add_modifier(Modifier::BOLD))));
+    for (k, d) in [
+        ("tab / shift+tab", "cycle views"),
+        ("j / k  or  ↑ / ↓", "navigate"),
+        ("enter", "open / play / activate"),
+        ("h", "this help"),
+        ("q", "quit"),
+        ("esc", "cancel / back"),
+    ] {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("{k:<20}"), Style::default().fg(ok)),
+            Span::raw(d),
+        ]));
+    }
+    lines.push(Line::from(Span::raw("")));
+
+    // view-specific keys
+    let (title, keys): (&str, &[(&str, &str)]) = match app.view() {
+        View::Browser => ("browser", &[
+            ("enter", "open / play"),
+            ("a", "add to queue"),
+            ("c", "cast to speaker"),
+            ("backspace", "up one directory"),
+            ("/", "filter"),
+            ("S", "save playlist"),
+            ("L", "load playlist"),
+            ("R", "remove playlist"),
+        ]),
+        View::Queue => ("queue", &[
+            ("enter", "play from cursor"),
+            ("d", "remove from queue"),
+            ("C", "clear queue"),
+        ]),
+        View::Audio => ("audio", &[
+            ("o", "toggle output local/heos"),
+            ("S", "cycle speaker"),
+            ("r", "cycle repeat"),
+            ("p / space", "pause/resume"),
+            ("v", "refresh speakers"),
+            ("t", "test cast"),
+            ("m", "mute toggle"),
+            ("g", "group all speakers"),
+            ("u", "ungroup"),
+            ("G", "group mute toggle"),
+            (" ,  .", "group volume -/+"),
+        ]),
+        View::Trove => ("trove", &[
+            ("s", "search"),
+            ("enter", "pick version"),
+            ("D", "download"),
+            ("M", "more results"),
+            ("A", "download all"),
+            ("F", "format"),
+            ("j / k", "navigate"),
+        ]),
+        View::Radio => ("radio", &[
+            ("enter / space", "play"),
+            ("C", "pick country"),
+            ("s", "search"),
+            ("f", "toggle favorite"),
+            ("A", "add stream url"),
+            ("M", "more results"),
+            ("j / k", "navigate"),
+        ]),
+    };
+    lines.push(Line::from(Span::styled(format!("  {title}"), Style::default().fg(silver).add_modifier(Modifier::BOLD))));
+    for (k, d) in keys {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("{k:<20}"), Style::default().fg(ok)),
+            Span::raw(*d),
+        ]));
+    }
+
+    lines.push(Line::from(Span::raw("")));
+    lines.push(Line::from(Span::styled("  press any key to close", Style::default().fg(dim))));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" ✦ help ✦ ")
+        .border_style(Style::default().fg(accent));
+    let para = Paragraph::new(lines).block(block).wrap(ratatui::widgets::Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
 fn draw(f: &mut Frame, app: &mut App) {
+    if app.show_help {
+        draw_help(f, app);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
-            Constraint::Length(4), // persistent waves strip
+            Constraint::Length(6), // persistent waves strip
             Constraint::Length(7),
         ])
         .split(f.area());
@@ -2030,7 +2244,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(top_title)
-        .border_style(Style::default().fg(Color::Magenta));
+        .border_style(Style::default().fg(Color::Rgb(142, 196, 200)));
     let inner = top_block.inner(chunks[0]);
     f.render_widget(top_block, chunks[0]);
     match focus {
@@ -2046,7 +2260,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(" ✦ waves ✦ ")
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Rgb(138, 138, 150)));
     let wave_inner = wave_block.inner(chunks[1]);
     f.render_widget(wave_block, chunks[1]);
     f.render_widget(Paragraph::new(waves_lines(app)), wave_inner);
@@ -2066,18 +2280,18 @@ fn draw(f: &mut Frame, app: &mut App) {
             format!(" ✦ {prompt} ✦ "),
             vec![Line::from(vec![
                 Span::raw("  "),
-                Span::styled(app.input_buf.clone() + "█", Style::default().fg(Color::White)),
+                Span::styled(app.input_buf.clone() + "█", Style::default().fg(Color::Rgb(255, 235, 242))),
             ])],
         )
     } else {
         let mut lines = vec![Line::from(Span::styled(
             format!("  {}", focus.menu()),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::Rgb(192, 192, 200)),
         ))];
         if !app.msg.is_empty() && app.msg_at.elapsed() < Duration::from_secs(6) {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(app.msg.clone(), Style::default().fg(Color::Cyan)),
+                Span::styled(app.msg.clone(), Style::default().fg(Color::Rgb(142, 196, 200))),
             ]));
         } else {
             let hint = match focus {
@@ -2126,7 +2340,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                     format!("{where_} · {st} · favs:{} · tab cycle · q quit", app.radio.favs.len())
                 }
             };
-            lines.push(Line::from(Span::styled(format!("  {hint}"), Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(format!("  {hint}"), Style::default().fg(Color::Rgb(138, 138, 150)))));
         }
         (format!(" ✦ {} menu ✦ ", focus.title()), lines)
     };
@@ -2134,7 +2348,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(menu_title)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(Color::Rgb(138, 138, 150)));
     let menu_inner = menu_block.inner(chunks[2]);
     f.render_widget(menu_block, chunks[2]);
     f.render_widget(Paragraph::new(menu_lines), menu_inner);
@@ -2147,7 +2361,7 @@ fn draw_browser(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             .iter()
             .map(|e| {
                 let (mark, style) = if e.is_dir {
-                    ("▸ ", Style::default().fg(Color::Cyan))
+                    ("▸ ", Style::default().fg(Color::Rgb(142, 196, 200)))
                 } else {
                     ("  ", Style::default())
                 };
@@ -2174,7 +2388,7 @@ fn draw_browser(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         state.select(Some(app.browser_sel.min(rows.len() - 1)));
     }
     let list = List::new(rows)
-        .highlight_style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD))
         .highlight_symbol("❯ ");
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -2202,12 +2416,12 @@ fn draw_queue(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let list = List::new(if rows.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  (queue empty)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(138, 138, 150)),
         )))]
     } else {
         rows
     })
-    .highlight_style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+    .highlight_style(Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD))
     .highlight_symbol("❯ ");
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -2224,33 +2438,56 @@ fn speaker_entry(app: &App) -> Option<heos::HeosPlayer> {
         .cloned()
 }
 
-/// Real 64-bar EQ row for a track at `secs` ("analyzing…" until decoded).
-/// Live streams have no local file to decode — say so instead of spinning.
-fn eq_row(app: &App, path: &PathBuf, secs: f64) -> String {
+
+/// Render the 64-band spectrum as a 3-row bar chart.
+/// Returns (top, mid, bottom) strings, each 64 chars.
+fn spectrum_rows(app: &App) -> Option<(String, String, String)> {
+    let (path, secs) = if app.is_heos() {
+        match (&app.heos_clock.path, app.heos_elapsed) {
+            (Some(p), Some(s)) => (p.clone(), s),
+            _ => return None,
+        }
+    } else {
+        let p = player::now_path();
+        if p.is_empty() {
+            return None;
+        }
+        (PathBuf::from(&p), app.mpv_pos)
+    };
     if crate::meta::is_url(&path.to_string_lossy()) {
-        return "· live stream ·".into();
+        return None;
     }
-    crate::spectrum::request_analyze(path);
-    match crate::spectrum::spectrum_for(path) {
-        Some(spec) => spec.at(secs).iter().map(|v| crate::spectrum::bar_glyph(*v)).collect(),
-        None => "analyzing…".into(),
+    crate::spectrum::request_analyze(&path);
+    let spec = crate::spectrum::spectrum_for(&path)?;
+    let bands = spec.at(secs);
+    let mut top = String::with_capacity(64);
+    let mut mid = String::with_capacity(64);
+    let mut bot = String::with_capacity(64);
+    for &v in bands.iter() {
+        let h = (v.clamp(0.0, 1.0) * 3.0).round() as usize;
+        top.push(if h >= 3 { '\u{2587}' } else { ' ' });
+        mid.push(if h >= 2 { '\u{2585}' } else { ' ' });
+        bot.push(if h >= 1 { '\u{2583}' } else { ' ' });
     }
+    Some((top, mid, bot))
 }
 
 /// Waves strip body — always visible. Real spectrum (mpv time-pos local,
 /// pause-aware elapsed clock on speaker); label follows `audio_output`.
 fn waves_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let accent = Color::Rgb(142, 196, 200);
+    let ok = Color::Rgb(61, 214, 140);
+    let dim = Color::Rgb(138, 138, 150);
+    let silver = Color::Rgb(192, 192, 200);
+
     if app.is_heos() {
         match speaker_entry(app) {
             Some(p) => {
                 let playing = p.state.as_deref() == Some("play");
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(
-                        if playing { "▶ " } else { "❚❚ " },
-                        Style::default().fg(Color::Green),
-                    ),
+                    Span::styled(if playing { "▶ " } else { "❚❚ " }, Style::default().fg(ok)),
                     Span::raw(format!(
                         "{} — {}{}",
                         p.name,
@@ -2258,45 +2495,47 @@ fn waves_lines(app: &App) -> Vec<Line<'static>> {
                         p.volume.map(|v| format!("  {v}%")).unwrap_or_default()
                     )),
                 ]));
-                let bars = match (&app.heos_clock.path, app.heos_elapsed) {
-                    (Some(path), Some(secs)) => eq_row(app, path, secs),
-                    _ => "analyzing…".into(),
-                };
-                lines.push(Line::from(Span::raw(format!("  {bars}"))));
             }
             None => {
                 lines.push(Line::from(Span::raw(format!("  heos → {}", app.cfg.audio_speaker))));
-                lines.push(Line::from(Span::styled(
-                    "  no speaker seen — v in audio view",
-                    Style::default().fg(Color::DarkGray),
-                )));
             }
         }
+    } else if app.mpv_label.is_empty() && !player::alive() {
+        lines.push(Line::from(Span::styled("  idle — no mpv", Style::default().fg(dim))));
         return lines;
-    }
-    if app.mpv_label.is_empty() && !player::alive() {
-        lines.push(Line::from(Span::styled(
-            "  idle — no mpv",
-            Style::default().fg(Color::DarkGray),
-        )));
-        return lines;
-    }
-    let label = if app.mpv_label.is_empty() {
-        "— silence —".to_string()
     } else {
-        app.mpv_label.clone()
-    };
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            if app.mpv_paused { "❚❚ " } else { "▶ " },
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw(label),
-    ]));
-    let p = player::now_path();
-    let bars = if p.is_empty() { "—".into() } else { eq_row(app, &PathBuf::from(&p), app.mpv_pos) };
-    lines.push(Line::from(Span::raw(format!("  {bars}"))));
+        let label = if app.mpv_label.is_empty() {
+            "— silence —".to_string()
+        } else {
+            app.mpv_label.clone()
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(if app.mpv_paused { "❚❚ " } else { "▶ " }, Style::default().fg(ok)),
+            Span::raw(label),
+        ]));
+    }
+
+    match spectrum_rows(app) {
+        Some((top, mid, bot)) => {
+            lines.push(Line::from(Span::styled(format!("  {top}"), Style::default().fg(accent))));
+            lines.push(Line::from(Span::styled(format!("  {mid}"), Style::default().fg(silver))));
+            lines.push(Line::from(Span::styled(format!("  {bot}"), Style::default().fg(dim))));
+        }
+        None => {
+            let msg = if app.is_heos() {
+                match (&app.heos_clock.path, app.heos_elapsed) {
+                    (Some(p), _) if crate::meta::is_url(&p.to_string_lossy()) => "  · live stream ·".to_string(),
+                    _ => "  analyzing…".to_string(),
+                }
+            } else {
+                "  —".to_string()
+            };
+            lines.push(Line::from(Span::styled(msg, Style::default().fg(dim))));
+            lines.push(Line::from(Span::raw("")));
+            lines.push(Line::from(Span::raw("")));
+        }
+    }
     lines
 }
 
@@ -2305,7 +2544,7 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     if app.trove.searching {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  searching archive.org…",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(138, 138, 150)),
         ))));
     } else if app.trove.docs.is_empty() {
         rows.push(ListItem::new(Line::from(Span::styled(
@@ -2314,7 +2553,7 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             } else {
                 "  no results — s to search again"
             },
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(138, 138, 150)),
         ))));
     }
     for (i, d) in app.trove.docs.iter().enumerate() {
@@ -2323,18 +2562,18 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         let _ = l2;
         rows.push(ListItem::new(Line::from(Span::styled(
             format!("      {l2}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(138, 138, 150)),
         ))));
     }
     if app.trove.loading_more {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  loading more…",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(138, 138, 150)),
         ))));
     } else if app.trove.exhausted && !app.trove.docs.is_empty() {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  — end —",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(138, 138, 150)),
         ))));
     }
     if let Some(idx) = app.trove.fmt_for {
@@ -2355,7 +2594,7 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 Span::raw("  version? "),
                 Span::styled(
                     format!("{} — {what}", d.identifier),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(Color::Rgb(255, 176, 32)),
                 ),
             ])));
         }
@@ -2365,7 +2604,7 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     for l in tail.into_iter().rev() {
         rows.push(ListItem::new(Line::from(Span::styled(
             format!("  {l}"),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(Color::Rgb(142, 196, 200)),
         ))));
     }
     // selection tracks result rows (2 rows per doc)
@@ -2394,11 +2633,11 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     if !title.is_empty() {
         rows.insert(
             0,
-            ListItem::new(Line::from(Span::styled(title, Style::default().fg(Color::Gray)))),
+            ListItem::new(Line::from(Span::styled(title, Style::default().fg(Color::Rgb(192, 192, 200))))),
         );
     }
     let list = List::new(rows)
-        .highlight_style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD))
         .highlight_symbol("❯ ");
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -2410,7 +2649,7 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         if app.radio.countries_loading && app.radio.countries.is_empty() {
             rows.push(ListItem::new(Line::from(Span::styled(
                 "  reading countries…",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Rgb(138, 138, 150)),
             ))));
         }
         for c in &app.radio.countries {
@@ -2424,7 +2663,7 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             state.select(Some(app.radio.pick_sel.min(rows.len() - 1)));
         }
         let list = List::new(rows)
-            .highlight_style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+            .highlight_style(Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD))
             .highlight_symbol("❯ ");
         f.render_stateful_widget(list, area, &mut state);
         return;
@@ -2432,23 +2671,23 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     if app.radio.loading && app.radio.stations.is_empty() && app.radio.favs.is_empty() {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  tuning…",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(138, 138, 150)),
         ))));
     }
     if radio_len(app) == 0 && !app.radio.loading {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  press enter to pick a country",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(138, 138, 150)),
         ))));
     }
     for (s, fav) in radio_visible(app) {
         if fav {
             rows.push(ListItem::new(Line::from(vec![
                 Span::raw("★ "),
-                Span::styled(s.name.clone(), Style::default().fg(Color::Yellow)),
+                Span::styled(s.name.clone(), Style::default().fg(Color::Rgb(255, 176, 32))),
                 Span::styled(
                     format!("  [{}]", s.country),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Rgb(138, 138, 150)),
                 ),
             ])));
             continue;
@@ -2466,12 +2705,12 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     if app.radio.loading_more {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  loading more…",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(138, 138, 150)),
         ))));
     } else if app.radio.exhausted && radio_len(app) > 0 {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  — end —",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(138, 138, 150)),
         ))));
     }
     let mut state = ListState::default();
@@ -2479,7 +2718,7 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         state.select(Some(app.radio.sel.min(rows.len().saturating_sub(1))));
     }
     let list = List::new(rows)
-        .highlight_style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD))
         .highlight_symbol("❯ ");
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -2490,22 +2729,22 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         Span::raw("  output   "),
         Span::styled(
             app.cfg.audio_output.clone(),
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("   (o toggle)", Style::default().fg(Color::DarkGray)),
+        Span::styled("   (o toggle)", Style::default().fg(Color::Rgb(138, 138, 150))),
     ]));
     lines.push(Line::from(vec![
         Span::raw("  speaker  "),
         Span::styled(
             app.cfg.audio_speaker.clone(),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(Color::Rgb(142, 196, 200)),
         ),
-        Span::styled("   (s cycle · v refresh)", Style::default().fg(Color::DarkGray)),
+        Span::styled("   (s cycle · v refresh)", Style::default().fg(Color::Rgb(138, 138, 150))),
     ]));
     if app.audio.roster.is_empty() {
         lines.push(Line::from(Span::styled(
             "  no speakers seen — press v",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(138, 138, 150)),
         )));
     }
     for p in &app.audio.roster {
@@ -2514,7 +2753,7 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             Span::raw(format!("  {} ", if playing { "▶" } else { "·" })),
             Span::styled(
                 p.name.clone(),
-                Style::default().fg(if playing { Color::Green } else { Color::Gray }),
+                Style::default().fg(if playing { Color::Rgb(61, 214, 140) } else { Color::Rgb(192, 192, 200) }),
             ),
             Span::raw(format!(
                 "  {}  {}{}",
@@ -2524,12 +2763,55 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             )),
         ]));
     }
+    // group state
+    if !app.groups.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  ── group ─────────────────────────────",
+            Style::default().fg(Color::Rgb(138, 138, 150)),
+        )));
+        for g in &app.groups {
+            let members: String = g
+                .players
+                .iter()
+                .map(|p| format!("{} ({})", p.name, p.role))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(Line::from(vec![
+                Span::raw("  group   "),
+                Span::styled(
+                    format!("{} ", g.name),
+                    Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("gid={} ", g.gid),
+                    Style::default().fg(Color::Rgb(138, 138, 150)),
+                ),
+                Span::styled(
+                    if app.group_muted { "muted" } else { "unmuted" },
+                    Style::default().fg(if app.group_muted { Color::Rgb(255, 176, 32) } else { Color::Rgb(61, 214, 140) }),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!("    {}", members),
+                Style::default().fg(Color::Rgb(192, 192, 200)),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "    (g group all · u ungroup · G group mute)",
+            Style::default().fg(Color::Rgb(138, 138, 150)),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  group   none  (g group all · u ungroup)",
+            Style::default().fg(Color::Rgb(138, 138, 150)),
+        )));
+    }
     lines.push(Line::from(Span::styled(
         format!(
             "  dlna {}   (t test-cast · m mute · +/- vol)",
             if app.audio.dlna_ok { "ok" } else { "down" }
         ),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Rgb(138, 138, 150)),
     )));
     f.render_widget(Paragraph::new(lines), area);
 }

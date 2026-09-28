@@ -26,6 +26,22 @@ pub struct HeosPlayer {
     pub volume: Option<i32>,
 }
 
+
+/// A HEOS speaker group (from `group/get_groups`).
+#[derive(Debug, Clone, Default)]
+pub struct HeosGroup {
+    pub name: String,
+    pub gid: i64,
+    pub players: Vec<GroupPlayer>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GroupPlayer {
+    pub name: String,
+    pub pid: i64,
+    pub role: String,
+}
+
 /// Split concatenated JSON objects (firmware sends several per reply).
 fn split_objects(text: &str) -> Vec<Value> {
     let mut out = Vec::new();
@@ -789,6 +805,92 @@ pub fn tunein_play(ip: &str, pid: i64, hit: &TuneinHit) -> bool {
     ))
 }
 
+
+/// Parse a `group/get_groups` payload into structured groups.
+/// Pure function — no I/O, fully testable.
+pub fn parse_groups(objs: &[Value]) -> Vec<HeosGroup> {
+    let mut out = Vec::new();
+    for o in objs {
+        let Some(list) = o.get("payload").and_then(|p| p.as_array()) else { continue };
+        for g in list {
+            let players = g
+                .get("players")
+                .and_then(|p| p.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|p| GroupPlayer {
+                            name: p.get("name").and_then(|v| v.as_str()).unwrap_or("").into(),
+                            pid: p.get("pid").and_then(|v| v.as_i64()).unwrap_or(0),
+                            role: p.get("role").and_then(|v| v.as_str()).unwrap_or("").into(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(HeosGroup {
+                name: g.get("name").and_then(|v| v.as_str()).unwrap_or("").into(),
+                gid: g.get("gid").and_then(|v| v.as_i64()).unwrap_or(0),
+                players,
+            });
+        }
+    }
+    out
+}
+
+/// List speaker groups (`group/get_groups`). Empty when nothing is grouped.
+pub fn get_groups(ip: &str) -> Vec<HeosGroup> {
+    let objs = rpc(ip, &[String::from("heos://group/get_groups")]);
+    parse_groups(&objs)
+}
+
+/// Build the `set_group` pid list: leader first, then members.
+/// Pure function — no I/O, fully testable.
+pub fn group_pid_list(leader: i64, members: &[i64]) -> String {
+    let mut pids = vec![leader];
+    pids.extend_from_slice(members);
+    pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
+}
+
+/// Create or modify a group. `leader` is the group leader; `members` are the
+/// other pids. Pass an empty `members` to ungroup the leader.
+/// `heos://group/set_group?pid=leader,member1,member2`
+pub fn set_group(ip: &str, leader: i64, members: &[i64]) -> bool {
+    let list = group_pid_list(leader, members);
+    ok(&rpc(
+        ip,
+        &[format!("heos://group/set_group?pid={list}")],
+    ))
+}
+
+/// Ungroup every player in the group (leader pid only).
+pub fn ungroup(ip: &str, leader: i64) -> bool {
+    ok(&rpc(
+        ip,
+        &[format!("heos://group/set_group?pid={leader}")],
+    ))
+}
+
+/// Group volume (0-100). Applies to every member.
+pub fn group_set_volume(ip: &str, gid: i64, level: i32) -> bool {
+    let level = level.clamp(0, 100);
+    ok(&rpc(
+        ip,
+        &[format!("heos://group/set_volume?gid={gid}&level={level}")],
+    ))
+}
+
+/// Group mute toggle.
+pub fn group_set_mute(ip: &str, gid: i64, on: bool) -> bool {
+    ok(&rpc(
+        ip,
+        &[format!("heos://group/set_mute?gid={gid}&state={}", if on { "on" } else { "off" })],
+    ))
+}
+
+/// Group play/pause (leader pid).
+pub fn group_set_state(ip: &str, leader: i64, state: &str) -> bool {
+    set_state(ip, leader, state)
+}
+
 /// Record a radio play for the elapsed clock + now displays.
 pub fn note_radio(url: &str, title: &str) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
@@ -918,5 +1020,122 @@ pub fn dlna_cast(ip: &str, pid: i64, path: &std::path::Path, aid: i64) -> Result
                 .unwrap_or_default();
             Err(format!("track not in DLNA for '{stem}' (sid {sid})"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ---------- group_pid_list ----------
+
+    #[test]
+    fn group_pid_list_leader_first() {
+        assert_eq!(group_pid_list(258957015, &[-105329903]), "258957015,-105329903");
+    }
+
+    #[test]
+    fn group_pid_list_single_player_is_just_leader() {
+        assert_eq!(group_pid_list(258957015, &[]), "258957015");
+    }
+
+    #[test]
+    fn group_pid_list_multiple_members() {
+        assert_eq!(group_pid_list(1, &[2, 3, 4]), "1,2,3,4");
+    }
+
+    #[test]
+    fn group_pid_list_preserves_negative_pids() {
+        assert_eq!(group_pid_list(-105329903, &[258957015]), "-105329903,258957015");
+    }
+
+    // ---------- parse_groups ----------
+
+    #[test]
+    fn parse_groups_empty_payload() {
+        let objs = vec![json!({"heos": {"command": "group/get_groups", "result": "success", "message": ""}, "payload": []})];
+        assert!(parse_groups(&objs).is_empty());
+    }
+
+    #[test]
+    fn parse_groups_no_payload_key() {
+        let objs = vec![json!({"heos": {"command": "group/get_groups", "result": "success", "message": ""}})];
+        assert!(parse_groups(&objs).is_empty());
+    }
+
+    #[test]
+    fn parse_groups_single_group() {
+        let objs = vec![json!({
+            "heos": {"command": "group/get_groups", "result": "success", "message": ""},
+            "payload": [{
+                "name": "Cave + Vanguarda Office",
+                "gid": 258957015,
+                "players": [
+                    {"name": "Cave", "pid": 258957015, "role": "leader"},
+                    {"name": "Vanguarda Office", "pid": -105329903, "role": "member"}
+                ]
+            }]
+        })];
+        let groups = parse_groups(&objs);
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert_eq!(g.name, "Cave + Vanguarda Office");
+        assert_eq!(g.gid, 258957015);
+        assert_eq!(g.players.len(), 2);
+        assert_eq!(g.players[0].name, "Cave");
+        assert_eq!(g.players[0].pid, 258957015);
+        assert_eq!(g.players[0].role, "leader");
+        assert_eq!(g.players[1].name, "Vanguarda Office");
+        assert_eq!(g.players[1].pid, -105329903);
+        assert_eq!(g.players[1].role, "member");
+    }
+
+    #[test]
+    fn parse_groups_multiple_groups() {
+        let objs = vec![json!({
+            "heos": {"command": "group/get_groups", "result": "success", "message": ""},
+            "payload": [
+                {"name": "A", "gid": 1, "players": [{"name": "P1", "pid": 1, "role": "leader"}]},
+                {"name": "B", "gid": 2, "players": [{"name": "P2", "pid": 2, "role": "leader"}]}
+            ]
+        })];
+        let groups = parse_groups(&objs);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].name, "A");
+        assert_eq!(groups[1].name, "B");
+    }
+
+    #[test]
+    fn parse_groups_missing_fields_default() {
+        let objs = vec![json!({
+            "heos": {"command": "group/get_groups", "result": "success", "message": ""},
+            "payload": [{"name": "X", "gid": 9}]
+        })];
+        let groups = parse_groups(&objs);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "X");
+        assert_eq!(groups[0].gid, 9);
+        assert!(groups[0].players.is_empty());
+    }
+
+    #[test]
+    fn parse_groups_ignores_non_array_payload() {
+        let objs = vec![json!({
+            "heos": {"command": "group/get_groups", "result": "success", "message": ""},
+            "payload": "not-an-array"
+        })];
+        assert!(parse_groups(&objs).is_empty());
+    }
+
+    #[test]
+    fn parse_groups_handles_split_json_objects() {
+        let objs = vec![
+            json!({"heos": {"command": "group/get_groups", "result": "success", "message": ""}, "payload": []}),
+            json!({"heos": {"command": "group/get_groups", "result": "success", "message": ""}, "payload": [{"name": "Late", "gid": 5, "players": []}]}),
+        ];
+        let groups = parse_groups(&objs);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Late");
     }
 }

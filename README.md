@@ -30,23 +30,46 @@ Python `faeOS/bin/siren` is archived (tests/rollback only).
 - `scripts/siren` — thin launcher (never a prebuilt ELF in git)
 - `build.sh install` — engine → `~/.local/lib/faeos/siren`, launcher → `~/bin/siren`
 
-## TUI (target)
+## TUI
 
 Two boxes + a persistent waves strip. Top = content view (Tab cycles
 browser → queue → audio → trove → radio). Bottom = context menu of the
-focused view (Option A):
+focused view. Waves strip shows speaker state + 3-row spectrum (local
+files) or `· live stream ·` (radio). Press `h` for help overlay.
 
-| Focus   | Bottom menu                          |
-|---------|--------------------------------------|
-| browser | open/play · add · cast · backspace up · / filter |
-| queue   | play-from · remove · clear            |
-| audio   | output local\|heos · speaker · vol · test-cast |
-| trove   | search · pick version · download      |
-| radio   | play · country · search · fav · more  |
+**Consistent keys across all views:**
 
-## Audio (target)
+| Key | Action |
+|-----|--------|
+| `c` | cast to speaker |
+| `d` | delete/remove |
+| `s` | search |
+| `m` | mute toggle |
+| `a` | add |
+| `f` | favorite |
+| `h` | help overlay |
+
+**View-specific keys** (uppercase = variant):
+
+| View | Keys |
+|------|------|
+| browser | `enter` open · `a` add · `c` cast · `⌫` up · `/` filter · `S` save · `L` load · `R` rm |
+| queue | `enter` play-from · `d` remove · `C` clear |
+| audio | `o` output · `S` speaker · `r` repeat · `p` pause · `v` refresh · `t` test · `m` mute · `g` group · `u` ungroup · `G` group mute · `,`/`.` group vol |
+| trove | `s` search · `enter` vers · `D` dl · `M` more · `A` all · `F` format |
+| radio | `enter` play · `C` country · `s` search · `f` fav · `A` add url · `M` more |
+
+**Group control** (audio view): `g` groups all speakers under current
+speaker as leader, `u` ungroups, `G` toggles group mute, `,`/`.` adjust
+group volume. HEOS natively syncs grouped speakers — verified 1–2ms
+drift.
+
+## Audio
 
 Siren owns its audio routing (`~/.config/siren/config.json`):
+
+**Group mode** (new): `g` in audio view groups all HEOS speakers.
+HEOS handles sync natively. Verified: 1–2ms drift between speakers.
 
 ```
 siren audio                  # output, speaker, volumes, DLNA status
