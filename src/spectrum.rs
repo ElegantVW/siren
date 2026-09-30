@@ -234,6 +234,48 @@ fn analyze(pcm: &[f32]) -> TrackSpec {
     TrackSpec { frames, frame_dur, duration }
 }
 
+/// Live spectrum: one frame of BANDS magnitudes from a PCM window.
+/// No caching, no file decode — for the real-time visualizer.
+/// Normalizes against a rolling peak so quiet and loud both look right.
+pub fn live_bands(pcm: &[f32], peak: &mut f32) -> [f32; BANDS] {
+    let mut raw = frame_bands(pcm);
+    // rolling peak (attack fast, decay slow) keeps the display full
+    let mx = raw.iter().copied().fold(0.0f32, f32::max).max(1e-6);
+    if mx > *peak {
+        *peak = mx;
+    } else {
+        *peak *= 0.992;
+    }
+    for b in raw.iter_mut() {
+        *b = (*b / peak.max(1e-6)).sqrt().clamp(0.0, 1.0);
+    }
+    raw
+}
+
+/// Smoothing: faster attack than release (bars snap up, fall smoothly).
+pub fn smooth_bands(prev: &[f32; BANDS], cur: &[f32; BANDS]) -> [f32; BANDS] {
+    let mut out = [0.0f32; BANDS];
+    for i in 0..BANDS {
+        out[i] = if cur[i] > prev[i] {
+            prev[i] * 0.35 + cur[i] * 0.65
+        } else {
+            prev[i] * 0.82 + cur[i] * 0.18
+        };
+    }
+    out
+}
+
+/// Peak-hold caps: tick down one step per frame (classic analyzer).
+pub fn tick_peaks(peaks: &mut [f32; BANDS], cur: &[f32; BANDS]) {
+    for i in 0..BANDS {
+        if cur[i] > peaks[i] {
+            peaks[i] = cur[i];
+        } else {
+            peaks[i] = (peaks[i] - 0.02).max(0.0);
+        }
+    }
+}
+
 static MEM: OnceLock<Mutex<HashMap<String, TrackSpec>>> = OnceLock::new();
 static PENDING: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
 

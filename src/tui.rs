@@ -9,7 +9,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
@@ -19,20 +19,22 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum View {
     Browser,
     Queue,
     Audio,
     Trove,
     Radio,
+    Viz,
 }
-const VIEWS: [View; 5] = [
+const VIEWS: [View; 6] = [
     View::Browser,
     View::Queue,
     View::Audio,
     View::Trove,
     View::Radio,
+    View::Viz,
 ];
 
 impl View {
@@ -43,6 +45,7 @@ impl View {
             View::Audio => "audio",
             View::Trove => "trove",
             View::Radio => "radio",
+            View::Viz => "viz",
         }
     }
     fn menu(&self) -> &'static str {
@@ -52,6 +55,7 @@ impl View {
             View::Audio => "o output · S speaker · j/k src · m mute · -/+ vol · g group · W stream",
             View::Trove => "s search · enter vers · D dl · j/k · M more · A all · F format",
             View::Radio => "enter play · C country · s search · f fav · A add url · M more · j/k",
+            View::Viz => "t toggle h/v · V cycle zoom · tab cycle · q quit",
         }
     }
 }
@@ -204,6 +208,8 @@ struct App {
     play_phase: usize,
     play_pending: bool,
     play_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    viz_vert: bool,
+    viz_zoom: usize,
     mpv_label: String,
     mpv_pos: f64,
     mpv_dur: f64,
@@ -305,6 +311,8 @@ impl App {
             play_phase: 0,
             play_pending: false,
             play_rx: None,
+            viz_vert: false,
+            viz_zoom: 1,
             mpv_label: String::new(),
             mpv_pos: 0.0,
             mpv_dur: 0.0,
@@ -664,6 +672,8 @@ pub fn run() -> anyhow::Result<()> {
             app.stream_msg = "stream failed to start".into();
         }
     }
+    // live visualizer: read the same monitor, run the FFT on it.
+    crate::viz::start(&crate::stream::capture_source());
     let res = event_loop(&mut terminal, &mut app);
     crate::stream::stop();
 
@@ -825,6 +835,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             View::Audio => handle_audio(app, code, mods),
             View::Trove => handle_trove(app, code, mods),
             View::Radio => handle_radio(app, code, mods),
+            View::Viz => handle_viz(app, code, mods),
         },
     }
     false
@@ -2289,6 +2300,69 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
 
 // ---- drawing ----
 
+/// Full-screen visualizer. Both orientations:
+///   horizontal (bars grow up)  and  vertical (bars grow right).
+/// Braille 2×4 dots per cell, peak caps, house-palette gradient.
+fn draw_viz(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let (bands, peaks) = crate::viz::snapshot();
+    let accent = Color::Rgb(142, 196, 200);
+    let silver = Color::Rgb(192, 192, 200);
+    let dim = Color::Rgb(138, 138, 150);
+    let zoom = app.viz_zoom.max(1);
+    // inner area of the content box
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(format!(" ✦ siren · viz · {} · {}x ✦ ",
+            if app.viz_vert { "vertical" } else { "horizontal" }, zoom))
+        .border_style(Style::default().fg(accent));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let w = inner.width as usize;
+    let h = inner.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let rows: Vec<String> = if app.viz_vert {
+        crate::viz::render_vertical(&bands, &peaks, w / zoom, h / zoom)
+    } else {
+        crate::viz::render_horizontal(&bands, &peaks, w / zoom, h / zoom)
+    };
+    for (i, r) in rows.iter().enumerate() {
+        let y = if app.viz_vert {
+            inner.y + (i as u16).saturating_mul(zoom as u16)
+        } else {
+            inner.y + (i as u16).saturating_mul(zoom as u16)
+        };
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let styled = Line::from(Span::styled(r.clone(), Style::default().fg(accent)));
+        f.render_widget(Paragraph::new(styled), Rect::new(inner.x, y, inner.width, 1));
+    }
+    // footer hint
+    let hint = if app.viz_vert { " vertical · t flip · V zoom " } else { " horizontal · t flip · V zoom " };
+    let hint_y = inner.y + inner.height.saturating_sub(1);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(dim)))),
+        Rect::new(inner.x, hint_y, inner.width, 1),
+    );
+    let _ = silver;
+}
+
+/// Viz view keys: t = flip orientation, V = zoom cycle.
+fn handle_viz(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
+    match code {
+        KeyCode::Char('t') | KeyCode::Char(' ') => {
+            app.viz_vert = !app.viz_vert;
+        }
+        KeyCode::Char('V') => {
+            app.viz_zoom = (app.viz_zoom % 3) + 1;
+        }
+        _ => {}
+    }
+}
+
 /// Full-screen help overlay. Shows every key for the current view.
 fn draw_help(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -2371,6 +2445,11 @@ fn draw_help(f: &mut Frame, app: &mut App) {
             ("M", "more results"),
             ("j / k", "navigate"),
         ]),
+        View::Viz => ("viz", &[
+            ("t / space", "flip horizontal / vertical"),
+            ("V", "cycle zoom"),
+            ("j / k", "navigate"),
+        ]),
     };
     lines.push(Line::from(Span::styled(format!("  {title}"), Style::default().fg(silver).add_modifier(Modifier::BOLD))));
     for (k, d) in keys {
@@ -2424,6 +2503,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         View::Audio => draw_audio(f, app, inner),
         View::Trove => draw_trove(f, app, inner),
         View::Radio => draw_radio(f, app, inner),
+        View::Viz => draw_viz(f, app, inner),
     }
 
     // persistent waves strip — visible at all times, all views
@@ -2486,6 +2566,10 @@ fn draw(f: &mut Frame, app: &mut App) {
                     }
                 }
                 View::Queue => format!("{} queued · tab cycle · q quit", queue::snapshot().len()),
+                View::Viz => format!(
+                    "{} · t flip · V zoom · tab cycle · q quit",
+                    if app.viz_vert { "vertical" } else { "horizontal" }
+                ),
                 View::Audio => format!("out:{} · spk:{} · tab cycle · q quit", app.cfg.audio_output, app.cfg.audio_speaker),
                 View::Trove => {
                     let st = if app.trove.searching {
@@ -2699,24 +2783,15 @@ fn waves_lines(app: &App) -> Vec<Line<'static>> {
         ]));
     }
 
-    match spectrum_rows(app) {
-        Some((top, mid, bot)) => {
-            lines.push(Line::from(Span::styled(format!("  {top}"), Style::default().fg(accent))));
-            lines.push(Line::from(Span::styled(format!("  {mid}"), Style::default().fg(silver))));
-            lines.push(Line::from(Span::styled(format!("  {bot}"), Style::default().fg(dim))));
-        }
-        None => {
-            let msg = if app.is_heos() {
-                match (&app.heos_clock.path, app.heos_elapsed) {
-                    (Some(p), _) if crate::meta::is_url(&p.to_string_lossy()) => "  · live stream ·".to_string(),
-                    _ => "  analyzing…".to_string(),
-                }
-            } else {
-                "  —".to_string()
-            };
-            lines.push(Line::from(Span::styled(msg, Style::default().fg(dim))));
-            lines.push(Line::from(Span::raw("")));
-            lines.push(Line::from(Span::raw("")));
+    {
+        // live braille spectrum (horizontal) — 2×4 dots/cell = 16 levels
+        // even in this short box, instead of the old 3 chunky rows.
+        let (bands, peaks) = crate::viz::snapshot();
+        let w = 44usize; // cell cols (2 dot cols each = 88 dot cols)
+        let h = 3usize;  // cell rows (4 dot rows each = 12 dot rows)
+        let rows = crate::viz::render_horizontal(&bands, &peaks, w, h);
+        for r in rows {
+            lines.push(Line::from(Span::styled(format!("  {r}"), Style::default().fg(accent))));
         }
     }
     lines
@@ -3133,5 +3208,62 @@ mod play_cue_tests {
         std::thread::sleep(std::time::Duration::from_millis(250));
         app.poll_play();
         assert!(!app.play_pending);
+    }
+}
+
+#[cfg(test)]
+mod viz_key_tests {
+    use super::*;
+
+    fn viz_app() -> App {
+        let mut app = App::new();
+        // move focus to Viz (last view)
+        while app.view() != View::Viz {
+            app.focus = (app.focus + 1) % VIEWS.len();
+        }
+        app
+    }
+
+    #[test]
+    fn viz_view_is_last_tab_stop() {
+        let app = viz_app();
+        assert_eq!(app.view(), View::Viz);
+    }
+
+    #[test]
+    fn t_toggles_orientation() {
+        let mut app = viz_app();
+        assert!(!app.viz_vert, "starts horizontal");
+        handle_viz(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(app.viz_vert, "t flips to vertical");
+        handle_viz(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(!app.viz_vert, "t flips back to horizontal");
+    }
+
+    #[test]
+    fn space_also_toggles_orientation() {
+        let mut app = viz_app();
+        handle_viz(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(app.viz_vert);
+    }
+
+    #[test]
+    fn V_cycles_zoom_1_2_3() {
+        let mut app = viz_app();
+        assert_eq!(app.viz_zoom, 1);
+        handle_viz(&mut app, KeyCode::Char('V'), KeyModifiers::NONE);
+        assert_eq!(app.viz_zoom, 2);
+        handle_viz(&mut app, KeyCode::Char('V'), KeyModifiers::NONE);
+        assert_eq!(app.viz_zoom, 3);
+        handle_viz(&mut app, KeyCode::Char('V'), KeyModifiers::NONE);
+        assert_eq!(app.viz_zoom, 1, "wraps back to 1");
+    }
+
+    #[test]
+    fn other_keys_do_not_flip() {
+        let mut app = viz_app();
+        handle_viz(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(!app.viz_vert);
+        assert_eq!(app.viz_zoom, 1);
     }
 }

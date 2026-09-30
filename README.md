@@ -75,6 +75,14 @@ While it runs, the bottom status line shows `| connecting… <name>`
 with an animated `|/-\` spinner. The waves strip is reserved for the
 visualizer and is never used for status.
 
+**Visualizer** (`V` view, last Tab stop): live spectrum from the
+PipeWire monitor, so it follows whatever is playing — radio, YouTube,
+games. Braille rendering (2×4 dots per cell = 16 amplitude levels
+even in a short box) instead of chunky block glyphs. Two orientations:
+`t`/`space` flips horizontal (bars grow up) ↔ vertical (bars grow
+right); `V` cycles zoom 1×/2×/3×. Peak-hold caps fall slowly. The
+waves strip carries a compact horizontal braille spectrum.
+
 **Mixer** (audio view): every live source listed with app, volume,
 muted state. `j/k` select, `m` mute/unmute one source, `-/+` adjust its
 volume. The loopback is filtered out (infrastructure, not a source).

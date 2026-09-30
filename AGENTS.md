@@ -80,6 +80,14 @@ in the bottom status line while running — **never the waves strip**
 (reserved for the visualizer). **Never poll 1255 in a loop**: this
 firmware wedges its CLI under rapid requests; verify via UPnP 60006.
 
+**Visualizer** (`viz.rs`, `V` view): live FFT from the PipeWire
+monitor (`stream.rs::capture_source`), so it follows real audio —
+not file-decoded. Braille packer (2×4 dots/cell) is pure + tested.
+Orientations: `render_horizontal` (bars up) / `render_vertical`
+(bars right). `t`/`space` flips, `V` zooms 1×/2×/3×. Smoothing is
+attack-fast/release-slow; peak caps tick down. Waves strip carries
+a compact horizontal braille spectrum.
+
 **Live stream** (audio view, `W`): siren captures the `Siren_Master`
 null sink (the PipeWire default — every client lands there), encodes
 mp3 via ffmpeg, serves it on `:8899/siren.mp3`, and feeds the group

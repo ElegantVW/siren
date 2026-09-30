@@ -16,6 +16,7 @@ mod mixer;
 mod spectrum;
 mod stream;
 mod trove;
+mod viz;
 mod tui;
 
 use anyhow::Result;
