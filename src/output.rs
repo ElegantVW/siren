@@ -108,6 +108,24 @@ fn speaker_target(cfg: &SirenConfig) -> Option<(String, i64, String)> {
     heos::resolve(h.as_deref()).map(|(ip, pid, p)| (ip, pid, p.name))
 }
 
+/// Append a timestamped line to the play log. This is the audit
+/// trail: when the UI and the speaker disagree, this file says what
+/// siren actually decided and why.
+fn play_log(msg: &str) {
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(home) = std::env::var("HOME").ok() {
+        let path = format!("{home}/.cache/siren/play.log");
+        let _ = std::fs::create_dir_all(format!("{home}/.cache/siren"));
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "[{ts}] {msg}");
+        }
+    }
+}
+
 /// Play the staged queue from `index` through the configured output.
 /// `Ok`/`Err` carry the human message (faeOS cli-voice, no superlatives).
 pub fn play_from(cfg: &SirenConfig, index: usize) -> Result<String, String> {
@@ -136,11 +154,16 @@ pub fn play_from(cfg: &SirenConfig, index: usize) -> Result<String, String> {
         // by name. Dead URLs are skipped here (fast HEAD check) so
         // the speaker never gets a 404 to "play" silently.
         if heos::url_alive(&url) {
+            play_log(&format!("direct: {url} -> {ip} pid={pid}"));
             if heos::play_url(&ip, pid, &url) && heos::confirm_play(&ip, pid, 10) {
                 heos::note_radio(&url, &title);
+                play_log(&format!("direct OK: {title} confirmed play"));
                 return Ok(format!("▶ {title} on {name}"));
             }
+            play_log(&format!("direct FAILED: {title} (ack or confirm failed)"));
             // URL alive but speaker wouldn't hold it — fall through to TuneIn
+        } else {
+            play_log(&format!("direct SKIP (dead URL): {url}"));
         }
         // 2. Fall back to TuneIn matching (name → mid → play).
         // Rank gate (≤3) keeps URL-named favs from matching random junk.
@@ -150,10 +173,13 @@ pub fn play_from(cfg: &SirenConfig, index: usize) -> Result<String, String> {
         if heos::tunein_play(&ip, pid, &hit) {
             if heos::confirm_play(&ip, pid, 10) {
                 heos::note_radio(&url, &hit.name);
+                play_log(&format!("tunein OK: {} mid={} confirmed play", hit.name, hit.mid));
                 return Ok(format!("▶ {} on {name}", hit.name));
             }
+            play_log(&format!("tunein FAILED (no confirm): {}", hit.name));
             return Err(format!("{} not responding (stream may be down)", hit.name));
         }
+        play_log(&format!("tunein FAILED (no ack): {}", hit.name));
         Err(format!("TuneIn play failed: {}", hit.name))
     } else {
         // files cast in order; stray streams after files can't ride DLNA
