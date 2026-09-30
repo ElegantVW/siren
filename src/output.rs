@@ -155,7 +155,7 @@ pub fn play_from(cfg: &SirenConfig, index: usize) -> Result<String, String> {
         // the speaker never gets a 404 to "play" silently.
         if heos::url_alive(&url) {
             play_log(&format!("direct: {url} -> {ip} pid={pid}"));
-            if heos::play_url(&ip, pid, &url) && heos::confirm_play(&ip, pid, 10) {
+            if heos::play_url(&ip, pid, &url) && heos::confirm_play_url(&ip, &url, 4) {
                 heos::note_radio(&url, &title);
                 play_log(&format!("direct OK: {title} confirmed play"));
                 return Ok(format!("▶ {title} on {name}"));
@@ -171,7 +171,7 @@ pub fn play_from(cfg: &SirenConfig, index: usize) -> Result<String, String> {
             return Err(format!("no TuneIn match: {title} (try output local)"));
         };
         if heos::tunein_play(&ip, pid, &hit) {
-            if heos::confirm_play(&ip, pid, 10) {
+            if heos::confirm_play(&ip, pid, 4) {
                 heos::note_radio(&url, &hit.name);
                 play_log(&format!("tunein OK: {} mid={} confirmed play", hit.name, hit.mid));
                 return Ok(format!("▶ {} on {name}", hit.name));

@@ -896,20 +896,75 @@ fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
     Some((host, port, path))
 }
 
-/// Poll play-state until it reads `play` or the deadline passes.
-/// Returns true only on confirmed playback. This is what makes
-/// the TUI honest: an accepted command to a dead URL reports
-/// failure instead of claiming success.
+/// ONE deferred play-state check. Never poll 1255 in a loop: this
+/// firmware wedges its CLI under rapid requests (fuzzing proved it,
+/// and a 800ms-confirm loop wedged the speaker badly enough to flash
+/// its status LED). One RPC after `secs` is safe; a loop is not.
 pub fn confirm_play(ip: &str, pid: i64, secs: u64) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-    while std::time::Instant::now() < deadline {
-        if get_state(ip, pid).as_deref() == Some("play") {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(800));
-    }
-    // one last read — state may have flipped between polls
+    std::thread::sleep(std::time::Duration::from_secs(secs));
     get_state(ip, pid).as_deref() == Some("play")
+}
+
+/// Verify a direct-URL play via UPnP GetPositionInfo (port 60006).
+/// The UPnP service has survived heavy probing all session without
+/// wedging — unlike the 1255 CLI. Returns true when the speaker's
+/// TrackURI matches the URL we sent (it may normalize case or
+/// percent-encoding, so we compare loosely).
+pub fn confirm_play_url(ip: &str, url: &str, secs: u64) -> bool {
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    let uri = upnp_track_uri(ip);
+    if uri.is_empty() {
+        return false;
+    }
+    // Loose match: speaker echoes what we sent, but don't trust
+    // exact bytes. Compare the path tail + host substring.
+    let norm = |s: &str| -> String {
+        s.trim().trim_end_matches('/').to_ascii_lowercase()
+    };
+    let n_uri = norm(&uri);
+    let n_url = norm(url);
+    n_uri == n_url || n_uri.contains(&n_url) || n_url.contains(&n_uri)
+}
+
+/// UPnP GetPositionInfo -> TrackURI (empty on failure). Raw TCP SOAP,
+/// no dependencies. Port 60006, one request, one response.
+pub fn upnp_track_uri(ip: &str) -> String {
+    use std::io::{Read, Write};
+    let body = concat!(
+        r#"<?xml version="1.0"?>"#,
+        r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">"#,
+        r#"<s:Body><u:GetPositionInfo xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">"#,
+        r#"<InstanceID>0</InstanceID></u:GetPositionInfo></s:Body></s:Envelope>"#,
+    );
+    let req = format!(
+        "POST /upnp/control/renderer_dvc/AVTransport HTTP/1.1\r\n         Host: {ip}:60006\r\n         Content-Type: text/xml; charset=\"utf-8\"\r\n         SOAPACTION: \"urn:schemas-upnp-org:service:AVTransport:1#GetPositionInfo\"\r\n         Content-Length: {len}\r\n         Connection: close\r\n\r\n{body}",
+        ip = ip, len = body.len(), body = body,
+    );
+    let mut s = match std::net::TcpStream::connect_timeout(
+        &format!("{ip}:60006").parse().ok().unwrap_or_else(|| "0.0.0.0:80".parse().unwrap()),
+        std::time::Duration::from_secs(5),
+    ) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(6)));
+    if s.write_all(req.as_bytes()).is_err() {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&out);
+    let Some(start) = text.find("<TrackURI>") else { return String::new() };
+    let rest = &text[start + 11..];
+    let Some(end) = rest.find("</TrackURI>") else { return String::new() };
+    rest[..end].trim().to_string()
 }
 
 
