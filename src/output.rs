@@ -125,23 +125,36 @@ pub fn play_from(cfg: &SirenConfig, index: usize) -> Result<String, String> {
     let (ip, pid, name) = speaker_target(cfg).ok_or_else(|| "no speaker found".to_string())?;
     let slice = &items[index..];
     if crate::meta::is_url(&slice[0].path) {
-        // Speaker radio rides TuneIn: map the station name to a TuneIn
-        // mid and play it. Raw-URL play_stream won't hold on this unit.
-        // Rank gate (≤3) keeps URL-named favs from matching random junk.
+        let url = slice[0].path.clone();
         let title = if slice[0].display.is_empty() {
-            slice[0].path.clone()
+            url.clone()
         } else {
             slice[0].display.clone()
         };
+        // 1. Try the favorite's own URL first — but only if it's
+        // alive. The old code threw the URL away and searched TuneIn
+        // by name. Dead URLs are skipped here (fast HEAD check) so
+        // the speaker never gets a 404 to "play" silently.
+        if heos::url_alive(&url) {
+            if heos::play_url(&ip, pid, &url) && heos::confirm_play(&ip, pid, 10) {
+                heos::note_radio(&url, &title);
+                return Ok(format!("▶ {title} on {name}"));
+            }
+            // URL alive but speaker wouldn't hold it — fall through to TuneIn
+        }
+        // 2. Fall back to TuneIn matching (name → mid → play).
+        // Rank gate (≤3) keeps URL-named favs from matching random junk.
         let Some(hit) = tunein_find(&ip, &title) else {
             return Err(format!("no TuneIn match: {title} (try output local)"));
         };
         if heos::tunein_play(&ip, pid, &hit) {
-            heos::note_radio(&slice[0].path, &hit.name);
-            Ok(format!("▶ {} on {name}", hit.name))
-        } else {
-            Err(format!("TuneIn play failed: {}", hit.name))
+            if heos::confirm_play(&ip, pid, 10) {
+                heos::note_radio(&url, &hit.name);
+                return Ok(format!("▶ {} on {name}", hit.name));
+            }
+            return Err(format!("{} not responding (stream may be down)", hit.name));
         }
+        Err(format!("TuneIn play failed: {}", hit.name))
     } else {
         // files cast in order; stray streams after files can't ride DLNA
         let files: Vec<std::path::PathBuf> = slice

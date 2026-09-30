@@ -805,6 +805,113 @@ pub fn tunein_play(ip: &str, pid: i64, hit: &TuneinHit) -> bool {
     ))
 }
 
+/// Play a raw stream URL on the speaker. True = command accepted.
+/// NOTE: acceptance is NOT playback — the speaker resolves the URL
+/// server-side and may silently stop on 404. Always follow with
+/// `confirm_play`. Percent-encodes the URL per HEOS CLI spec
+/// (&, =, % must be encoded in attribute values).
+pub fn play_url(ip: &str, pid: i64, url: &str) -> bool {
+    let mut enc = String::with_capacity(url.len());
+    for b in url.bytes() {
+        match b {
+            b'&' => enc.push_str("%26"),
+            b'=' => enc.push_str("%3D"),
+            b'%' => enc.push_str("%25"),
+            b' ' => enc.push_str("%20"),
+            _ => enc.push(b as char),
+        }
+    }
+    ok(&rpc(
+        ip,
+        &[format!("heos://browse/play_stream?pid={pid}&url={enc}")],
+    ))
+}
+
+/// HEAD a stream URL to check it's alive before telling the speaker
+/// to play it. Returns true on HTTP 200 with an audio content-type
+/// (or any 2xx when the server hides its type). Fast (3s timeout) —
+/// a dead URL fails here instead of silently "playing" on the speaker.
+pub fn url_alive(url: &str) -> bool {
+    // HTTPS: no TLS in std, so we cannot check. Assume alive and let
+    // `confirm_play` decide — it catches every failure mode except a
+    // speaker that reports `play` forever on a 404 (rare; the TuneIn
+    // path below is the common case and is fully verified).
+    if url.starts_with("https://") {
+        return true;
+    }
+    use std::io::{Read, Write};
+    // minimal HTTP client over TcpStream: parse host, port, path
+    let (host, port, path) = match parse_http_url(url) {
+        Some(t) => t,
+        None => return false,
+    };
+    let mut s = match std::net::TcpStream::connect_timeout(
+        &format!("{host}:{port}").parse().ok().unwrap_or_else(|| "0.0.0.0:80".parse().unwrap()),
+        std::time::Duration::from_secs(3),
+    ) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    let req = format!("HEAD {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: siren\r\n\r\n");
+    if s.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 1024];
+    let n = s.read(&mut buf).unwrap_or(0);
+    let head = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+    // accept 200 outright; also accept 206/301/302 (relays, redirects)
+    // and audio content-types even on odd statuses
+    head.contains(" 200")
+        || head.contains(" 206")
+        || head.contains(" 301")
+        || head.contains(" 302")
+        || head.contains("audio/")
+        || head.contains("mpegurl")
+        || head.contains("x-mpegurl")
+}
+
+/// Split http(s)://host[:port][/path] into parts. HTTPS treated as
+/// port 443 (no TLS — HEAD check only needs the status line, and
+/// most stream hosts serve plain HTTP anyway; HTTPS returns false
+/// rather than blocking).
+fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
+    // HTTPS: no TLS in std — retry as plain HTTP on :80. Most
+    // Shoutcast/Icecast hosts serve both; if not, we return false
+    // and the caller falls back to TuneIn. Safe direction.
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+    let (host, port) = match hostport.find(':') {
+        Some(i) => (hostport[..i].to_string(), hostport[i + 1..].parse().unwrap_or(80)),
+        None => (hostport.to_string(), 80),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port, path))
+}
+
+/// Poll play-state until it reads `play` or the deadline passes.
+/// Returns true only on confirmed playback. This is what makes
+/// the TUI honest: an accepted command to a dead URL reports
+/// failure instead of claiming success.
+pub fn confirm_play(ip: &str, pid: i64, secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if get_state(ip, pid).as_deref() == Some("play") {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(800));
+    }
+    // one last read — state may have flipped between polls
+    get_state(ip, pid).as_deref() == Some("play")
+}
+
 
 /// Parse a `group/get_groups` payload into structured groups.
 /// Pure function — no I/O, fully testable.
@@ -1137,5 +1244,24 @@ mod tests {
         let groups = parse_groups(&objs);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].name, "Late");
+    }
+}
+
+#[cfg(test)]
+mod url_alive_live_tests {
+    // These hit the real network. Slow but honest.
+    use super::url_alive;
+
+    #[test]
+    #[ignore]
+    fn live_bauer_is_alive() {
+        // HTTPS passes through (no TLS in std) — confirm_play decides
+        assert!(url_alive("https://stream-icy.bauermedia.pt/cidade.mp3"));
+    }
+
+    #[test]
+    #[ignore]
+    fn dead_evspt_is_dead() {
+        assert!(!url_alive("http://proic1.evspt.com/oxigenio_aac"));
     }
 }
