@@ -82,7 +82,12 @@ firmware wedges its CLI under rapid requests; verify via UPnP 60006.
 
 **Visualizer** (`viz.rs`, `V` view): live FFT from the PipeWire
 monitor (`stream.rs::capture_source`), so it follows real audio —
-not file-decoded. Braille packer (2×4 dots/cell) is pure + tested.
+not file-decoded. **Latency**: `HOP`=256 slides the window (11.6ms
+updates) while `WINDOW`=2048 keeps frequency resolution; the event
+loop renders at 60fps only while `animating()` (Viz view, live
+spectrum, or a play job) and falls back to a 500ms tick otherwise —
+CPU stays proportional to visible motion. Network polls never run
+at frame rate. Braille packer (2×4 dots/cell) is pure + tested.
 Orientations: `render_horizontal` (bars up) / `render_vertical`
 (bars right). `t`/`space` flips, `V` zooms 1×/2×/3×. Smoothing is
 attack-fast/release-slow; peak caps tick down. Waves strip carries

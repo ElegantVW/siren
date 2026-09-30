@@ -13,7 +13,7 @@ use std::sync::{Mutex, OnceLock};
 
 pub const SAMPLE_RATE: u32 = 22050;
 pub const WINDOW: usize = 2048; // ~93ms per FFT
-pub const HOP: usize = 1024; // 50% overlap
+pub const HOP: usize = 256; // 50% overlap -> 25% step: 8x more updates
 pub const BANDS: usize = 64;
 pub const FMIN: f32 = 50.0;
 pub const FMAX: f32 = 11025.0;

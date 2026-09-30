@@ -77,7 +77,8 @@ visualizer and is never used for status.
 
 **Visualizer** (`V` view, last Tab stop): live spectrum from the
 PipeWire monitor, so it follows whatever is playing — radio, YouTube,
-games. Braille rendering (2×4 dots per cell = 16 amplitude levels
+games. 60fps while animating (46ms analysis → 12ms update steps, 500ms
+→ 16ms render). Braille rendering (2×4 dots per cell = 16 amplitude levels
 even in a short box) instead of chunky block glyphs. Two orientations:
 `t`/`space` flips horizontal (bars grow up) ↔ vertical (bars grow
 right); `V` cycles zoom 1×/2×/3×. Peak-hold caps fall slowly. The

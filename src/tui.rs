@@ -378,6 +378,12 @@ impl App {
     fn view(&self) -> View {
         VIEWS[self.focus]
     }
+    /// Is anything on screen moving? Drives the render cadence: 60fps
+    /// only when a visualiser is live or a play job is running, else a
+    /// slow tick. Keeps CPU proportional to visible animation.
+    fn animating(&self) -> bool {
+        self.view() == View::Viz || self.play_pending || crate::viz::running()
+    }
     fn is_heos(&self) -> bool {
         self.cfg.audio_output == "heos"
     }
@@ -690,29 +696,41 @@ fn event_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> anyhow::Result<()> {
-    // draw on input + 2Hz tick (was: every 100ms regardless)
-    let mut last_tick = Instant::now() - Duration::from_secs(99);
+    // Adaptive cadence: 60fps redraws only while something animates
+    // (Viz view, live spectrum, or a play job). CPU stays proportional
+    // to visible motion. Network polls keep their own 2-4s cadence —
+    // they never run at frame rate.
+    let frame = Duration::from_micros(16_667); // ~60fps
+    let slow = Duration::from_millis(500);
+    let mut last_draw = Instant::now() - Duration::from_secs(99);
+    let mut last_poll = Instant::now() - Duration::from_secs(99);
     terminal.draw(|f| draw(f, app))?;
     loop {
-        if event::poll(Duration::from_millis(500))? {
+        // wait only as long as the next frame is due
+        let anim = app.animating();
+        let next = if anim { last_draw + frame } else { last_poll + slow };
+        let wait = next.saturating_duration_since(Instant::now());
+        if event::poll(wait)? {
             match event::read()? {
                 Event::Key(key) => {
                     if handle_key(app, key.code, key.modifiers) {
                         return Ok(());
                     }
                     terminal.draw(|f| draw(f, app))?;
-                    last_tick = Instant::now();
+                    last_draw = Instant::now();
                 }
                 Event::Mouse(me) => {
                     if handle_mouse(app, me) {
                         terminal.draw(|f| draw(f, app))?;
-                        last_tick = Instant::now();
+                        last_draw = Instant::now();
                     }
                 }
                 _ => {}
             }
-        } else if last_tick.elapsed() >= Duration::from_millis(500) {
-            last_tick = Instant::now();
+        }
+        // background polls: 2Hz, never faster
+        if last_poll.elapsed() >= slow {
+            last_poll = Instant::now();
             app.poll_mpv();
             app.poll_speaker();
             app.poll_groups();
@@ -724,12 +742,20 @@ fn event_loop(
             app.heos_elapsed = app.heos_clock.tick(playing);
             poll_trove(app);
             poll_radio(app);
-            terminal.draw(|f| draw(f, app))?;
-        } else {
+            if !anim {
+                terminal.draw(|f| draw(f, app))?;
+                last_draw = Instant::now();
+            }
+        } else if !anim {
             // harvest background results without a full redraw
             app.poll_speaker();
             poll_trove(app);
             poll_radio(app);
+        }
+        // animation frame: redraw at 60fps only while something moves
+        if anim && last_draw.elapsed() >= frame {
+            terminal.draw(|f| draw(f, app))?;
+            last_draw = Instant::now();
         }
     }
 }
@@ -3265,5 +3291,39 @@ mod viz_key_tests {
         handle_viz(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
         assert!(!app.viz_vert);
         assert_eq!(app.viz_zoom, 1);
+    }
+}
+
+#[cfg(test)]
+mod animating_tests {
+    use super::*;
+
+    /// animating() drives the render cadence: 60fps only when
+    /// something is actually moving.
+    #[test]
+    fn animating_true_in_viz_view() {
+        let mut app = App::new();
+        while app.view() != View::Viz {
+            app.focus = (app.focus + 1) % VIEWS.len();
+        }
+        assert!(app.animating(), "Viz view must animate at 60fps");
+    }
+
+    #[test]
+    fn animating_true_while_play_job_runs() {
+        let mut app = App::new();
+        app.start_play("x".into(), Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            Ok("done".into())
+        }));
+        assert!(app.animating(), "play job must animate (spinner)");
+    }
+
+    #[test]
+    fn not_animating_in_idle_browser() {
+        let mut app = App::new();
+        // browser view, no play job -> slow tick
+        assert_eq!(app.view(), View::Browser);
+        assert!(!app.animating(), "idle browser should not force 60fps");
     }
 }

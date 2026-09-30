@@ -82,16 +82,22 @@ pub fn start(monitor: &str) -> bool {
             }
         };
         let mut out = child.stdout.take().unwrap();
-        let mut buf = vec![0u8; crate::spectrum::WINDOW * 4];
+        // Sliding window at HOP granularity: read HOP samples per step
+        // (23ms at 22050Hz) instead of a full WINDOW (92ms). The window
+        // keeps WINDOW samples for frequency resolution; the *update*
+        // rate is what makes the visualiser feel swift.
+        let mut win = vec![0.0f32; crate::spectrum::WINDOW];
+        let mut hop_bytes = vec![0u8; crate::spectrum::HOP * 4];
         loop {
-            match out.read_exact(&mut buf) {
+            match out.read_exact(&mut hop_bytes) {
                 Ok(()) => {
-                    let pcm: Vec<f32> = buf
+                    let hop: Vec<f32> = hop_bytes
                         .chunks_exact(4)
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                         .collect();
+                    slide_window(&mut win, &hop);
                     let mut g = live().lock().unwrap();
-                    let raw = live_bands(&pcm, &mut g.peak);
+                    let raw = live_bands(&win, &mut g.peak);
                     let sm = smooth_bands(&g.smoothed, &raw);
                     tick_peaks(&mut g.peaks, &sm);
                     g.smoothed = sm;
@@ -103,6 +109,16 @@ pub fn start(monitor: &str) -> bool {
         live().lock().unwrap().running = false;
     });
     true
+}
+
+/// Slide `hop` new samples into `win`, dropping the oldest. Keeps the
+/// window at WINDOW samples so frequency resolution is unchanged while
+/// the update rate becomes HOP-sized steps.
+fn slide_window(win: &mut [f32], hop: &[f32]) {
+    let n = win.len();
+    let k = hop.len().min(n);
+    win.copy_within(k.., 0);
+    win[n - k..].copy_from_slice(&hop[hop.len() - k..]);
 }
 
 /// Snapshot the current smoothed bands and peak caps.
@@ -280,5 +296,47 @@ mod tests {
         let b = live_bands(&pcm, &mut peak);
         let mx = b.iter().copied().fold(0.0f32, f32::max);
         assert!(mx > 0.9 && mx <= 1.0, "normalized to full scale, got {mx}");
+    }
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+
+    /// HOP is the update step: 256 samples @ 22050Hz = ~11.6ms.
+    #[test]
+    fn hop_gives_fast_updates() {
+        let step_ms = crate::spectrum::HOP as f64 * 1000.0 / crate::spectrum::SAMPLE_RATE as f64;
+        assert!(step_ms < 25.0, "HOP step should be under 25ms, got {step_ms:.1}ms");
+    }
+
+    /// WINDOW still defines resolution: 2048 samples = ~92ms of audio.
+    #[test]
+    fn window_keeps_resolution() {
+        assert_eq!(crate::spectrum::WINDOW, 2048, "window must stay 2048 for frequency resolution");
+    }
+
+    /// slide_window keeps the window length and shifts by hop.
+    #[test]
+    fn slide_window_shifts_and_keeps_len() {
+        let mut win = vec![0.0f32; 8];
+        let hop = vec![1.0f32, 2.0, 3.0, 4.0];
+        slide_window(&mut win, &hop);
+        assert_eq!(win.len(), 8);
+        // tail holds the newest hop
+        assert_eq!(&win[4..], &[1.0, 2.0, 3.0, 4.0]);
+        // head is zeros (shifted-in silence)
+        assert_eq!(&win[..4], &[0.0, 0.0, 0.0, 0.0]);
+    }
+
+    /// Subsequent slides accumulate without corrupting length.
+    #[test]
+    fn slide_window_multiple_steps() {
+        let mut win = vec![0.0f32; 8];
+        slide_window(&mut win, &[1.0; 4]);
+        slide_window(&mut win, &[2.0; 4]);
+        assert_eq!(win.len(), 8);
+        assert_eq!(&win[4..], &[2.0; 4]);
+        assert_eq!(&win[..4], &[1.0; 4]);
     }
 }
