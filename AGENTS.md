@@ -68,6 +68,12 @@ drift.
 muted state. `j/k` select, `m` mute/unmute one source, `-/+` adjust its
 volume. The loopback is filtered out (infrastructure, not a source).
 
+**Radio honesty**: favorites play their own saved URL first (direct
+`play_stream`), TuneIn only as fallback. Playback is verified by
+polling speaker state — dead streams report failure instead of fake
+success. HTTP URLs are pre-checked; HTTPS passes through (no TLS
+in std).
+
 **Live stream** (audio view, `W`): siren captures the `Siren_Master`
 null sink (the PipeWire default — every client lands there), encodes
 mp3 via ffmpeg, serves it on `:8899/siren.mp3`, and feeds the group
