@@ -70,6 +70,11 @@ polling speaker state — dead streams report failure instead of fake
 success. HTTP URLs are pre-checked; HTTPS passes through (no TLS
 in std).
 
+**Loading cue**: play runs in a job thread so the TUI never freezes.
+While it runs, the bottom status line shows `| connecting… <name>`
+with an animated `|/-\` spinner. The waves strip is reserved for the
+visualizer and is never used for status.
+
 **Mixer** (audio view): every live source listed with app, volume,
 muted state. `j/k` select, `m` mute/unmute one source, `-/+` adjust its
 volume. The loopback is filtered out (infrastructure, not a source).

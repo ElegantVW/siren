@@ -74,6 +74,12 @@ polling speaker state — dead streams report failure instead of fake
 success. HTTP URLs are pre-checked; HTTPS passes through (no TLS
 in std).
 
+**Loading cue** (`tui.rs` `start_play`/`poll_play`): play is an async
+job thread, single-flight, harvested on the UI tick. Spinner `|/-\`
+in the bottom status line while running — **never the waves strip**
+(reserved for the visualizer). **Never poll 1255 in a loop**: this
+firmware wedges its CLI under rapid requests; verify via UPnP 60006.
+
 **Live stream** (audio view, `W`): siren captures the `Siren_Master`
 null sink (the PipeWire default — every client lands there), encodes
 mp3 via ffmpeg, serves it on `:8899/siren.mp3`, and feeds the group

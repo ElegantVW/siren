@@ -200,6 +200,10 @@ struct App {
     mixer: Vec<crate::mixer::SinkInput>,
     mixer_sel: usize,
     mixer_at: Instant,
+    play_label: String,
+    play_phase: usize,
+    play_pending: bool,
+    play_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     mpv_label: String,
     mpv_pos: f64,
     mpv_dur: f64,
@@ -297,6 +301,10 @@ impl App {
             mixer: Vec::new(),
             mixer_sel: 0,
             mixer_at: Instant::now() - Duration::from_secs(99),
+            play_label: String::new(),
+            play_phase: 0,
+            play_pending: false,
+            play_rx: None,
             mpv_label: String::new(),
             mpv_pos: 0.0,
             mpv_dur: 0.0,
@@ -413,6 +421,61 @@ impl App {
 
     /// Speaker poll runs in a background thread — never blocks draw/input.
     /// Cadence 10s, or forced (view enter, `s`/`v` keys).
+    /// Kick an async play job. Returns immediately; the TUI keeps
+    /// drawing a spinner while the job runs. Blocks never — the old
+    /// sync path froze the UI for ~4s per play.
+    fn start_play(&mut self, label: String, run: Box<dyn FnOnce() -> Result<String, String> + Send>) {
+        if self.play_pending {
+            return; // one job at a time
+        }
+        self.play_label = label;
+        self.play_phase = 0;
+        self.play_pending = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.play_rx = Some(rx);
+        std::thread::spawn(move || {
+            let res = run();
+            let _ = tx.send(res);
+        });
+    }
+
+    /// Harvest a finished play job (one check per tick, never blocks).
+    fn poll_play(&mut self) {
+        // advance the spinner every tick while running
+        if self.play_pending {
+            self.play_phase = self.play_phase.wrapping_add(1);
+        }
+        if self.play_pending {
+            if let Some(rx) = self.play_rx.as_ref() {
+                match rx.try_recv() {
+                    Ok(res) => {
+                        match res {
+                            Ok(m) => self.say(m),
+                            Err(e) => self.say(e),
+                        }
+                        self.play_pending = false;
+                        self.play_rx = None;
+                        self.play_label.clear();
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.play_pending = false;
+                        self.play_rx = None;
+                        self.play_label.clear();
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            } else {
+                self.play_pending = false;
+            }
+        }
+    }
+
+    /// Spinner glyph for the current phase (|/-\).
+    fn play_spinner(&self) -> &'static str {
+        const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+        FRAMES[self.play_phase % FRAMES.len()]
+    }
+
     fn poll_mixer(&mut self) {
         if self.mixer_at.elapsed() < Duration::from_secs(2) {
             return;
@@ -644,6 +707,7 @@ fn event_loop(
             app.poll_speaker();
             app.poll_groups();
             app.poll_mixer();
+            app.poll_play();
             // speaker playing-state for the elapsed clock (roster may lag;
             // actions patch it optimistically, so this stays truthful)
             let playing = speaker_entry(app).and_then(|p| p.state).map(|s| s == "play");
@@ -1508,17 +1572,15 @@ fn radio_open_picker(app: &mut App) {
 }
 
 /// Stage a station on the queue and play it through the one output.
+/// Non-blocking: the play runs in a job thread so the TUI keeps
+/// drawing the loading spinner instead of freezing ~4s per play.
 fn radio_play(app: &mut App, st: &radio::Station) {
     queue::replace(vec![radio::to_queue_item(st)]);
-    match crate::output::play_from(&app.cfg, 0) {
-        Ok(m) => {
-            if app.is_heos() {
-                patch_roster(app, Some("play"), None);
-            }
-            app.say(format!("{} · {m}", st.name));
-        }
-        Err(e) => app.say(e),
-    }
+    let cfg = app.cfg.clone();
+    let label = st.name.clone();
+    app.start_play(label.clone(), Box::new(move || {
+        crate::output::play_from(&cfg, 0).map(|m| format!("{} · {m}", label))
+    }));
 }
 
 /// Harvest finished radio threads + prefetch near the end (non-blocking).
@@ -2397,7 +2459,19 @@ fn draw(f: &mut Frame, app: &mut App) {
             format!("  {}", focus.menu()),
             Style::default().fg(Color::Rgb(192, 192, 200)),
         ))];
-        if !app.msg.is_empty() && app.msg_at.elapsed() < Duration::from_secs(6) {
+        if app.play_pending {
+            // loading cue: animated spinner + what's loading.
+            // Lives here in the status line (NOT the waves strip,
+            // which is reserved for the visualizer).
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(app.play_spinner(), Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(" connecting… {}", app.play_label),
+                    Style::default().fg(Color::Rgb(142, 196, 200)),
+                ),
+            ]));
+        } else if !app.msg.is_empty() && app.msg_at.elapsed() < Duration::from_secs(6) {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(app.msg.clone(), Style::default().fg(Color::Rgb(142, 196, 200))),
@@ -2987,4 +3061,77 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         Style::default().fg(Color::Rgb(138, 138, 150)),
     )));
     f.render_widget(Paragraph::new(lines), area);
+}
+
+#[cfg(test)]
+mod play_cue_tests {
+    use super::*;
+
+    /// Spinner frames cycle | / - \ and never panic on wrap.
+    #[test]
+    fn spinner_cycles_frames() {
+        let mut app = App::new();
+        assert_eq!(app.play_spinner(), "|");
+        app.play_phase = 1; assert_eq!(app.play_spinner(), "/");
+        app.play_phase = 2; assert_eq!(app.play_spinner(), "-");
+        app.play_phase = 3; assert_eq!(app.play_spinner(), "\\");
+        app.play_phase = 4; assert_eq!(app.play_spinner(), "|"); // wraps
+        app.play_phase = usize::MAX; assert_eq!(app.play_spinner(), "\\"); // no overflow panic
+    }
+
+    /// A finished job harvests into msg and clears the spinner.
+    #[test]
+    fn play_job_success_clears_and_reports() {
+        let mut app = App::new();
+        app.start_play("Cidade FM".into(), Box::new(|| Ok("▶ Cidade FM · playing".into())));
+        assert!(app.play_pending, "job should be running");
+        assert_eq!(app.play_label, "Cidade FM");
+        // let the thread finish
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        app.poll_play();
+        assert!(!app.play_pending, "job should have harvested");
+        assert!(app.play_rx.is_none(), "rx cleared");
+        assert!(app.msg.contains("Cidade FM"), "result reported: {}", app.msg);
+        assert!(app.play_label.is_empty(), "label cleared");
+    }
+
+    /// A failed job reports the error, not silence.
+    #[test]
+    fn play_job_failure_reports_honestly() {
+        let mut app = App::new();
+        app.start_play("Antena 2 Ópera".into(), Box::new(|| Err("not responding".into())));
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        app.poll_play();
+        assert!(!app.play_pending);
+        assert!(app.msg.contains("not responding"), "error reported: {}", app.msg);
+    }
+
+    /// Spinner phase advances while pending, so the frame animates.
+    #[test]
+    fn spinner_advances_while_pending() {
+        let mut app = App::new();
+        app.start_play("x".into(), Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok("done".into())
+        }));
+        let p0 = app.play_phase;
+        app.poll_play();
+        assert_eq!(app.play_phase, p0.wrapping_add(1), "phase advances while pending");
+    }
+
+    /// Only one job at a time — a second start_play is ignored, so
+    /// we never double-fire a play at the speaker.
+    #[test]
+    fn play_job_is_single_flight() {
+        let mut app = App::new();
+        app.start_play("first".into(), Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            Ok("first".into())
+        }));
+        app.start_play("second".into(), Box::new(|| Ok("second".into())));
+        assert_eq!(app.play_label, "first", "second start ignored while first runs");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        app.poll_play();
+        assert!(!app.play_pending);
+    }
 }
