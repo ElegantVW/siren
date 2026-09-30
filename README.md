@@ -64,6 +64,12 @@ speaker as leader, `u` ungroups, `G` toggles group mute, `,`/`.` adjust
 group volume. HEOS natively syncs grouped speakers — verified 1–2ms
 drift.
 
+**Radio honesty**: favorites play their own saved URL first (direct
+`play_stream`), TuneIn only as fallback. Playback is verified by
+polling speaker state — dead streams report failure instead of fake
+success. HTTP URLs are pre-checked; HTTPS passes through (no TLS
+in std).
+
 **Mixer** (audio view): every live source listed with app, volume,
 muted state. `j/k` select, `m` mute/unmute one source, `-/+` adjust its
 volume. The loopback is filtered out (infrastructure, not a source).
