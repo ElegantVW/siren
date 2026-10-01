@@ -388,7 +388,7 @@ fn player_from_json(v: &Value) -> Option<HeosPlayer> {
     })
 }
 
-fn read_roster_cache() -> Option<Vec<HeosPlayer>> {
+pub fn read_roster_cache() -> Option<Vec<HeosPlayer>> {
     let raw = std::fs::read_to_string(roster_cache_path()).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
     let ts = v.get("ts")?.as_f64()?;

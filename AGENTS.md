@@ -80,6 +80,12 @@ in the bottom status line while running — **never the waves strip**
 (reserved for the visualizer). **Never poll 1255 in a loop**: this
 firmware wedges its CLI under rapid requests; verify via UPnP 60006.
 
+**Network calls need a deadline.** `now --refresh` sweeps the /24
+(254 hosts × 600ms) — with speakers off the network that hangs
+forever. Every CLI network path goes through `with_deadline` and
+falls back to the roster cache (`now_snapshot_cached`) with a
+`"speakers unreachable"` label. A status command must always answer.
+
 **No blocking I/O on the render thread.** `pactl` costs 233–477ms and
 HEOS `get_groups` is a network round-trip — both live in `spawn_bg`'s
 worker thread, harvested via channel. `poll_stream` is a pure state

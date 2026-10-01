@@ -517,6 +517,38 @@ fn now_epoch() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Same shape as `now_snapshot` but never touches the network: reads
+/// the roster cache and the last known cache. Used when the refresh
+/// deadline expires (speakers off the network) so the command still
+/// answers instead of hanging.
+fn now_snapshot_cached(cfg: &SirenConfig) -> serde_json::Value {
+    if cfg.audio_output == "heos" {
+        if let Some(players) = heos::read_roster_cache() {
+            if let Some(p) = players
+                .iter()
+                .find(|p| p.name.to_lowercase().contains(&cfg.audio_speaker.to_lowercase()))
+                .or_else(|| players.first())
+            {
+                let label = format!("{} — {}", p.name, p.state.as_deref().unwrap_or("?"));
+                return serde_json::json!({
+                    "label": label,
+                    "output": "heos",
+                    "state": p.state,
+                    "vol": p.volume,
+                    "ts": now_epoch(),
+                    "stale": true,
+                });
+            }
+        }
+        return serde_json::json!({
+            "label": "speakers unreachable", "output": "heos",
+            "state": null, "vol": null, "ts": now_epoch(), "stale": true,
+        });
+    }
+    // local: mpv state is on a unix socket, cheap — reuse the real path
+    now_snapshot(cfg)
+}
+
 /// Gather current playback (output-aware) for the cache / JSON.
 fn now_snapshot(cfg: &SirenConfig) -> serde_json::Value {
     if cfg.audio_output == "heos" {
@@ -568,10 +600,39 @@ fn now_snapshot(cfg: &SirenConfig) -> serde_json::Value {
 }
 
 /// `siren now --refresh`: rewrite the cache, quiet. Timer calls this.
+/// Run a closure on a worker thread with a hard deadline. Returns
+/// None if it does not finish in time. The network path (a full /24
+/// sweep, 254 hosts) can take minutes when speakers are down — a
+/// status command must never hang on it.
+fn with_deadline<T, F>(secs: u64, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(secs)).ok()
+}
+
 fn cmd_now_refresh(cfg: &SirenConfig, json: bool) -> i32 {
-    // keep the roster cache warm too (best effort, never fails the refresh)
-    heos::refresh_roster();
-    let snap = now_snapshot(cfg);
+    // keep the roster cache warm too (best effort, never fails the
+    // refresh) — but bounded: if the speakers are off the network the
+    // sweep would otherwise hang forever.
+    let cfg2 = cfg.clone();
+    let snap = with_deadline(5, move || {
+        heos::refresh_roster();
+        now_snapshot(&cfg2)
+    });
+    let snap = match snap {
+        Some(s) => s,
+        None => {
+            // deadline hit — fall back to whatever we already know
+            eprintln!("siren: speakers unreachable (using cached state)");
+            now_snapshot_cached(cfg)
+        }
+    };
     if let Some(parent) = now_cache_path().parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -1539,4 +1600,38 @@ fn main() -> Result<()> {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::with_deadline;
+
+    /// A fast closure returns its value.
+    #[test]
+    fn deadline_returns_value_when_fast() {
+        let v = with_deadline(2, || 42);
+        assert_eq!(v, Some(42));
+    }
+
+    /// A slow closure times out and returns None — never hangs.
+    #[test]
+    fn deadline_times_out_and_does_not_hang() {
+        let start = std::time::Instant::now();
+        let v = with_deadline(1, || {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            1
+        });
+        assert!(v.is_none(), "must return None on timeout, got {v:?}");
+        assert!(start.elapsed().as_secs() < 3, "must return promptly, took {:?}", start.elapsed());
+    }
+
+    /// The worker still completes later; we just stop waiting.
+    #[test]
+    fn deadline_does_not_block_the_caller() {
+        let start = std::time::Instant::now();
+        let _ = with_deadline(1, || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        assert!(start.elapsed().as_secs() < 2, "caller must not wait for the worker");
+    }
 }
