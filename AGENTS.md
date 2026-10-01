@@ -80,6 +80,14 @@ in the bottom status line while running — **never the waves strip**
 (reserved for the visualizer). **Never poll 1255 in a loop**: this
 firmware wedges its CLI under rapid requests; verify via UPnP 60006.
 
+**No blocking I/O on the render thread.** `pactl` costs 233–477ms and
+HEOS `get_groups` is a network round-trip — both live in `spawn_bg`'s
+worker thread, harvested via channel. `poll_stream` is a pure state
+update. The draw path spawns nothing. Regression-tested by
+`no_blocking_tests` (source-scan asserts every slow call is inside a
+`std::thread::spawn`). `stream::running()` is `try_wait` — cheap, and
+fine to call anywhere.
+
 **Visualizer** (`viz.rs`, `V` view): live FFT from the PipeWire
 monitor (`stream.rs::capture_source`), so it follows real audio —
 not file-decoded. **Latency**: `HOP`=256 slides the window (11.6ms

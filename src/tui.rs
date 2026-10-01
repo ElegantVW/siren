@@ -170,6 +170,18 @@ struct RadioState {
     favs: Vec<radio::Station>,
 }
 
+/// Everything the UI shows that costs a process spawn or a network
+/// round-trip. Gathered on a worker thread — the render thread must
+/// never block on these (pactl alone takes 233-477ms per call).
+struct BackgroundPoll {
+    stream_up: bool,
+    stream_master: bool,
+    stream_clients: usize,
+    viz_on: bool,
+    mixer: Vec<crate::mixer::SinkInput>,
+    groups: Vec<heos::HeosGroup>,
+}
+
 struct App {
     cfg: SirenConfig,
     focus: usize,
@@ -189,6 +201,9 @@ struct App {
     trove: TroveState,
     radio: RadioState,
     spk_rx: Option<std::sync::mpsc::Receiver<(Vec<heos::HeosPlayer>, bool)>>,
+    bg_rx: Option<std::sync::mpsc::Receiver<BackgroundPoll>>,
+    bg_pending: bool,
+    bg_at: Instant,
     spk_pending: bool,
     spk_at: Instant,
     spk_force: bool,
@@ -201,6 +216,10 @@ struct App {
     show_help: bool,
     stream_port: u16,
     stream_msg: String,
+    stream_up: bool,
+    stream_master: bool,
+    stream_clients: usize,
+    viz_on: bool,
     mixer: Vec<crate::mixer::SinkInput>,
     mixer_sel: usize,
     mixer_at: Instant,
@@ -287,6 +306,9 @@ impl App {
                 favs: radio::favs(),
             },
             spk_rx: None,
+            bg_rx: None,
+            bg_pending: false,
+            bg_at: Instant::now() - Duration::from_secs(99),
             spk_pending: false,
             spk_at: Instant::now() - Duration::from_secs(99),
             spk_force: true,
@@ -304,6 +326,10 @@ impl App {
             show_help: false,
             stream_port: crate::stream::DEFAULT_PORT,
             stream_msg: String::new(),
+            stream_up: false,
+            stream_master: false,
+            stream_clients: 0,
+            viz_on: false,
             mixer: Vec::new(),
             mixer_sel: 0,
             mixer_at: Instant::now() - Duration::from_secs(99),
@@ -382,7 +408,7 @@ impl App {
     /// only when a visualiser is live or a play job is running, else a
     /// slow tick. Keeps CPU proportional to visible animation.
     fn animating(&self) -> bool {
-        self.view() == View::Viz || self.play_pending || crate::viz::running()
+        self.view() == View::Viz || self.play_pending || self.viz_on
     }
     fn is_heos(&self) -> bool {
         self.cfg.audio_output == "heos"
@@ -490,20 +516,89 @@ impl App {
         FRAMES[self.play_phase % FRAMES.len()]
     }
 
+    /// Kick a background poll. Returns immediately; the worker does
+    /// every process spawn and network round-trip off the render thread.
+    /// One flight at a time — never queue more than the last can finish.
+    fn spawn_bg(&mut self, need: (bool, bool)) {
+        if self.bg_pending {
+            return;
+        }
+        // resolve the speaker here (cheap: cached roster), pass the ip
+        // into the worker so it can poll groups without touching self
+        let group_ip = if need.1 {
+            self.speaker_target().map(|(ip, _, _)| ip)
+        } else {
+            None
+        };
+        self.bg_pending = true;
+        self.bg_at = Instant::now();
+        let (want_mixer, want_groups) = need;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.bg_rx = Some(rx);
+        std::thread::spawn(move || {
+            let mut p = BackgroundPoll {
+                stream_up: crate::stream::running(),
+                stream_master: false,
+                stream_clients: 0,
+                viz_on: crate::viz::running(),
+                mixer: Vec::new(),
+                groups: Vec::new(),
+            };
+            // each of these costs ~250-500ms (pactl) — that is why
+            // they live here and not in the draw path
+            if crate::stream::running() {
+                p.stream_master = crate::stream::master_is_default();
+                p.stream_clients = crate::stream::master_clients();
+            }
+            if want_mixer {
+                p.mixer = crate::mixer::list_inputs();
+            }
+            if want_groups {
+                if let Some(ip) = group_ip {
+                    p.groups = crate::heos::get_groups(&ip);
+                }
+            }
+            let _ = tx.send(p);
+        });
+    }
+
+    /// Harvest a finished background poll. Pure state update, no I/O.
+    fn poll_stream(&mut self) {
+        if let Some(rx) = self.bg_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(p) => {
+                    self.stream_up = p.stream_up;
+                    self.stream_master = p.stream_master;
+                    self.stream_clients = p.stream_clients;
+                    self.viz_on = p.viz_on;
+                    self.mixer = p.mixer;
+                    if !self.mixer.is_empty() {
+                        self.mixer_sel = self.mixer_sel.min(self.mixer.len() - 1);
+                    }
+                    self.groups = p.groups;
+                    self.bg_pending = false;
+                    self.bg_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.bg_pending = false;
+                    self.bg_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
     fn poll_mixer(&mut self) {
         if self.mixer_at.elapsed() < Duration::from_secs(2) {
             return;
         }
         self.mixer_at = Instant::now();
-        self.mixer = crate::mixer::list_inputs();
-        if !self.mixer.is_empty() {
-            self.mixer_sel = self.mixer_sel.min(self.mixer.len() - 1);
-        }
+        self.spawn_bg((true, false));
     }
 
     fn poll_mixer_force(&mut self) {
         self.mixer_at = Instant::now() - Duration::from_secs(99);
-        self.poll_mixer();
+        self.spawn_bg((true, false));
     }
 
     fn poll_groups(&mut self) {
@@ -511,11 +606,8 @@ impl App {
             return;
         }
         self.group_at = Instant::now();
-        if !self.is_heos() {
-            return;
-        }
-        if let Some((ip, _, _)) = self.speaker_target() {
-            self.groups = heos::get_groups(&ip);
+        if self.is_heos() {
+            self.spawn_bg((false, true));
         }
     }
 
@@ -680,6 +772,7 @@ pub fn run() -> anyhow::Result<()> {
     }
     // live visualizer: read the same monitor, run the FFT on it.
     crate::viz::start(&crate::stream::capture_source());
+    app.viz_on = crate::viz::running();
     let res = event_loop(&mut terminal, &mut app);
     crate::stream::stop();
 
@@ -735,6 +828,7 @@ fn event_loop(
             app.poll_speaker();
             app.poll_groups();
             app.poll_mixer();
+            app.poll_stream();
             app.poll_play();
             // speaker playing-state for the elapsed clock (roster may lag;
             // actions patch it optimistically, so this stays truthful)
@@ -3092,9 +3186,11 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     }
     // live stream state
     {
-        let up = crate::stream::running();
-        let master = crate::stream::master_is_default();
-        let n = crate::stream::master_clients();
+        // cached on the 2Hz tick — the draw path must never spawn
+        // a process (it runs at 60fps while animating).
+        let up = app.stream_up;
+        let master = app.stream_master;
+        let n = app.stream_clients;
         lines.push(Line::from(vec![
             Span::raw("  stream  "),
             Span::styled(
@@ -3325,5 +3421,98 @@ mod animating_tests {
         // browser view, no play job -> slow tick
         assert_eq!(app.view(), View::Browser);
         assert!(!app.animating(), "idle browser should not force 60fps");
+    }
+}
+
+#[cfg(test)]
+mod draw_purity_tests {
+    /// The draw path runs at 60fps while animating. It must never
+    /// spawn a process — every `Command::new` belongs in a poll_* fn
+    /// on the 2Hz tick. This test parses the source and asserts that.
+    #[test]
+    fn draw_functions_spawn_no_process() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("read tui.rs");
+        // collect each `fn draw...` body and look for Command::new inside
+        let mut bad: Vec<String> = Vec::new();
+        let lines: Vec<&str> = src.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].starts_with("fn draw") || lines[i].starts_with("fn waves_lines")
+                || lines[i].starts_with("fn spectrum_rows") {
+                // find matching close brace at column 0
+                let mut depth = 0usize;
+                let mut started = false;
+                let mut j = i;
+                while j < lines.len() {
+                    depth += lines[j].matches('{').count();
+                    depth = depth.saturating_sub(lines[j].matches('}').count());
+                    if lines[j].contains('{') { started = true; }
+                    if started && depth == 0 { break; }
+                    if lines[j].contains("Command::new") {
+                        bad.push(format!("{}:{} spawns a process", lines[i].trim(), j + 1));
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+            i += 1;
+        }
+        assert!(bad.is_empty(), "draw path must not spawn processes: {:?}", bad);
+    }
+
+    /// animating() must be cheap (no syscall / mutex) — it is called
+    /// every loop iteration at up to 60fps.
+    #[test]
+    fn animating_uses_cached_flag_only() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("read tui.rs");
+        let start = src.find("fn animating").expect("animating present");
+        let body = &src[start..start + 400];
+        assert!(!body.contains("Command::new"), "animating() must not spawn");
+        assert!(!body.contains("crate::viz::"), "animating() must use cached viz_on, not lock a mutex");
+    }
+}
+
+#[cfg(test)]
+mod no_blocking_tests {
+    /// The render thread's only I/O may be `event::poll`. Every slow
+    /// call (pactl: 233-477ms) must live inside a worker thread.
+    #[test]
+    fn slow_calls_live_only_in_worker() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("read tui.rs");
+        // only the genuinely expensive calls: pactl (~250-500ms) and the
+        // HEOS network round-trip. `stream::running()` is try_wait — a
+        // cheap waitpid, fine on the render thread.
+        let slow = ["crate::mixer::list_inputs", "crate::stream::master_",
+                    "heos::get_groups"];
+        let all: Vec<&str> = src.lines().collect();
+        // skip our own test module — it contains the needle strings
+        let test_start = all.iter().position(|l| l.contains("mod no_blocking_tests"))
+            .unwrap_or(all.len());
+        // find every occurrence outside tests, assert it is after a spawn
+        for needle in slow {
+            for (ln, line) in all[..test_start].iter().enumerate() {
+                if line.contains(needle) {
+                    // walk upward for the enclosing thread::spawn
+                    let mut found = false;
+                    for back in all[..ln].iter().rev().take(80) {
+                        if back.contains("std::thread::spawn") { found = true; break; }
+                        if back.contains("fn draw") || back.contains("fn event_loop") { break; }
+                    }
+                    assert!(found, "{needle} at line {} is NOT inside a worker thread", ln+1);
+                }
+            }
+        }
+    }
+
+    /// poll_stream must be a pure harvest — no I/O at all.
+    #[test]
+    fn poll_stream_is_pure_harvest() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("read tui.rs");
+        let start = src.find("fn poll_stream").expect("poll_stream present");
+        let end = src[start..].find("\n    fn ").map(|i| start + i).unwrap_or(src.len());
+        let body = &src[start..end];
+        for bad in ["Command::new", "list_inputs", "master_", "get_groups", "list short"] {
+            assert!(!body.contains(bad), "poll_stream must not call {bad}");
+        }
     }
 }
