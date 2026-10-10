@@ -10,7 +10,7 @@ use crossterm::{
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
     Frame,
@@ -416,6 +416,9 @@ impl App {
     fn is_heos(&self) -> bool {
         self.cfg.audio_output == "heos"
     }
+    fn pal(&self) -> crate::theme::Palette {
+        crate::theme::named(&self.cfg.palette)
+    }
     fn say(&mut self, m: impl Into<String>) {
         self.msg = m.into();
         self.msg_at = Instant::now();
@@ -539,6 +542,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.bg_rx = Some(rx);
         std::thread::spawn(move || {
+            crate::viz::start(&crate::stream::capture_source());
             let mut p = BackgroundPoll {
                 stream_up: crate::stream::encoder_alive(),
                 stream_follow: crate::stream::following(),
@@ -772,6 +776,7 @@ pub fn run() -> anyhow::Result<()> {
     crate::viz::start(&crate::stream::capture_source());
     app.viz_on = crate::viz::running();
     let res = event_loop(&mut terminal, &mut app);
+    crate::viz::stop();
     // Leave the sound-card feed up if follow is on (systemd / CLI).
     if !crate::stream::following() {
         crate::stream::stop();
@@ -923,6 +928,17 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
         }
         KeyCode::Char('-') | KeyCode::Char('_') => {
             app.adjust_volume(-5);
+            return false;
+        }
+        KeyCode::Char('T') => {
+            let next = crate::theme::cycle(&app.cfg.palette);
+            match app.cfg.set("palette", next) {
+                Ok(shown) => {
+                    let _ = app.cfg.save();
+                    app.say(format!("palette → {shown}"));
+                }
+                Err(m) => app.say(m),
+            }
             return false;
         }
         KeyCode::Tab => {
@@ -2389,6 +2405,8 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                     }
                 }
             }
+            crate::viz::start(&crate::stream::capture_source());
+            app.viz_on = crate::viz::running();
         }
         KeyCode::Char('j') | KeyCode::Down => {
             if !app.mixer.is_empty() {
@@ -2456,10 +2474,10 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
 ///   horizontal (bars grow up)  and  vertical (bars grow right).
 /// Braille 2×4 dots per cell, peak caps, house-palette gradient.
 fn draw_viz(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let p = app.pal();
     let (bands, peaks) = crate::viz::snapshot();
-    let accent = Color::Rgb(142, 196, 200);
-    let silver = Color::Rgb(192, 192, 200);
-    let dim = Color::Rgb(138, 138, 150);
+    let accent = p.accent;
+    let dim = p.dim;
     let zoom = app.viz_zoom.max(1);
     // inner area of the content box
     let block = Block::default()
@@ -2499,7 +2517,6 @@ fn draw_viz(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(dim)))),
         Rect::new(inner.x, hint_y, inner.width, 1),
     );
-    let _ = silver;
 }
 
 /// Viz view keys: t = flip orientation, V = zoom cycle.
@@ -2518,10 +2535,11 @@ fn handle_viz(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
 /// Full-screen help overlay. Shows every key for the current view.
 fn draw_help(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let accent = Color::Rgb(142, 196, 200);
-    let ok = Color::Rgb(61, 214, 140);
-    let dim = Color::Rgb(138, 138, 150);
-    let silver = Color::Rgb(192, 192, 200);
+    let p = app.pal();
+    let accent = p.accent;
+    let ok = p.ok;
+    let dim = p.dim;
+    let silver = p.silver;
 
     let mut lines = vec![
         Line::from(Span::styled("  ✦ siren help ✦", Style::default().fg(accent).add_modifier(Modifier::BOLD))),
@@ -2538,6 +2556,7 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         ("p", "pause / resume"),
         ("← / →", "seek ±5s (shift ±30s)"),
         ("+ / -", "volume (HEOS while following)"),
+        ("T", "cycle palette (pixie blush silver siren cave)"),
         ("h", "this help"),
         ("q", "quit"),
         ("esc", "quit (closes a picker first)"),
@@ -2632,44 +2651,53 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_help(f, app);
         return;
     }
+    let p = app.pal();
+    let focus = app.view();
+    let viz = focus == View::Viz;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(6), // persistent waves strip
-            Constraint::Length(7),
-        ])
+        .constraints(if viz {
+            // viz tab *is* the waves — no second spectrum strip
+            vec![Constraint::Min(0), Constraint::Length(7)]
+        } else {
+            vec![
+                Constraint::Min(0),
+                Constraint::Length(6), // waves strip
+                Constraint::Length(7),
+            ]
+        })
         .split(f.area());
 
-    // top box
-    let focus = app.view();
-    let out_tag = if app.is_heos() { "heos" } else { "local" };
-    let top_title = format!(" ✦ siren · {} · out:{out_tag} ✦ ", focus.title());
-    let top_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(top_title)
-        .border_style(Style::default().fg(Color::Rgb(142, 196, 200)));
-    let inner = top_block.inner(chunks[0]);
-    f.render_widget(top_block, chunks[0]);
-    match focus {
-        View::Browser => draw_browser(f, app, inner),
-        View::Queue => draw_queue(f, app, inner),
-        View::Audio => draw_audio(f, app, inner),
-        View::Trove => draw_trove(f, app, inner),
-        View::Radio => draw_radio(f, app, inner),
-        View::Viz => draw_viz(f, app, inner),
-    }
+    if viz {
+        draw_viz(f, app, chunks[0]);
+    } else {
+        let out_tag = if app.is_heos() { "heos" } else { "local" };
+        let top_title = format!(" ✦ siren · {} · out:{out_tag} ✦ ", focus.title());
+        let top_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(top_title)
+            .border_style(Style::default().fg(p.accent));
+        let inner = top_block.inner(chunks[0]);
+        f.render_widget(top_block, chunks[0]);
+        match focus {
+            View::Browser => draw_browser(f, app, inner),
+            View::Queue => draw_queue(f, app, inner),
+            View::Audio => draw_audio(f, app, inner),
+            View::Trove => draw_trove(f, app, inner),
+            View::Radio => draw_radio(f, app, inner),
+            View::Viz => {}
+        }
 
-    // persistent waves strip — visible at all times, all views
-    let wave_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(" ✦ waves ✦ ")
-        .border_style(Style::default().fg(Color::Rgb(138, 138, 150)));
-    let wave_inner = wave_block.inner(chunks[1]);
-    f.render_widget(wave_block, chunks[1]);
-    f.render_widget(Paragraph::new(waves_lines(app)), wave_inner);
+        let wave_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(" ✦ waves ✦ ")
+            .border_style(Style::default().fg(p.dim));
+        let wave_inner = wave_block.inner(chunks[1]);
+        f.render_widget(wave_block, chunks[1]);
+        f.render_widget(Paragraph::new(waves_lines(app)), wave_inner);
+    }
 
     // bottom box: context menu (or input)
     let (menu_title, menu_lines) = if let Some(mode) = app.input {
@@ -2686,13 +2714,13 @@ fn draw(f: &mut Frame, app: &mut App) {
             format!(" ✦ {prompt} ✦ "),
             vec![Line::from(vec![
                 Span::raw("  "),
-                Span::styled(app.input_buf.clone() + "█", Style::default().fg(Color::Rgb(255, 235, 242))),
+                Span::styled(app.input_buf.clone() + "█", Style::default().fg(p.fg)),
             ])],
         )
     } else {
         let mut lines = vec![Line::from(Span::styled(
             format!("  {}", focus.menu()),
-            Style::default().fg(Color::Rgb(192, 192, 200)),
+            Style::default().fg(p.silver),
         ))];
         if app.play_pending {
             // loading cue: animated spinner + what's loading.
@@ -2700,16 +2728,16 @@ fn draw(f: &mut Frame, app: &mut App) {
             // which is reserved for the visualizer).
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(app.play_spinner(), Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD)),
+                Span::styled(app.play_spinner(), Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
                 Span::styled(
                     format!(" connecting… {}", app.play_label),
-                    Style::default().fg(Color::Rgb(142, 196, 200)),
+                    Style::default().fg(p.accent),
                 ),
             ]));
         } else if !app.msg.is_empty() && app.msg_at.elapsed() < Duration::from_secs(6) {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(app.msg.clone(), Style::default().fg(Color::Rgb(142, 196, 200))),
+                Span::styled(app.msg.clone(), Style::default().fg(p.accent)),
             ]));
         } else {
             let hint = match focus {
@@ -2762,28 +2790,30 @@ fn draw(f: &mut Frame, app: &mut App) {
                     format!("{where_} · {st} · favs:{} · tab cycle · q quit", app.radio.favs.len())
                 }
             };
-            lines.push(Line::from(Span::styled(format!("  {hint}"), Style::default().fg(Color::Rgb(138, 138, 150)))));
+            lines.push(Line::from(Span::styled(format!("  {hint}"), Style::default().fg(p.dim))));
         }
         (format!(" ✦ {} menu ✦ ", focus.title()), lines)
     };
+    let menu_area = chunks[chunks.len() - 1];
     let menu_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(menu_title)
-        .border_style(Style::default().fg(Color::Rgb(138, 138, 150)));
-    let menu_inner = menu_block.inner(chunks[2]);
-    f.render_widget(menu_block, chunks[2]);
+        .border_style(Style::default().fg(p.dim));
+    let menu_inner = menu_block.inner(menu_area);
+    f.render_widget(menu_block, menu_area);
     f.render_widget(Paragraph::new(menu_lines), menu_inner);
 }
 
 fn draw_browser(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let p = app.pal();
     // search mode: flat fuzzy hits. dir mode: cwd entries (dirs + files).
     let rows: Vec<ListItem> = if app.filter.trim().is_empty() {
         app.bentries
             .iter()
             .map(|e| {
                 let (mark, style) = if e.is_dir {
-                    ("▸ ", Style::default().fg(Color::Rgb(142, 196, 200)))
+                    ("▸ ", Style::default().fg(p.accent))
                 } else {
                     ("  ", Style::default())
                 };
@@ -2810,12 +2840,13 @@ fn draw_browser(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         state.select(Some(app.browser_sel.min(rows.len() - 1)));
     }
     let list = List::new(rows)
-        .highlight_style(Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
         .highlight_symbol("❯ ");
     f.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_queue(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let p = app.pal();
     let items = queue::snapshot();
     let rows: Vec<ListItem> = items
         .iter()
@@ -2838,12 +2869,12 @@ fn draw_queue(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let list = List::new(if rows.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  (queue empty)",
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         )))]
     } else {
         rows
     })
-    .highlight_style(Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD))
+    .highlight_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
     .highlight_symbol("❯ ");
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -2898,10 +2929,10 @@ fn spectrum_rows(app: &App) -> Option<(String, String, String)> {
 /// pause-aware elapsed clock on speaker); label follows `audio_output`.
 fn waves_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let accent = Color::Rgb(142, 196, 200);
-    let ok = Color::Rgb(61, 214, 140);
-    let dim = Color::Rgb(138, 138, 150);
-    let _silver = Color::Rgb(192, 192, 200);
+    let p = app.pal();
+    let accent = p.accent;
+    let ok = p.ok;
+    let dim = p.dim;
 
     if app.is_heos() {
         match speaker_entry(app) {
@@ -2924,7 +2955,6 @@ fn waves_lines(app: &App) -> Vec<Line<'static>> {
         }
     } else if app.mpv_label.is_empty() && !player::alive() {
         lines.push(Line::from(Span::styled("  idle — no mpv", Style::default().fg(dim))));
-        return lines;
     } else {
         let label = if app.mpv_label.is_empty() {
             "— silence —".to_string()
@@ -2953,11 +2983,12 @@ fn waves_lines(app: &App) -> Vec<Line<'static>> {
 }
 
 fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let p = app.pal();
     let mut rows: Vec<ListItem> = Vec::new();
     if app.trove.searching {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  searching archive.org…",
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         ))));
     } else if app.trove.docs.is_empty() {
         rows.push(ListItem::new(Line::from(Span::styled(
@@ -2966,7 +2997,7 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             } else {
                 "  no results — s to search again"
             },
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         ))));
     }
     for (i, d) in app.trove.docs.iter().enumerate() {
@@ -2975,18 +3006,18 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         let _ = l2;
         rows.push(ListItem::new(Line::from(Span::styled(
             format!("      {l2}"),
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         ))));
     }
     if app.trove.loading_more {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  loading more…",
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         ))));
     } else if app.trove.exhausted && !app.trove.docs.is_empty() {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  — end —",
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         ))));
     }
     if let Some(idx) = app.trove.fmt_for {
@@ -3007,7 +3038,7 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 Span::raw("  version? "),
                 Span::styled(
                     format!("{} — {what}", d.identifier),
-                    Style::default().fg(Color::Rgb(255, 176, 32)),
+                    Style::default().fg(p.warn),
                 ),
             ])));
         }
@@ -3017,7 +3048,7 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     for l in tail.into_iter().rev() {
         rows.push(ListItem::new(Line::from(Span::styled(
             format!("  {l}"),
-            Style::default().fg(Color::Rgb(142, 196, 200)),
+            Style::default().fg(p.accent),
         ))));
     }
     // selection tracks result rows (2 rows per doc)
@@ -3046,23 +3077,24 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     if !title.is_empty() {
         rows.insert(
             0,
-            ListItem::new(Line::from(Span::styled(title, Style::default().fg(Color::Rgb(192, 192, 200))))),
+            ListItem::new(Line::from(Span::styled(title, Style::default().fg(p.silver)))),
         );
     }
     let list = List::new(rows)
-        .highlight_style(Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
         .highlight_symbol("❯ ");
     f.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_radio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let p = app.pal();
     let mut rows: Vec<ListItem> = Vec::new();
     if app.radio.picking {
         // modal country list, alphabetical
         if app.radio.countries_loading && app.radio.countries.is_empty() {
             rows.push(ListItem::new(Line::from(Span::styled(
                 "  reading countries…",
-                Style::default().fg(Color::Rgb(138, 138, 150)),
+                Style::default().fg(p.dim),
             ))));
         }
         for c in &app.radio.countries {
@@ -3076,7 +3108,7 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             state.select(Some(app.radio.pick_sel.min(rows.len() - 1)));
         }
         let list = List::new(rows)
-            .highlight_style(Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD))
+            .highlight_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
             .highlight_symbol("❯ ");
         f.render_stateful_widget(list, area, &mut state);
         return;
@@ -3084,23 +3116,23 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     if app.radio.loading && app.radio.stations.is_empty() && app.radio.favs.is_empty() {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  tuning…",
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         ))));
     }
     if radio_len(app) == 0 && !app.radio.loading {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  press enter to pick a country",
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         ))));
     }
     for (s, fav) in radio_visible(app) {
         if fav {
             rows.push(ListItem::new(Line::from(vec![
                 Span::raw("★ "),
-                Span::styled(s.name.clone(), Style::default().fg(Color::Rgb(255, 176, 32))),
+                Span::styled(s.name.clone(), Style::default().fg(p.warn)),
                 Span::styled(
                     format!("  [{}]", s.country),
-                    Style::default().fg(Color::Rgb(138, 138, 150)),
+                    Style::default().fg(p.dim),
                 ),
             ])));
             continue;
@@ -3118,12 +3150,12 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     if app.radio.loading_more {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  loading more…",
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         ))));
     } else if app.radio.exhausted && radio_len(app) > 0 {
         rows.push(ListItem::new(Line::from(Span::styled(
             "  — end —",
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         ))));
     }
     let mut state = ListState::default();
@@ -3131,48 +3163,49 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         state.select(Some(app.radio.sel.min(rows.len().saturating_sub(1))));
     }
     let list = List::new(rows)
-        .highlight_style(Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
         .highlight_symbol("❯ ");
     f.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let p = app.pal();
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
         Span::raw("  output   "),
         Span::styled(
             app.cfg.audio_output.clone(),
-            Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("   (o toggle)", Style::default().fg(Color::Rgb(138, 138, 150))),
+        Span::styled("   (o toggle)", Style::default().fg(p.dim)),
     ]));
     lines.push(Line::from(vec![
         Span::raw("  speaker  "),
         Span::styled(
             app.cfg.audio_speaker.clone(),
-            Style::default().fg(Color::Rgb(142, 196, 200)),
+            Style::default().fg(p.accent),
         ),
-        Span::styled("   (s cycle · v refresh)", Style::default().fg(Color::Rgb(138, 138, 150))),
+        Span::styled("   (s cycle · v refresh)", Style::default().fg(p.dim)),
     ]));
     if app.audio.roster.is_empty() {
         lines.push(Line::from(Span::styled(
             "  no speakers seen — press v",
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         )));
     }
-    for p in &app.audio.roster {
-        let playing = p.state.as_deref() == Some("play");
+    for spk in &app.audio.roster {
+        let playing = spk.state.as_deref() == Some("play");
         lines.push(Line::from(vec![
             Span::raw(format!("  {} ", if playing { "▶" } else { "·" })),
             Span::styled(
-                p.name.clone(),
-                Style::default().fg(if playing { Color::Rgb(61, 214, 140) } else { Color::Rgb(192, 192, 200) }),
+                spk.name.clone(),
+                Style::default().fg(if playing { p.ok } else { p.silver }),
             ),
             Span::raw(format!(
                 "  {}  {}{}",
-                p.model,
-                p.ip,
-                p.volume.map(|v| format!("  {v}%")).unwrap_or_default()
+                spk.model,
+                spk.ip,
+                spk.volume.map(|v| format!("  {v}%")).unwrap_or_default()
             )),
         ]));
     }
@@ -3180,7 +3213,7 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     if !app.groups.is_empty() {
         lines.push(Line::from(Span::styled(
             "  ── group ─────────────────────────────",
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         )));
         for g in &app.groups {
             let members: String = g
@@ -3193,30 +3226,30 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 Span::raw("  group   "),
                 Span::styled(
                     format!("{} ", g.name),
-                    Style::default().fg(Color::Rgb(142, 196, 200)).add_modifier(Modifier::BOLD),
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("gid={} ", g.gid),
-                    Style::default().fg(Color::Rgb(138, 138, 150)),
+                    Style::default().fg(p.dim),
                 ),
                 Span::styled(
                     if app.group_muted { "muted" } else { "unmuted" },
-                    Style::default().fg(if app.group_muted { Color::Rgb(255, 176, 32) } else { Color::Rgb(61, 214, 140) }),
+                    Style::default().fg(if app.group_muted { p.warn } else { p.ok }),
                 ),
             ]));
             lines.push(Line::from(Span::styled(
                 format!("    {}", members),
-                Style::default().fg(Color::Rgb(192, 192, 200)),
+                Style::default().fg(p.silver),
             )));
         }
         lines.push(Line::from(Span::styled(
             "    (g group all · u ungroup · G group mute)",
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             "  group   none  (g group all · u ungroup)",
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         )));
     }
     // live stream state
@@ -3231,7 +3264,7 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             Span::raw("  stream  "),
             Span::styled(
                 if up { "live" } else { "down" },
-                Style::default().fg(if up { Color::Rgb(61, 214, 140) } else { Color::Rgb(138, 138, 150) }).add_modifier(Modifier::BOLD),
+                Style::default().fg(if up { p.ok } else { p.dim }).add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
                 "   master:{}  clients:{}  follow:{}",
@@ -3239,12 +3272,12 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 n,
                 if follow { "on" } else { "off" },
             )),
-            Span::styled("   (W follow)", Style::default().fg(Color::Rgb(138, 138, 150))),
+            Span::styled("   (W follow)", Style::default().fg(p.dim)),
         ]));
         if !app.stream_msg.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!("    {}", app.stream_msg),
-                Style::default().fg(Color::Rgb(192, 192, 200)),
+                Style::default().fg(p.silver),
             )));
         }
     }
@@ -3252,12 +3285,12 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     {
         lines.push(Line::from(Span::styled(
             "  ── sources ───────────────────────────",
-            Style::default().fg(Color::Rgb(138, 138, 150)),
+            Style::default().fg(p.dim),
         )));
         if app.mixer.is_empty() {
             lines.push(Line::from(Span::styled(
                 "    (nothing playing)",
-                Style::default().fg(Color::Rgb(138, 138, 150)),
+                Style::default().fg(p.dim),
             )));
         } else {
             for (i, src) in app.mixer.iter().enumerate() {
@@ -3268,22 +3301,22 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                     Span::styled(
                         format!("{} ", src.app),
                         Style::default()
-                            .fg(if sel { Color::Rgb(142, 196, 200) } else { Color::Rgb(192, 192, 200) })
+                            .fg(if sel { p.accent } else { p.silver })
                             .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
                     ),
                     Span::styled(
                         format!("{}%{} ", src.volume_pct, if src.muted { " MUTED" } else { "" }),
-                        Style::default().fg(if src.muted { Color::Rgb(255, 176, 32) } else { Color::Rgb(61, 214, 140) }),
+                        Style::default().fg(if src.muted { p.warn } else { p.ok }),
                     ),
                     Span::styled(
                         src.media.clone(),
-                        Style::default().fg(Color::Rgb(138, 138, 150)),
+                        Style::default().fg(p.dim),
                     ),
                 ]));
             }
             lines.push(Line::from(Span::styled(
                 "    (j/k select · m mute · -/+ volume)",
-                Style::default().fg(Color::Rgb(138, 138, 150)),
+                Style::default().fg(p.dim),
             )));
         }
     }
@@ -3292,7 +3325,7 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             "  dlna {}   (t test-cast · m mute · +/- vol)",
             if app.audio.dlna_ok { "ok" } else { "down" }
         ),
-        Style::default().fg(Color::Rgb(138, 138, 150)),
+        Style::default().fg(p.dim),
     )));
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -3507,6 +3540,39 @@ mod draw_purity_tests {
         assert!(!body.contains("Command::new"), "animating() must not spawn");
         assert!(!body.contains("crate::viz::"), "animating() must use cached viz_on, not lock a mutex");
     }
+
+    #[test]
+    fn viz_tab_hides_waves_strip() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("read tui.rs");
+        let start = src.find("fn draw(").expect("draw");
+        let end = src[start..]
+            .find("\nfn draw_browser")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            body.contains("focus == View::Viz"),
+            "layout splits on viz tab"
+        );
+        let six = body.find("Length(6)").expect("strip height");
+        assert!(
+            body[..six].contains("if viz"),
+            "strip row is the non-viz layout"
+        );
+        let waves = body.find("waves_lines").expect("strip body");
+        assert!(
+            body[..waves].contains("} else {"),
+            "waves strip only off the viz tab"
+        );
+        assert!(
+            body.contains("draw_viz(f, app, chunks[0])"),
+            "viz owns the full upper chunk, no second chrome"
+        );
+        assert!(
+            !body.contains("Color::Rgb"),
+            "draw uses Palette, not hardcoded RGB"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3559,6 +3625,43 @@ mod no_blocking_tests {
             body.contains("if !crate::stream::following()"),
             "stop only when follow is off"
         );
+        assert!(
+            body.contains("crate::viz::stop()"),
+            "TUI exit kills viz ffmpeg, leaves follow encoder"
+        );
+    }
+
+    #[test]
+    fn follow_toggle_retargets_viz() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("read tui.rs");
+        let start = src.find("KeyCode::Char('W')").expect("W follow");
+        let end = src[start..]
+            .find("KeyCode::Char('j')")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            body.contains("crate::viz::start"),
+            "W must retarget waves onto capture_source"
+        );
+        assert!(
+            body.contains("capture_source()"),
+            "W uses Master while following, analog when off"
+        );
+        let bg = src.find("fn spawn_bg").expect("spawn_bg");
+        let bg_end = src[bg..]
+            .find("\n    fn poll_stream")
+            .map(|i| bg + i)
+            .unwrap_or(src.len());
+        let bg_body = &src[bg..bg_end];
+        assert!(
+            bg_body.contains("crate::viz::start"),
+            "worker retargets when systemd follow comes up mid-TUI"
+        );
+        assert!(
+            bg_body.contains("std::thread::spawn"),
+            "retarget stays off the render thread in spawn_bg"
+        );
     }
 
     /// poll_stream must be a pure harvest — no I/O at all.
@@ -3571,6 +3674,22 @@ mod no_blocking_tests {
         for bad in ["Command::new", "list_inputs", "master_", "get_groups", "list short"] {
             assert!(!body.contains(bad), "poll_stream must not call {bad}");
         }
+    }
+
+    #[test]
+    fn global_t_cycles_palette() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("tui.rs");
+        let start = src.find("fn handle_key").expect("handle_key");
+        let end = src[start..]
+            .find("\nfn handle_mouse")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        let t = body.find("KeyCode::Char('T')").expect("global T");
+        let views = body.find("match app.view()").expect("view match");
+        assert!(t < views, "T is global, before view handlers");
+        assert!(body.contains("theme::cycle"), "T cycles compiled palettes");
+        assert!(body.contains("palette →"), "T names the new palette");
     }
 
     #[test]
@@ -3635,6 +3754,14 @@ mod no_blocking_tests {
         assert!(
             body.contains("quit (closes a picker first)"),
             "Esc quits when no picker"
+        );
+        assert!(
+            body.contains("cycle palette"),
+            "help lists T palette cycle"
+        );
+        assert!(
+            body.contains("pixie blush silver siren cave"),
+            "help names the five palettes"
         );
         assert!(
             src.contains("o local/heos · S speaker · W follow · j/k src · m mute · +/- vol · g group"),

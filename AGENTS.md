@@ -34,11 +34,12 @@ not a second player.
 
 ## TUI
 
-Two boxes + a persistent waves strip. Top = content view (Tab cycles
-browser → queue → audio → trove → radio → viz). Bottom = context menu
-of the focused view. Waves strip shows speaker state + 3-row spectrum
-(local files) or `· live stream ·` (radio). Press `h` for help overlay
-(matches the handlers; any key closes it).
+Two boxes + a waves strip on every view except viz. Top = content
+view (Tab cycles browser → queue → audio → trove → radio → viz).
+Bottom = context menu of the focused view. The strip shows speaker
+state + 3-row spectrum; the viz tab *is* that spectrum (full canvas,
+no second box). Press `h` for help overlay (matches the handlers;
+any key closes it).
 
 House audio diagram: [`docs/AUDIO.md`](docs/AUDIO.md).
 
@@ -51,6 +52,7 @@ House audio diagram: [`docs/AUDIO.md`](docs/AUDIO.md).
 | `p` | pause / resume |
 | ← / → | seek ±5s (Shift ±30s) |
 | `+` / `-` | volume (HEOS while following) |
+| `T` | cycle palette (pixie blush silver siren cave) |
 | `h` | help overlay |
 | `q` | quit |
 | Esc | quit (closes a picker first) |
@@ -141,8 +143,8 @@ CPU stays proportional to visible motion. Network polls never run
 at frame rate. Braille packer (2×4 dots/cell) is pure + tested.
 Orientations: `render_horizontal` (bars up) / `render_vertical`
 (bars right). `t`/`space` flips, `V` zooms 1×/2×/3×. Smoothing is
-attack-fast/release-slow; peak caps tick down. Waves strip carries
-a compact horizontal braille spectrum.
+attack-fast/release-slow; peak caps tick down. Other views keep a
+compact horizontal strip; the viz tab is the full canvas.
 
 **Follow** (audio view `W`, or `siren audio follow on|off`): Cave is
 Siren's speaker, **not** the PC sound card. Headset (front combo

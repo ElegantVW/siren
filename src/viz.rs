@@ -10,10 +10,11 @@
 //! chunky is they only give one level per row.
 //!
 //! The PCM comes from the PipeWire monitor that `stream.rs` already
-//! captures, so the visualizer follows whatever is playing: radio,
-//! YouTube, games. Not a pre-decoded file.
+//! captures: `Siren_Master.monitor` while follow is on, headset analog
+//! when follow is off. Radio, files, Cave — same bars. Not a file FFT.
 
 use crate::spectrum::{live_bands, smooth_bands, tick_peaks, BANDS};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 const DOT1: u8 = 0b0000_0001;
@@ -31,6 +32,9 @@ struct Live {
     peaks: [f32; BANDS],
     peak: f32,
     running: bool,
+    monitor: String,
+    ffmpeg_pid: Option<u32>,
+    gen: u64,
 }
 
 static LIVE: OnceLock<Mutex<Live>> = OnceLock::new();
@@ -42,6 +46,9 @@ fn live() -> &'static Mutex<Live> {
             peaks: [0.0; BANDS],
             peak: 1e-3,
             running: false,
+            monitor: String::new(),
+            ffmpeg_pid: None,
+            gen: 0,
         })
     })
 }
@@ -51,36 +58,81 @@ pub fn running() -> bool {
     live().lock().unwrap().running
 }
 
+fn kill_pid(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Stop the PCM reader. Follow's encoder is a different process — this
+/// only kills the viz ffmpeg.
+pub fn stop() {
+    let pid = {
+        let mut g = live().lock().unwrap();
+        g.gen = g.gen.wrapping_add(1);
+        g.running = false;
+        g.monitor.clear();
+        g.ffmpeg_pid.take()
+    };
+    if let Some(pid) = pid {
+        kill_pid(pid);
+    }
+}
+
 /// Start the PCM reader: ffmpeg decodes the monitor to f32le mono.
-/// One long-lived child, read on a thread, bands updated as they come.
+/// Same monitor + alive → no-op. A new name stops the old child first
+/// so follow-on waves leave the silent headset analog.
 pub fn start(monitor: &str) -> bool {
     {
-        let mut g = live().lock().unwrap();
-        if g.running {
+        let g = live().lock().unwrap();
+        if g.running && g.monitor == monitor {
             return true;
         }
-        g.running = true;
     }
+    stop();
+    let gen = {
+        let mut g = live().lock().unwrap();
+        g.running = true;
+        g.monitor = monitor.to_string();
+        g.smoothed = [0.0; BANDS];
+        g.peaks = [0.0; BANDS];
+        g.peak = 1e-3;
+        g.gen = g.gen.wrapping_add(1);
+        g.gen
+    };
     let monitor = monitor.to_string();
     std::thread::spawn(move || {
         use std::io::Read;
-        let mut child = match std::process::Command::new("ffmpeg")
+        let mut child = match Command::new("ffmpeg")
             .args([
                 "-hide_banner", "-loglevel", "error",
                 "-f", "pulse", "-i", &monitor,
                 "-ac", "1", "-ar", "22050",
                 "-f", "f32le", "-",
             ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
         {
             Ok(c) => c,
             Err(_) => {
-                live().lock().unwrap().running = false;
+                let mut g = live().lock().unwrap();
+                if g.gen == gen {
+                    g.running = false;
+                }
                 return;
             }
         };
+        {
+            let mut g = live().lock().unwrap();
+            if g.gen != gen {
+                let _ = child.kill();
+                return;
+            }
+            g.ffmpeg_pid = Some(child.id());
+        }
         let mut out = child.stdout.take().unwrap();
         // Sliding window at HOP granularity: read HOP samples per step
         // (23ms at 22050Hz) instead of a full WINDOW (92ms). The window
@@ -97,6 +149,9 @@ pub fn start(monitor: &str) -> bool {
                         .collect();
                     slide_window(&mut win, &hop);
                     let mut g = live().lock().unwrap();
+                    if g.gen != gen {
+                        break;
+                    }
                     let raw = live_bands(&win, &mut g.peak);
                     let sm = smooth_bands(&g.smoothed, &raw);
                     tick_peaks(&mut g.peaks, &sm);
@@ -106,7 +161,11 @@ pub fn start(monitor: &str) -> bool {
             }
         }
         let _ = child.kill();
-        live().lock().unwrap().running = false;
+        let mut g = live().lock().unwrap();
+        if g.gen == gen {
+            g.running = false;
+            g.ffmpeg_pid = None;
+        }
     });
     true
 }
@@ -284,6 +343,37 @@ mod tests {
         let cur = [0.0f32; BANDS];
         tick_peaks(&mut peaks, &cur);
         assert!(peaks[0] < 0.5, "peak should fall when band drops");
+    }
+
+    #[test]
+    fn start_retargets_when_monitor_changes() {
+        let src = std::fs::read_to_string("src/viz.rs").expect("viz.rs");
+        let start = src.find("pub fn start").expect("start");
+        let end = src[start..]
+            .find("\n/// Slide")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(body.contains("stop()"), "new monitor stops the old ffmpeg");
+        assert!(
+            body.contains("g.monitor == monitor"),
+            "same monitor is a no-op"
+        );
+        assert!(src.contains("pub fn stop"), "TUI exit / retarget kills viz ffmpeg");
+        let stop = src.find("pub fn stop").expect("stop");
+        let stop_end = src[stop..]
+            .find("\n/// Start")
+            .map(|i| stop + i)
+            .unwrap_or(src.len());
+        let stop_body = &src[stop..stop_end];
+        assert!(
+            stop_body.contains("kill_pid") || stop_body.contains("kill"),
+            "stop must TERM the viz ffmpeg"
+        );
+        assert!(
+            !stop_body.contains("siren-stream"),
+            "viz stop leaves the follow encoder"
+        );
     }
 
     #[test]

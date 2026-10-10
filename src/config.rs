@@ -37,6 +37,9 @@ pub struct SirenConfig {
     /// Preferred HEOS speaker (name fragment)
     #[serde(default = "d_speaker")]
     pub audio_speaker: String,
+    /// TUI palette: pixie | blush | silver | siren | cave
+    #[serde(default = "d_palette")]
+    pub palette: String,
 }
 
 fn d_volume() -> i32 {
@@ -57,6 +60,9 @@ fn d_output() -> String {
 fn d_speaker() -> String {
     "Cave".into()
 }
+fn d_palette() -> String {
+    "pixie".into()
+}
 
 impl Default for SirenConfig {
     fn default() -> Self {
@@ -72,6 +78,7 @@ impl Default for SirenConfig {
             mouse: true,
             audio_output: d_output(),
             audio_speaker: d_speaker(),
+            palette: d_palette(),
         }
     }
 }
@@ -136,6 +143,11 @@ impl SirenConfig {
         if let Some(s) = v.get("audio_speaker").and_then(|x| x.as_str()) {
             if !s.trim().is_empty() {
                 cfg.audio_speaker = s.to_string();
+            }
+        }
+        if let Some(s) = v.get("palette").and_then(|x| x.as_str()) {
+            if crate::theme::is_name(s) {
+                cfg.palette = s.trim().to_ascii_lowercase();
             }
         }
         cfg
@@ -220,6 +232,15 @@ impl SirenConfig {
                 self.audio_speaker = v.clone();
                 Ok(v)
             }
+            "palette" => {
+                let v = val.trim().to_ascii_lowercase();
+                if crate::theme::is_name(&v) {
+                    self.palette = v.clone();
+                    Ok(v)
+                } else {
+                    Err("expects pixie, blush, silver, siren or cave".to_string())
+                }
+            }
             _ => Err(format!("unknown key: {key}")),
         }
     }
@@ -237,6 +258,7 @@ impl SirenConfig {
             "mouse" => Some(onoff(self.mouse)),
             "audio_output" => Some(self.audio_output.clone()),
             "audio_speaker" => Some(self.audio_speaker.clone()),
+            "palette" => Some(self.palette.clone()),
             _ => None,
         }
     }
@@ -254,10 +276,28 @@ impl SirenConfig {
             "mouse",
             "audio_output",
             "audio_speaker",
+            "palette",
         ]
     }
 }
 
 fn onoff(b: bool) -> String {
     if b { "on".into() } else { "off".into() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_set_get_and_reject_unknown() {
+        let mut c = SirenConfig::default();
+        assert_eq!(c.palette, "pixie");
+        assert_eq!(c.set("palette", "siren").unwrap(), "siren");
+        assert_eq!(c.get("palette").as_deref(), Some("siren"));
+        assert_eq!(c.set("palette", "CAVE").unwrap(), "cave");
+        assert!(c.set("palette", "aether").is_err());
+        assert!(c.set("palette", "nope").is_err());
+        assert!(SirenConfig::keys().contains(&"palette"));
+    }
 }

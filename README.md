@@ -37,11 +37,12 @@ For: local files + HEOS speakers from one remote. Not for: Spotify/streaming app
 
 ## TUI
 
-Two boxes + a persistent waves strip. Top = content view (Tab cycles
-browser → queue → audio → trove → radio → viz). Bottom = context menu
-of the focused view. Waves strip shows speaker state + 3-row spectrum
-(local files) or `· live stream ·` (radio). Press `h` for help overlay
-(matches the handlers; any key closes it).
+Two boxes + a waves strip on every view except viz. Top = content
+view (Tab cycles browser → queue → audio → trove → radio → viz).
+Bottom = context menu of the focused view. The strip shows speaker
+state + 3-row spectrum; the viz tab *is* that spectrum (full canvas,
+no second box). Press `h` for help overlay (matches the handlers;
+any key closes it).
 
 **Global keys** (every view; these fire first):
 
@@ -52,6 +53,7 @@ of the focused view. Waves strip shows speaker state + 3-row spectrum
 | `p` | pause / resume |
 | ← / → | seek ±5s (Shift ±30s) |
 | `+` / `-` | volume (HEOS while following) |
+| `T` | cycle palette (pixie blush silver siren cave) |
 | `h` | help overlay |
 | `q` | quit |
 | Esc | quit (closes a picker first) |
@@ -91,8 +93,8 @@ visualizer and is never used for status.
 **Visualizer** (`V` view, last Tab stop): live spectrum from the
 PipeWire monitor. 60fps while animating. Braille rendering (2×4 dots
 per cell). `t`/`space` flips horizontal ↔ vertical; `V` cycles zoom
-1×/2×/3×. Peak-hold caps fall slowly. The waves strip carries a compact
-horizontal braille spectrum.
+1×/2×/3×. Peak-hold caps fall slowly. Other views keep a compact
+horizontal strip; the viz tab is the full canvas (no second box).
 
 **Follow** (audio view `W`, or `siren audio follow on|off`): Cave plays
 Siren music. Headset (front combo jack) stays the PipeWire default for

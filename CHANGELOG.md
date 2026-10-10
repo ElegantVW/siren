@@ -1,5 +1,21 @@
 # Siren changelog
 
+## 2026-10-10 — five TUI palettes
+
+- Global `T` cycles pixie / blush / silver / siren / cave (house pinks +
+  Siren teal). RGB is compiled in. `siren config set palette siren`.
+
+## 2026-10-10 — viz tab is the waves
+
+- The small waves strip hides on the viz tab; that height goes to the
+  full visualizer. Other views keep the strip.
+
+## 2026-10-10 — waves follow Siren_Master
+
+- TUI waves retarget onto `Siren_Master.monitor` when follow comes up
+  (they used to stay on silent headset analog). `viz::stop` on TUI exit
+  leaves the follow encoder.
+
 ## 2026-10-10 — music-only follow, dual-home Cave
 
 - Follow is Siren music only: mpv pinned to `Siren_Master`; headset analog

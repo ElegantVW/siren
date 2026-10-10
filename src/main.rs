@@ -15,6 +15,7 @@ mod queue;
 mod mixer;
 mod spectrum;
 mod stream;
+mod theme;
 mod trove;
 mod viz;
 mod tui;

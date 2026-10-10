@@ -125,6 +125,11 @@ leaves the headset so the box is never silent.
 The login unit is Type=simple `siren audio follow run`: it stays
 active while the encoder is alive and goes inactive when `:8899` dies.
 
+TUI waves (and the viz view) read the same monitor: `Siren_Master.monitor`
+while follow is on, headset analog when follow is off. Opening the TUI
+before follow, then `W` / the login unit, retargets the reader. The
+small strip hides on the viz tab — that tab *is* the waves.
+
 Volume keys move **HEOS** volume, not the null-sink percent. Seek on
 `/siren.wav` (or duration `00:00:00`) is skipped — firmware wedges
 TRANSITIONING. Pause is UPnP Pause/Play. CLI `get_play_state` is
