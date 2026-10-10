@@ -1,6 +1,6 @@
 # Siren changelog
 
-## 2026-10-10 — v0.1.1 vessel downloads
+## 2026-10-10 — sea-glass (v0.1.1)
 
 - GitHub Release: linux x86_64 + windows x86_64 `.exe`. Grove card has
   the buttons. macOS is still source (`docs/PORT.md`). mpv is required.
