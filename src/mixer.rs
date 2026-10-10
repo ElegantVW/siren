@@ -1,8 +1,8 @@
-//! Mixer — per-source output control.
+//! Mixer — analog phones plus per-app output control.
 //!
-//! Lists every live sink-input (app playing audio), lets the user
-//! mute/unmute and adjust each one. Synchronous pactl parsing,
-//! throttled by the caller — cheap enough to run on the UI tick.
+//! Lists the analog headset sink and every live sink-input, lets the
+//! user mute/unmute and set volume. Synchronous pactl parsing, run
+//! off the render thread. Never writes `Siren_Master` (follow).
 
 /// One live audio source.
 #[derive(Debug, Clone, Default)]
@@ -96,6 +96,117 @@ pub fn set_volume(id: u32, pct: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// One PipeWire/Pulse sink (the jack, a null sink, …).
+#[derive(Debug, Clone, Default)]
+pub struct Sink {
+    pub name: String,
+    pub description: String,
+    pub muted: bool,
+    pub volume_pct: u32,
+}
+
+/// Parse `pactl list sinks`.
+pub fn list_sinks() -> Vec<Sink> {
+    let out = std::process::Command::new("pactl")
+        .args(["list", "sinks"])
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    parse_sinks(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pure parser — fully testable.
+pub fn parse_sinks(text: &str) -> Vec<Sink> {
+    let mut out = Vec::new();
+    let mut cur = Sink::default();
+    let mut in_block = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("Sink #") {
+            if in_block {
+                out.push(std::mem::take(&mut cur));
+            }
+            in_block = true;
+        } else if in_block {
+            if let Some(v) = t.strip_prefix("Name: ") {
+                cur.name = v.trim().to_string();
+            } else if let Some(v) = t.strip_prefix("Description: ") {
+                cur.description = v.trim().to_string();
+            } else if let Some(v) = t.strip_prefix("Mute: ") {
+                cur.muted = v.trim() == "yes";
+            } else if t.starts_with("Volume: ") {
+                if let Some(pct) = t.split('/').nth(1) {
+                    cur.volume_pct = pct
+                        .trim()
+                        .trim_end_matches('%')
+                        .parse()
+                        .unwrap_or(100);
+                }
+            }
+        }
+    }
+    if in_block {
+        out.push(cur);
+    }
+    out
+}
+
+/// Headset analog — never Siren_Master (follow).
+pub fn pick_phones(sinks: &[Sink]) -> Option<&Sink> {
+    sinks
+        .iter()
+        .find(|s| s.name.contains("analog-stereo") && !s.name.contains("Siren"))
+        .or_else(|| {
+            sinks.iter().find(|s| {
+                let d = s.description.to_ascii_lowercase();
+                (d.contains("headphone") || d.contains("analog")) && !s.name.contains("Siren")
+            })
+        })
+}
+
+pub fn set_sink_mute(name: &str, mute: bool) -> bool {
+    if name.is_empty() || name.contains("Siren_Master") {
+        return false;
+    }
+    std::process::Command::new("pactl")
+        .args([
+            "set-sink-mute",
+            name,
+            if mute { "1" } else { "0" },
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub fn set_sink_volume(name: &str, pct: u32) -> bool {
+    if name.is_empty() || name.contains("Siren_Master") {
+        return false;
+    }
+    let pct = pct.clamp(0, 150);
+    std::process::Command::new("pactl")
+        .args(["set-sink-volume", name, &format!("{pct}%")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Map a terminal row onto a vertical fader. Top of the bar is 100%, bottom is 0%.
+pub fn fader_pct(y: u16, top: u16, h: u16) -> u32 {
+    if h == 0 {
+        return 0;
+    }
+    if y <= top {
+        return 100;
+    }
+    let bottom = top.saturating_add(h.saturating_sub(1));
+    if y >= bottom {
+        return 0;
+    }
+    let span = h.saturating_sub(1) as u32;
+    let rel = (y - top) as u32;
+    100u32.saturating_sub((rel * 100) / span)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +273,49 @@ Sink Input #467
         assert_eq!(v[0].id, 9);
         assert_eq!(v[0].app, "");
         assert!(!v[0].muted);
+    }
+
+    const SINKS: &str = r#"Sink #31
+	State: RUNNING
+	Name: Siren_Master
+	Description: Siren follow null
+	Mute: no
+	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+Sink #57
+	State: SUSPENDED
+	Name: alsa_output.pci-0000_31_00.4.analog-stereo
+	Description: HD Audio Controller Analog Stereo
+	Mute: yes
+	Volume: front-left: 26214 /  40% / -23.88 dB,   front-right: 26214 /  40% / -23.88 dB
+"#;
+
+    #[test]
+    fn parses_sinks_and_picks_phones() {
+        let v = parse_sinks(SINKS);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].name, "Siren_Master");
+        assert_eq!(v[1].volume_pct, 40);
+        assert!(v[1].muted);
+        let p = pick_phones(&v).expect("analog");
+        assert!(p.name.contains("analog-stereo"));
+        assert!(!p.name.contains("Siren"));
+    }
+
+    #[test]
+    fn refuses_master_as_phones_target() {
+        assert!(!set_sink_mute("Siren_Master", true));
+        assert!(!set_sink_volume("Siren_Master", 80));
+        assert!(!set_sink_mute("", false));
+    }
+
+    #[test]
+    fn fader_pct_top_is_loud() {
+        assert_eq!(fader_pct(4, 4, 10), 100);
+        assert_eq!(fader_pct(13, 4, 10), 0);
+        let mid = fader_pct(8, 4, 10);
+        assert!(mid >= 40 && mid <= 60, "mid was {mid}");
+        assert_eq!(fader_pct(0, 4, 10), 100);
+        assert_eq!(fader_pct(99, 4, 10), 0);
+        assert_eq!(fader_pct(4, 4, 0), 0);
     }
 }

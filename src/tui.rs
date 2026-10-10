@@ -1,5 +1,5 @@
 //! Two-box TUI: top = content view, bottom = focused view's menu.
-//! Tab cycles browser → queue → audio → trove → radio → viz.
+//! Tab cycles browser → queue → audio → mixer → trove → radio → viz.
 //! Playback stays mpv-over-IPC; audio view + `c` drive the HEOS speaker.
 
 use crate::{config::SirenConfig, heos, library, player, playlist, queue, radio};
@@ -24,18 +24,32 @@ enum View {
     Browser,
     Queue,
     Audio,
+    Mixer,
     Trove,
     Radio,
     Viz,
 }
-const VIEWS: [View; 6] = [
+const VIEWS: [View; 7] = [
     View::Browser,
     View::Queue,
     View::Audio,
+    View::Mixer,
     View::Trove,
     View::Radio,
     View::Viz,
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MixChan {
+    Phones,
+    Input(u32),
+}
+
+struct FaderHit {
+    chan: MixChan,
+    bar: Rect,
+    mute: Rect,
+}
 const TAB_MS: u64 = 180;
 
 impl View {
@@ -44,6 +58,7 @@ impl View {
             View::Browser => "browser",
             View::Queue => "queue",
             View::Audio => "audio",
+            View::Mixer => "mixer",
             View::Trove => "trove",
             View::Radio => "radio",
             View::Viz => "viz",
@@ -54,6 +69,7 @@ impl View {
             View::Browser => "enter open/play · a add · c cast · backspace up · / filter · S save · L load · R rm",
             View::Queue => "enter play-from · d remove · C clear · s shuffle",
             View::Audio => "o local/heos · S speaker · W follow · j/k src · m mute · +/- vol · g group",
+            View::Mixer => "drag fader · click mute · j/k/←/→ select · +/- vol · m mute",
             View::Trove => "s search · enter vers · D dl · j/k · M more · A all · F format",
             View::Radio => "enter play · C country · s search · f fav · A add url · M more · j/k",
             View::Viz => "tab cycle · q quit",
@@ -181,7 +197,10 @@ struct BackgroundPoll {
     stream_clients: usize,
     viz_on: bool,
     mixer: Vec<crate::mixer::SinkInput>,
+    phones: Option<crate::mixer::Sink>,
+    mixer_fresh: bool,
     groups: Vec<heos::HeosGroup>,
+    groups_fresh: bool,
 }
 
 struct App {
@@ -226,6 +245,10 @@ struct App {
     mixer: Vec<crate::mixer::SinkInput>,
     mixer_sel: usize,
     mixer_at: Instant,
+    phones: Option<crate::mixer::Sink>,
+    mixer_hits: Vec<FaderHit>,
+    mixer_drag: Option<MixChan>,
+    mixer_scroll: usize,
     play_label: String,
     play_phase: usize,
     play_pending: bool,
@@ -339,6 +362,10 @@ impl App {
             mixer: Vec::new(),
             mixer_sel: 0,
             mixer_at: Instant::now() - Duration::from_secs(99),
+            phones: None,
+            mixer_hits: Vec::new(),
+            mixer_drag: None,
+            mixer_scroll: 0,
             play_label: String::new(),
             play_phase: 0,
             play_pending: false,
@@ -415,7 +442,11 @@ impl App {
     /// only when a visualiser is live or a play job is running, else a
     /// slow tick. Keeps CPU proportional to visible animation.
     fn animating(&self) -> bool {
-        self.view() == View::Viz || self.play_pending || self.viz_on || self.tab_live()
+        self.view() == View::Viz
+            || self.play_pending
+            || self.viz_on
+            || self.tab_live()
+            || self.mixer_drag.is_some()
     }
     fn tab_live(&self) -> bool {
         self.tab_from.is_some() && self.tab_at.elapsed() < Duration::from_millis(TAB_MS)
@@ -441,6 +472,9 @@ impl App {
         self.tab_at = Instant::now();
         if self.view() == View::Audio {
             self.force_speaker_poll();
+        }
+        if self.view() == View::Mixer {
+            self.poll_mixer_force();
         }
         if self.view() == View::Radio {
             self.radio.favs = radio::favs();
@@ -599,7 +633,10 @@ impl App {
                 stream_clients: 0,
                 viz_on: crate::viz::running(),
                 mixer: Vec::new(),
+                phones: None,
+                mixer_fresh: false,
                 groups: Vec::new(),
+                groups_fresh: false,
             };
             // each of these costs ~250-500ms (pactl) — that is why
             // they live here and not in the draw path
@@ -609,11 +646,15 @@ impl App {
             }
             if want_mixer {
                 p.mixer = crate::mixer::list_inputs();
+                let sinks = crate::mixer::list_sinks();
+                p.phones = crate::mixer::pick_phones(&sinks).cloned();
+                p.mixer_fresh = true;
             }
             if want_groups {
                 if let Some(ip) = group_ip {
                     p.groups = crate::heos::get_groups(&ip);
                 }
+                p.groups_fresh = true;
             }
             let _ = tx.send(p);
         });
@@ -629,11 +670,23 @@ impl App {
                     self.stream_master = p.stream_master;
                     self.stream_clients = p.stream_clients;
                     self.viz_on = p.viz_on;
-                    self.mixer = p.mixer;
-                    if !self.mixer.is_empty() {
-                        self.mixer_sel = self.mixer_sel.min(self.mixer.len() - 1);
+                    if p.mixer_fresh {
+                        let drag_pct = self.mixer_drag.map(|c| mixer_vol_mute(self, c).0);
+                        self.mixer = p.mixer;
+                        self.phones = p.phones;
+                        if let (Some(chan), Some(pct)) = (self.mixer_drag, drag_pct) {
+                            mixer_set_local(self, chan, pct);
+                        }
+                        let n = mixer_chan_count(self);
+                        if n > 0 {
+                            self.mixer_sel = self.mixer_sel.min(n - 1);
+                        } else {
+                            self.mixer_sel = 0;
+                        }
                     }
-                    self.groups = p.groups;
+                    if p.groups_fresh {
+                        self.groups = p.groups;
+                    }
                     self.bg_pending = false;
                     self.bg_rx = None;
                 }
@@ -961,20 +1014,36 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             return false;
         }
         KeyCode::Left => {
+            if app.view() == View::Mixer && !mods.contains(KeyModifiers::SHIFT) {
+                handle_mixer(app, KeyCode::Left);
+                return false;
+            }
             let arg = if mods.contains(KeyModifiers::SHIFT) { "-30" } else { "-5" };
             do_seek(app, arg);
             return false;
         }
         KeyCode::Right => {
+            if app.view() == View::Mixer && !mods.contains(KeyModifiers::SHIFT) {
+                handle_mixer(app, KeyCode::Right);
+                return false;
+            }
             let arg = if mods.contains(KeyModifiers::SHIFT) { "+30" } else { "+5" };
             do_seek(app, arg);
             return false;
         }
         KeyCode::Char('+') | KeyCode::Char('=') => {
+            if app.view() == View::Mixer {
+                mixer_nudge(app, 5);
+                return false;
+            }
             app.adjust_volume(5);
             return false;
         }
         KeyCode::Char('-') | KeyCode::Char('_') => {
+            if app.view() == View::Mixer {
+                mixer_nudge(app, -5);
+                return false;
+            }
             app.adjust_volume(-5);
             return false;
         }
@@ -1020,6 +1089,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             View::Browser => handle_browser(app, code, mods),
             View::Queue => handle_queue(app, code, mods),
             View::Audio => handle_audio(app, code, mods),
+            View::Mixer => handle_mixer(app, code),
             View::Trove => handle_trove(app, code, mods),
             View::Radio => handle_radio(app, code, mods),
             View::Viz => {}
@@ -1033,6 +1103,9 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
 fn handle_mouse(app: &mut App, me: crossterm::event::MouseEvent) -> bool {
     if !app.cfg.mouse {
         return false;
+    }
+    if app.view() == View::Mixer {
+        return handle_mixer_mouse(app, me);
     }
     match me.kind {
         MouseEventKind::ScrollUp => {
@@ -2508,6 +2581,230 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
     }
 }
 
+fn mixer_channels(app: &App) -> Vec<MixChan> {
+    let mut out = Vec::new();
+    if app.phones.is_some() {
+        out.push(MixChan::Phones);
+    }
+    for src in &app.mixer {
+        out.push(MixChan::Input(src.id));
+    }
+    out
+}
+
+fn mixer_chan_count(app: &App) -> usize {
+    mixer_channels(app).len()
+}
+
+fn mixer_selected(app: &App) -> Option<MixChan> {
+    mixer_channels(app).get(app.mixer_sel).copied()
+}
+
+fn mixer_label(app: &App, chan: MixChan) -> String {
+    match chan {
+        MixChan::Phones => "phones".into(),
+        MixChan::Input(id) => app
+            .mixer
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.app.clone())
+            .unwrap_or_else(|| format!("#{id}")),
+    }
+}
+
+fn mixer_vol_mute(app: &App, chan: MixChan) -> (u32, bool) {
+    match chan {
+        MixChan::Phones => app
+            .phones
+            .as_ref()
+            .map(|p| (p.volume_pct, p.muted))
+            .unwrap_or((0, false)),
+        MixChan::Input(id) => app
+            .mixer
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| (s.volume_pct, s.muted))
+            .unwrap_or((0, false)),
+    }
+}
+
+fn mixer_set_local(app: &mut App, chan: MixChan, pct: u32) {
+    let pct = pct.min(150);
+    match chan {
+        MixChan::Phones => {
+            if let Some(p) = app.phones.as_mut() {
+                p.volume_pct = pct;
+            }
+        }
+        MixChan::Input(id) => {
+            if let Some(s) = app.mixer.iter_mut().find(|s| s.id == id) {
+                s.volume_pct = pct;
+            }
+        }
+    }
+}
+
+fn mixer_apply_vol(app: &mut App, chan: MixChan, pct: u32) {
+    let pct = pct.min(150);
+    mixer_set_local(app, chan, pct);
+    let name = mixer_label(app, chan);
+    let ok = match chan {
+        MixChan::Phones => app
+            .phones
+            .as_ref()
+            .map(|p| crate::mixer::set_sink_volume(&p.name, pct))
+            .unwrap_or(false),
+        MixChan::Input(id) => crate::mixer::set_volume(id, pct),
+    };
+    if ok {
+        app.say(format!("{name} → {pct}%"));
+    }
+}
+
+fn mixer_toggle_mute(app: &mut App, chan: MixChan) {
+    let name = mixer_label(app, chan);
+    match chan {
+        MixChan::Phones => {
+            if let Some(p) = app.phones.as_mut() {
+                let next = !p.muted;
+                if crate::mixer::set_sink_mute(&p.name, next) {
+                    p.muted = next;
+                    app.say(format!("phones mute → {}", if next { "on" } else { "off" }));
+                }
+            }
+        }
+        MixChan::Input(id) => {
+            if let Some(s) = app.mixer.iter().find(|s| s.id == id) {
+                let next = !s.muted;
+                if crate::mixer::set_mute(id, next) {
+                    app.say(format!("{name} mute → {}", if next { "on" } else { "off" }));
+                    if let Some(s) = app.mixer.iter_mut().find(|s| s.id == id) {
+                        s.muted = next;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn mixer_nudge(app: &mut App, delta: i32) {
+    let Some(chan) = mixer_selected(app) else {
+        app.say("mixer empty");
+        return;
+    };
+    let (vol, _) = mixer_vol_mute(app, chan);
+    let next = (vol as i32 + delta).clamp(0, 150) as u32;
+    mixer_apply_vol(app, chan, next);
+}
+
+fn mixer_hit(app: &App, col: u16, row: u16) -> Option<(MixChan, bool)> {
+    for h in &app.mixer_hits {
+        if col >= h.mute.x
+            && col < h.mute.x.saturating_add(h.mute.width)
+            && row >= h.mute.y
+            && row < h.mute.y.saturating_add(h.mute.height)
+        {
+            return Some((h.chan, true));
+        }
+        if col >= h.bar.x
+            && col < h.bar.x.saturating_add(h.bar.width)
+            && row >= h.bar.y
+            && row < h.bar.y.saturating_add(h.bar.height)
+        {
+            return Some((h.chan, false));
+        }
+    }
+    None
+}
+
+fn mixer_select_chan(app: &mut App, chan: MixChan) {
+    if let Some(i) = mixer_channels(app).iter().position(|c| *c == chan) {
+        app.mixer_sel = i;
+    }
+}
+
+fn handle_mixer(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Char('j') | KeyCode::Right | KeyCode::Down => {
+            let n = mixer_chan_count(app);
+            if n > 0 {
+                app.mixer_sel = (app.mixer_sel + 1).min(n - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Left | KeyCode::Up => {
+            app.mixer_sel = app.mixer_sel.saturating_sub(1);
+        }
+        KeyCode::Char('m') => {
+            if let Some(chan) = mixer_selected(app) {
+                mixer_toggle_mute(app, chan);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_mixer_mouse(app: &mut App, me: crossterm::event::MouseEvent) -> bool {
+    match me.kind {
+        MouseEventKind::ScrollUp => {
+            if let Some((chan, _)) = mixer_hit(app, me.column, me.row) {
+                mixer_select_chan(app, chan);
+                mixer_nudge(app, 5);
+            } else {
+                mixer_nudge(app, 5);
+            }
+            true
+        }
+        MouseEventKind::ScrollDown => {
+            if let Some((chan, _)) = mixer_hit(app, me.column, me.row) {
+                mixer_select_chan(app, chan);
+                mixer_nudge(app, -5);
+            } else {
+                mixer_nudge(app, -5);
+            }
+            true
+        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            if let Some((chan, is_mute)) = mixer_hit(app, me.column, me.row) {
+                mixer_select_chan(app, chan);
+                if is_mute {
+                    mixer_toggle_mute(app, chan);
+                    app.mixer_drag = None;
+                } else if let Some(h) = app.mixer_hits.iter().find(|h| h.chan == chan) {
+                    let pct = crate::mixer::fader_pct(me.row, h.bar.y, h.bar.height);
+                    mixer_set_local(app, chan, pct);
+                    app.mixer_drag = Some(chan);
+                }
+                true
+            } else {
+                false
+            }
+        }
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+            let chan = app.mixer_drag.or_else(|| mixer_hit(app, me.column, me.row).map(|p| p.0));
+            let Some(chan) = chan else { return false };
+            mixer_select_chan(app, chan);
+            if let Some(h) = app.mixer_hits.iter().find(|h| h.chan == chan) {
+                let pct = crate::mixer::fader_pct(me.row, h.bar.y, h.bar.height);
+                mixer_set_local(app, chan, pct);
+                app.mixer_drag = Some(chan);
+                true
+            } else {
+                false
+            }
+        }
+        MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+            if let Some(chan) = app.mixer_drag.take() {
+                let (pct, _) = mixer_vol_mute(app, chan);
+                mixer_apply_vol(app, chan, pct);
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 // ---- drawing ----
 
 /// Full-screen visualizer. Horizontal braille bars, peak caps,
@@ -2608,6 +2905,14 @@ fn draw_help(f: &mut Frame, app: &mut App) {
             ("G", "group mute toggle"),
             (",  .", "group volume -/+"),
         ]),
+        View::Mixer => ("mixer", &[
+            ("drag", "set fader (phones + live apps)"),
+            ("click mute", "mute that channel"),
+            ("wheel", "nudge fader under pointer"),
+            ("j / k / ← / →", "select channel"),
+            ("+ / -", "selected fader (not HEOS)"),
+            ("m", "mute selected"),
+        ]),
         View::Trove => ("trove", &[
             ("s", "search"),
             ("enter", "pick version"),
@@ -2676,6 +2981,7 @@ fn draw_content(f: &mut Frame, app: &mut App, view: View, area: ratatui::layout:
         View::Browser => draw_browser(f, app, inner),
         View::Queue => draw_queue(f, app, inner),
         View::Audio => draw_audio(f, app, inner),
+        View::Mixer => draw_mixer(f, app, inner),
         View::Trove => draw_trove(f, app, inner),
         View::Radio => draw_radio(f, app, inner),
         View::Viz => {}
@@ -2798,6 +3104,14 @@ fn draw(f: &mut Frame, app: &mut App) {
                 View::Queue => format!("{} queued · tab cycle · q quit", queue::snapshot().len()),
                 View::Viz => "waves · tab cycle · q quit".into(),
                 View::Audio => format!("out:{} · spk:{} · tab cycle · q quit", app.cfg.audio_output, app.cfg.audio_speaker),
+                View::Mixer => {
+                    let n = mixer_chan_count(app);
+                    if n == 0 {
+                        "mixer · pulse skip · tab cycle · q quit".into()
+                    } else {
+                        format!("{n} faders · drag · mute · tab cycle · q quit")
+                    }
+                }
                 View::Trove => {
                     let st = if app.trove.searching {
                         "searching…".to_string()
@@ -3374,6 +3688,107 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+fn draw_mixer(f: &mut Frame, app: &mut App, area: Rect) {
+    let p = app.pal();
+    let inner = area;
+    app.mixer_hits.clear();
+    let chans = mixer_channels(app);
+    if chans.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  nothing playing · Pulse mixer skips on Windows",
+                Style::default().fg(p.dim),
+            ))),
+            inner,
+        );
+        return;
+    }
+    if inner.width < 6 || inner.height < 6 {
+        return;
+    }
+    let col_w = ((inner.width / chans.len() as u16).max(6)).min(12);
+    let vis = ((inner.width / col_w) as usize).max(1).min(chans.len());
+    let max_off = chans.len().saturating_sub(vis);
+    if app.mixer_sel >= app.mixer_scroll + vis {
+        app.mixer_scroll = app.mixer_sel + 1 - vis;
+    }
+    if app.mixer_sel < app.mixer_scroll {
+        app.mixer_scroll = app.mixer_sel;
+    }
+    app.mixer_scroll = app.mixer_scroll.min(max_off);
+    let name_y = inner.y;
+    let bar_y = inner.y.saturating_add(1);
+    let pct_h = 1u16;
+    let mute_h = 1u16;
+    let bar_h = inner
+        .height
+        .saturating_sub(2 + pct_h + mute_h)
+        .max(1);
+    let pct_y = bar_y.saturating_add(bar_h);
+    let mute_y = pct_y.saturating_add(1);
+
+    for (vis_i, chan) in chans.iter().skip(app.mixer_scroll).take(vis).enumerate() {
+        let x = inner.x + vis_i as u16 * col_w;
+        let abs_i = app.mixer_scroll + vis_i;
+        let sel = abs_i == app.mixer_sel;
+        let (vol, muted) = mixer_vol_mute(app, *chan);
+        let label = mixer_label(app, *chan);
+        let name = if label.chars().count() > col_w as usize {
+            label.chars().take(col_w as usize).collect()
+        } else {
+            label
+        };
+        let name_style = Style::default()
+            .fg(if sel { p.accent } else { p.silver })
+            .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() });
+        f.render_widget(
+            Paragraph::new(Span::styled(name, name_style)),
+            Rect::new(x, name_y, col_w, 1),
+        );
+        let fill_fg = if muted { p.warn } else if sel { p.accent } else { p.ok };
+        let empty_fg = p.dim;
+        let buf = f.buffer_mut();
+        let bar_w = (col_w.saturating_sub(2)).min(3).max(1);
+        let bar_x = x + (col_w.saturating_sub(bar_w)) / 2;
+        for row in 0..bar_h {
+            let y = bar_y + row;
+            let here = crate::mixer::fader_pct(y, bar_y, bar_h);
+            let ch = if vol >= here { "█" } else { "░" };
+            let fg = if vol >= here { fill_fg } else { empty_fg };
+            for dx in 0..bar_w {
+                let cx = bar_x + dx;
+                if cx < inner.x + inner.width && y < inner.y + inner.height {
+                    buf[(cx, y)].set_symbol(ch).set_fg(fg);
+                }
+            }
+        }
+        let pct_s = if muted {
+            format!("{vol}% M")
+        } else {
+            format!("{vol}%")
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                pct_s,
+                Style::default().fg(if muted { p.warn } else { p.ok }),
+            )),
+            Rect::new(x, pct_y, col_w, 1),
+        );
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                if muted { "unmute" } else { "mute" },
+                Style::default().fg(if muted { p.warn } else { p.dim }),
+            )),
+            Rect::new(x, mute_y, col_w, 1),
+        );
+        app.mixer_hits.push(FaderHit {
+            chan: *chan,
+            bar: Rect::new(x, bar_y, col_w, bar_h),
+            mute: Rect::new(x, mute_y, col_w, mute_h),
+        });
+    }
+}
+
 #[cfg(test)]
 mod play_cue_tests {
     use super::*;
@@ -3463,6 +3878,62 @@ mod viz_key_tests {
     fn viz_view_is_last_tab_stop() {
         let app = viz_app();
         assert_eq!(app.view(), View::Viz);
+    }
+
+    #[test]
+    fn mixer_sits_between_audio_and_trove() {
+        assert_eq!(VIEWS[2], View::Audio);
+        assert_eq!(VIEWS[3], View::Mixer);
+        assert_eq!(VIEWS[4], View::Trove);
+        let mut app = App::new();
+        while app.view() != View::Audio {
+            app.focus = (app.focus + 1) % VIEWS.len();
+        }
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.view(), View::Mixer);
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.view(), View::Trove);
+    }
+
+    #[test]
+    fn mixer_plus_minus_do_not_call_heos() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("tui.rs");
+        let start = src.find("fn handle_key").expect("handle_key");
+        let end = src[start..]
+            .find("\nfn handle_mouse")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        let plus = body.find("KeyCode::Char('+')").expect("+");
+        let mixer = body[plus..].find("View::Mixer").expect("mixer eats +");
+        let heos = body[plus..].find("adjust_volume").expect("heos after");
+        assert!(mixer < heos, "mixer +/- runs before HEOS adjust_volume");
+        let left = body.find("KeyCode::Left").expect("Left");
+        let mixer_left = body[left..].find("View::Mixer").expect("mixer eats left");
+        let seek = body[left..].find("do_seek").expect("seek after left");
+        assert!(mixer_left < seek, "mixer arrows run before seek");
+        assert!(src.contains("fn handle_mixer_mouse"), "mouse faders");
+        assert!(src.contains("fn draw_mixer"), "mixer tab draws faders");
+        let draw = src.find("fn draw_mixer").expect("draw_mixer");
+        let draw_end = src[draw..]
+            .find("\n#[cfg(test)]")
+            .map(|i| draw + i)
+            .unwrap_or(src.len());
+        assert!(
+            !src[draw..draw_end].contains("list_inputs"),
+            "draw_mixer must not pactl"
+        );
+        assert!(
+            !src[draw..draw_end].contains("list_sinks"),
+            "draw_mixer must not pactl sinks"
+        );
+        let harvest = src.find("if p.mixer_fresh").expect("mixer harvest gated");
+        let assign = src[harvest..].find("self.mixer = p.mixer").expect("assign");
+        assert!(assign < 400, "fresh mixer writes only inside the gate");
+        assert!(
+            src.contains("mixer_set_local(self, chan, pct)"),
+            "drag volume survives harvest"
+        );
     }
 
     #[test]
@@ -3663,8 +4134,8 @@ mod no_blocking_tests {
         // only the genuinely expensive calls: pactl (~250-500ms) and the
         // HEOS network round-trip. `stream::running()` is try_wait — a
         // cheap waitpid, fine on the render thread.
-        let slow = ["crate::mixer::list_inputs", "crate::stream::master_",
-                    "heos::get_groups"];
+        let slow = ["crate::mixer::list_inputs", "crate::mixer::list_sinks",
+                    "crate::stream::master_", "heos::get_groups"];
         let all: Vec<&str> = src.lines().collect();
         // skip our own test module — it contains the needle strings
         let test_start = all.iter().position(|l| l.contains("mod no_blocking_tests"))

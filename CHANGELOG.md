@@ -1,5 +1,12 @@
 # Siren changelog
 
+## 2026-10-11 — mixer tab
+
+- New Tab stop: vertical faders for analog phones and live apps.
+  Mouse drag / mute / wheel. On this tab `+/-` is the selected fader,
+  not HEOS, and unshifted arrows pick a channel. Cave stays on the
+  audio tab.
+
 ## 2026-10-10 — sea-glass (v0.1.1)
 
 - GitHub Release: linux x86_64 + windows x86_64 `.exe`. Grove card has

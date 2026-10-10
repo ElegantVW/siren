@@ -47,7 +47,7 @@ version, file type, what you heard, what broke.
 ## TUI
 
 Two boxes + a waves strip on every view except viz. Top = content
-view (Tab cycles browser → queue → audio → trove → radio → viz).
+view (Tab cycles browser → queue → audio → mixer → trove → radio → viz).
 Bottom = context menu of the focused view. The strip shows speaker
 state + 3-row spectrum; the viz tab *is* that spectrum (full canvas,
 no second box). Press `h` for help overlay (matches the handlers;
@@ -74,6 +74,7 @@ any key closes it).
 | browser | Enter/space play · `a` add · `c` cast · ⌫ up · `/` filter · `S` save · `L` load · `R` rm |
 | queue | Enter play-from · `d` remove · `C` clear · `s` shuffle |
 | audio | `o` local/heos · `S` speaker · `W` follow · mixer `j`/`k`/`m` · `g`/`u`/`G` group · `,`/`.` group vol |
+| mixer | drag fader · click mute · `j`/`k`/`←`/`→` select · `+/-` selected · `m` mute |
 | trove | `s` search · Enter version · `D` download · `M` more · `A` all · `F` format |
 | radio | Enter/space play · `C` country · `s` search · `f` fav · `A` URL · `M` more |
 | viz | Tab cycles (pane pushes) |
@@ -83,10 +84,10 @@ speaker as leader, `u` ungroups, `G` toggles group mute, `,`/`.` adjust
 group volume. HEOS natively syncs grouped speakers — verified 1–2ms
 drift.
 
-**Mixer** (audio view): every live source listed with app, volume,
-muted state. `j/k` select, `m` mute/unmute one source. `+/-` is global
-transport volume (HEOS while following). Group volume is `,`/`.`. The
-loopback is filtered out (infrastructure, not a source).
+**Mixer** (mixer tab): vertical faders for analog phones plus live
+apps. Drag the bar, click mute, wheel to nudge. On this tab `+/-` is
+the selected fader and unshifted `←`/`→` pick a channel. Cave/HEOS
+volume stays audio `+/-`. Windows skips (no Pulse).
 
 **Radio honesty**: favorites play their own saved URL first (direct
 `play_stream`), TuneIn only as fallback. Playback is verified by
@@ -161,7 +162,7 @@ siren trove get <identifier>
 siren trove about
 ```
 
-TUI: 4th Tab stop (`trove`), `s` search · Enter pick version · `D`
+TUI: 5th Tab stop (`trove`), `s` search · Enter pick version · `D`
 download cursor · `j/k` + auto-prefetch near the end · `M` more · `A`
 all (double-press) · `F` session format · mouse wheel + click select,
 double-click acts. Search, metadata and downloads run in background
@@ -181,7 +182,7 @@ siren radio fav               list favorites
 siren radio fav <words>       toggle favorite
 ```
 
-TUI: 5th Tab stop (`radio`). `Enter` with no country opens the country
+TUI: 6th Tab stop (`radio`). `Enter` with no country opens the country
 picker (a-z, cached a week); `Enter`/space plays the cursor row, `C`
 re-picks country, `s` searches, `f` toggles favorite (★ pinned on top),
 `A` favorites any stream URL, `M` more. Favorites + last country persist
