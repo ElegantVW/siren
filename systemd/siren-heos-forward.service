@@ -1,0 +1,13 @@
+[Unit]
+Description=Siren speaker-LAN NAT for Cave UPnP
+After=network-online.target siren-heos-dhcpd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/evenweaker/siren/scripts/siren-heos-forward start
+ExecStop=/home/evenweaker/siren/scripts/siren-heos-forward stop
+
+[Install]
+WantedBy=multi-user.target

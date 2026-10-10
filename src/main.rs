@@ -48,6 +48,10 @@ enum Cmd {
     Next,
     /// Previous track
     Prev,
+    /// Seek: +5 | -5 | 30% | mm:ss | seconds
+    Seek {
+        arg: String,
+    },
     /// Now playing
     Now {
         /// Read ~/.cache/siren/now.json instead of live state
@@ -141,11 +145,21 @@ enum AudioCmd {
     },
     /// Cast now-playing (or first queue/library track) to the speaker
     Test,
+    /// LAN doctor: cached IPs vs a fast /24 :1255 scan
+    Probe {
+        #[arg(long)]
+        json: bool,
+    },
     /// Speaker queue: list | play <n> | rm <n> | clear | move <from> <to>
     /// (local queue stays `siren queue …`; this is the HEOS box)
     Queue {
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         args: Vec<String>,
+    },
+    /// Siren music → Cave (PCM follow). Headset stays analog.
+    Follow {
+        /// on | off | run (run = on, then wait for the encoder — systemd)
+        action: String,
     },
 }
 
@@ -205,6 +219,95 @@ fn cmd_config(action: Option<String>, key: Option<String>, value: Option<String>
 
 fn use_heos(cfg: &SirenConfig) -> bool {
     cfg.audio_output == "heos"
+}
+
+fn cmd_pause(cfg: &SirenConfig) -> i32 {
+    if crate::stream::following() {
+        let ip = crate::stream::follow_speaker_ip().or_else(|| heos_target(cfg, None).map(|t| t.0));
+        match ip {
+            Some(ip) => {
+                let to = crate::stream::toggle_follow_pause(&ip);
+                println!("{to}");
+                0
+            }
+            None => {
+                eprintln!("no speaker found");
+                1
+            }
+        }
+    } else if use_heos(cfg) {
+        match heos_target(cfg, None) {
+            Some(t) => {
+                let to = heos::toggle(&t.0, t.1);
+                println!("{} → {to}", t.2);
+                0
+            }
+            None => {
+                eprintln!("no speaker found");
+                1
+            }
+        }
+    } else {
+        queue::cmd_pause();
+        println!("Playback paused / resumed");
+        0
+    }
+}
+
+fn cmd_stop(cfg: &SirenConfig) -> i32 {
+    if use_heos(cfg) || crate::stream::following() {
+        match heos_target(cfg, None) {
+            Some(t) => {
+                let uri = crate::stream::track_uri(&t.0);
+                heos::set_state(&t.0, t.1, "stop");
+                let _ = crate::stream::stop_playback(&t.0);
+                if crate::stream::following() && crate::stream::is_follow_uri(&uri) {
+                    crate::stream::mark_follow_want_stop();
+                } else {
+                    let _ = crate::stream::maybe_reclaim();
+                }
+                println!("{} stopped", t.2);
+                0
+            }
+            None => {
+                eprintln!("no speaker found");
+                1
+            }
+        }
+    } else {
+        queue::cmd_stop();
+        println!("Playback stopped");
+        0
+    }
+}
+
+fn cmd_seek(cfg: &SirenConfig, arg: &str) -> i32 {
+    if crate::stream::following() {
+        eprintln!("seek skipped (live stream)");
+        return 0;
+    }
+    let r = if use_heos(cfg) {
+        match heos_target(cfg, None) {
+            Some(t) => crate::stream::apply_heos_seek(&t.0, arg),
+            None => Err("no speaker found".into()),
+        }
+    } else {
+        player::apply_local_seek(arg)
+    };
+    match r {
+        Ok(m) => {
+            println!("{m}");
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            if e.starts_with("seek skipped") {
+                0
+            } else {
+                1
+            }
+        }
+    }
 }
 
 fn cmd_play(cfg: &SirenConfig, rest: &[String]) -> i32 {
@@ -517,70 +620,76 @@ fn now_epoch() -> f64 {
         .unwrap_or(0.0)
 }
 
+fn heos_snap(p: &heos::HeosPlayer, stale: bool) -> serde_json::Value {
+    serde_json::json!({
+        "label": format!("{} — {}", p.name, p.state.as_deref().unwrap_or("?")),
+        "output": "heos",
+        "state": p.state,
+        "vol": p.volume,
+        "name": p.name,
+        "ip": p.ip,
+        "ts": now_epoch(),
+        "stale": stale,
+    })
+}
+
 /// Same shape as `now_snapshot` but never touches the network: reads
-/// the roster cache and the last known cache. Used when the refresh
-/// deadline expires (speakers off the network) so the command still
-/// answers instead of hanging.
+/// the roster file even after TTL. Used when the refresh deadline
+/// expires (speakers off the network) so the command still answers
+/// instead of hanging — and still names Cave/Office.
 fn now_snapshot_cached(cfg: &SirenConfig) -> serde_json::Value {
-    if cfg.audio_output == "heos" {
-        if let Some(players) = heos::read_roster_cache() {
-            if let Some(p) = players
-                .iter()
-                .find(|p| p.name.to_lowercase().contains(&cfg.audio_speaker.to_lowercase()))
-                .or_else(|| players.first())
-            {
-                let label = format!("{} — {}", p.name, p.state.as_deref().unwrap_or("?"));
-                return serde_json::json!({
-                    "label": label,
-                    "output": "heos",
-                    "state": p.state,
-                    "vol": p.volume,
-                    "ts": now_epoch(),
-                    "stale": true,
-                });
+    // Follow is Cave's transport even when audio_output is local.
+    // Must not recurse into now_snapshot (that path hits the network,
+    // and heos_target-fail would loop).
+    if crate::stream::following() || cfg.audio_output == "heos" {
+        if let Some(players) = heos::read_roster_stale() {
+            if let Some(p) = heos::pick_named(&players, &cfg.audio_speaker) {
+                return heos_snap(p, true);
             }
         }
         return serde_json::json!({
             "label": "speakers unreachable", "output": "heos",
-            "state": null, "vol": null, "ts": now_epoch(), "stale": true,
+            "state": null, "vol": null, "name": null, "ip": null,
+            "ts": now_epoch(), "stale": true,
         });
     }
-    // local: mpv state is on a unix socket, cheap — reuse the real path
+    // local, follow off: mpv state is on a unix socket, cheap
     now_snapshot(cfg)
 }
 
 /// Gather current playback (output-aware) for the cache / JSON.
 fn now_snapshot(cfg: &SirenConfig) -> serde_json::Value {
-    if cfg.audio_output == "heos" {
+    // Follow is Cave's transport even when audio_output is local (mpv rides Master).
+    if crate::stream::following() || cfg.audio_output == "heos" {
         if let Some(t) = heos_target(cfg, None) {
             let mut ps = vec![heos::HeosPlayer {
                 name: t.2.clone(),
                 pid: t.1,
-                model: String::new(),
                 ip: t.0.clone(),
-                network: String::new(),
-                state: None,
-                volume: None,
+                ..Default::default()
             }];
             heos::enrich(&mut ps);
-            let p = &ps[0];
-            let label = format!(
-                "{} — {}",
-                p.name,
-                p.state.as_deref().unwrap_or("?")
+            let (uri, _, _) = crate::stream::position_info(&t.0);
+            let upnp = crate::stream::transport_state(&t.0);
+            let published = crate::stream::publish_state(ps[0].state.as_deref(), &upnp);
+            let suffix = crate::stream::now_suffix(
+                &uri,
+                ps[0].song.as_deref(),
+                published.as_deref(),
             );
-            return serde_json::json!({
-                "label": label,
-                "output": "heos",
-                "state": p.state,
-                "vol": p.volume,
-                "ts": now_epoch(),
-            });
+            let stale = published.is_none();
+            let mut snap = heos_snap(&ps[0], stale);
+            snap["state"] = published
+                .clone()
+                .map(|s| serde_json::Value::String(s))
+                .unwrap_or(serde_json::Value::Null);
+            snap["label"] = serde_json::Value::String(format!("{} — {suffix}", ps[0].name));
+            if crate::stream::is_follow_uri(&uri) {
+                snap["uri"] = serde_json::json!(uri);
+            }
+            return snap;
         }
-        return serde_json::json!({
-            "label": "", "output": "heos",
-            "state": null, "vol": null, "ts": now_epoch(),
-        });
+        return now_snapshot_cached(cfg);
     }
     let label = queue::now_label();
     let state = if !player::alive() {
@@ -648,7 +757,73 @@ fn cmd_now_refresh(cfg: &SirenConfig, json: bool) -> i32 {
     if json {
         println!("{snap}");
     }
+    let _ = crate::stream::maybe_reclaim();
     0
+}
+
+/// Live `siren now`: try the speaker, fall back to stale roster names.
+fn cmd_now_live(cfg: &SirenConfig, json: bool) -> i32 {
+    let cfg2 = cfg.clone();
+    let snap = with_deadline(5, move || now_snapshot(&cfg2)).unwrap_or_else(|| now_snapshot_cached(cfg));
+    if json {
+        println!("{snap}");
+        return 0;
+    }
+    let label = snap.get("label").and_then(|x| x.as_str()).unwrap_or("");
+    if label.is_empty() {
+        println!("Not playing");
+    } else {
+        println!("{label}");
+    }
+    0
+}
+
+fn print_heos_status(snap: &serde_json::Value) {
+    let stale = snap.get("stale").and_then(|x| x.as_bool()).unwrap_or(false);
+    let state = snap
+        .get("state")
+        .and_then(|x| x.as_str())
+        .unwrap_or(if stale { "unreachable" } else { "?" });
+    println!("status: {state}");
+    let name = snap.get("name").and_then(|x| x.as_str()).unwrap_or("");
+    let ip = snap.get("ip").and_then(|x| x.as_str()).unwrap_or("");
+    if !name.is_empty() {
+        if ip.is_empty() {
+            println!("speaker: {name}");
+        } else {
+            println!("speaker: {name} ({ip})");
+        }
+    } else {
+        let label = snap.get("label").and_then(|x| x.as_str()).unwrap_or("no speaker found");
+        println!("speaker: {label}");
+    }
+    match snap.get("vol").and_then(|x| x.as_i64()) {
+        Some(v) => println!("vol:    {v}%"),
+        None => println!("vol:    ?"),
+    }
+    if stale {
+        println!("note:   speakers unreachable (cached roster)");
+    }
+}
+
+fn cmd_status(cfg: &SirenConfig) -> i32 {
+    if use_heos(cfg) || crate::stream::following() {
+        let cfg2 = cfg.clone();
+        let snap = with_deadline(5, move || now_snapshot(&cfg2)).unwrap_or_else(|| now_snapshot_cached(cfg));
+        print_heos_status(&snap);
+        return 0;
+    }
+    if !player::alive() {
+        let lib = library::scan_library(cfg);
+        println!("status: idle (no mpv)");
+        println!("library tracks: {}", lib.len());
+        0
+    } else {
+        for line in queue::status_lines(cfg) {
+            println!("{line}");
+        }
+        0
+    }
 }
 
 /// `siren now --cached [--json]`: instant read for prompts/boxes.
@@ -683,35 +858,125 @@ fn heos_target(cfg: &SirenConfig, hint: Option<&str>) -> Option<(String, i64, St
     heos::resolve(h.as_deref()).map(|(ip, pid, p)| (ip, pid, p.name))
 }
 
+fn cmd_audio_probe(json: bool) -> i32 {
+    let report = heos::run_probe();
+    if json {
+        let cached: Vec<serde_json::Value> = report
+            .cached
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "name": r.name, "ip": r.ip,
+                    "arp": r.arp, "cli": r.cli, "upnp": r.upnp,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "verdict": report.verdict.as_str(),
+                "cached": cached,
+                "lan_1255": report.lan_1255,
+                "exit": report.verdict.exit_code(),
+            })
+        );
+        return report.verdict.exit_code();
+    }
+    if report.cached.is_empty() {
+        println!("cached:  (none)");
+    }
+    for r in &report.cached {
+        println!(
+            "cached:  {}  {}  arp={}  1255={}  60006={}",
+            r.name,
+            r.ip,
+            if r.arp { "ok" } else { "dead" },
+            if r.cli { "up" } else { "down" },
+            if r.upnp { "up" } else { "down" },
+        );
+    }
+    if report.lan_1255.is_empty() {
+        println!("lan 1255: (none)");
+    } else {
+        println!("lan 1255: {}", report.lan_1255.join(" "));
+    }
+    println!("verdict: {}", report.verdict.as_str());
+    report.verdict.exit_code()
+}
+
+fn cmd_audio_follow(cfg: &SirenConfig, action: &str) -> i32 {
+    match action.trim().to_ascii_lowercase().as_str() {
+        "on" | "start" | "1" | "run" => {
+            let wait = action.trim().eq_ignore_ascii_case("run");
+            let report = heos::run_probe();
+            if report.verdict == heos::ProbeVerdict::NotOnLan {
+                let sink = crate::stream::default_sink()
+                    .unwrap_or_else(|| crate::stream::FALLBACK_SINK.to_string());
+                eprintln!("follow: not-on-lan — leaving headset {sink}");
+                return 1;
+            }
+            let tgt = match heos_target(cfg, None) {
+                Some(t) => t,
+                None => {
+                    eprintln!("no speaker found");
+                    return 1;
+                }
+            };
+            if crate::stream::follow_on(crate::stream::DEFAULT_PORT, &tgt.0) {
+                let def = crate::stream::default_sink()
+                    .unwrap_or_else(|| "headset".into());
+                println!(
+                    "follow on → {} ({})  music={}  default={}",
+                    tgt.2,
+                    tgt.0,
+                    crate::stream::MASTER,
+                    def
+                );
+                if wait {
+                    crate::stream::wait_while_encoder();
+                }
+                0
+            } else {
+                1
+            }
+        }
+        "off" | "stop" | "0" => {
+            crate::stream::follow_off(true);
+            println!("follow off");
+            0
+        }
+        other => {
+            eprintln!("usage: siren audio follow on|off|run  (got {other})");
+            1
+        }
+    }
+}
+
 fn cmd_audio(sub: Option<AudioCmd>) -> i32 {
     let mut cfg = SirenConfig::load();
     match sub {
         None | Some(AudioCmd::Status) => {
             println!("output:  {}", cfg.audio_output);
             println!("speaker: {}", cfg.audio_speaker);
-            match heos_target(&cfg, None) {
-                Some((ip, pid, name)) => {
-                    let mut ps = vec![heos::HeosPlayer {
-                        name: name.clone(),
-                        pid,
-                        model: String::new(),
-                        ip: ip.clone(),
-                        network: String::new(),
-                        state: None,
-                        volume: None,
-                    }];
-                    heos::enrich(&mut ps);
-                    let p = &ps[0];
-                    println!(
-                        "live:    {} ({}) state={} vol={}",
-                        p.name,
-                        p.ip,
-                        p.state.as_deref().unwrap_or("?"),
-                        p.volume.map(|v| format!("{v}%")).unwrap_or("?".into())
-                    );
-                }
-                None => println!("live:    no speaker found"),
+            let cfg2 = cfg.clone();
+            let snap = with_deadline(5, move || now_snapshot(&cfg2)).unwrap_or_else(|| now_snapshot_cached(&cfg));
+            let name = snap.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            let ip = snap.get("ip").and_then(|x| x.as_str()).unwrap_or("");
+            let state = snap.get("state").and_then(|x| x.as_str()).unwrap_or("?");
+            let vol = snap
+                .get("vol")
+                .and_then(|x| x.as_i64())
+                .map(|v| format!("{v}%"))
+                .unwrap_or_else(|| "?".into());
+            let stale = snap.get("stale").and_then(|x| x.as_bool()).unwrap_or(false);
+            if name.is_empty() {
+                println!("live:    no speaker found");
+            } else if stale {
+                println!("live:    {name} ({ip}) unreachable (cached) vol={vol}");
+            } else {
+                println!("live:    {name} ({ip}) state={state} vol={vol}");
             }
+            println!("{}", crate::stream::health_line());
             0
         }
         Some(AudioCmd::Output { value }) => match value {
@@ -767,11 +1032,8 @@ fn cmd_audio(sub: Option<AudioCmd>) -> i32 {
                     let mut ps = vec![heos::HeosPlayer {
                         name: tgt.2.clone(),
                         pid: tgt.1,
-                        model: String::new(),
                         ip: tgt.0.clone(),
-                        network: String::new(),
-                        state: None,
-                        volume: None,
+                        ..Default::default()
                     }];
                     heos::enrich(&mut ps);
                     println!(
@@ -782,15 +1044,20 @@ fn cmd_audio(sub: Option<AudioCmd>) -> i32 {
                     0
                 }
                 Some(v) => {
-                    let lvl: i32 = match v.trim().trim_end_matches('%').parse() {
-                        Ok(n) => n,
-                        Err(_) => {
-                            eprintln!("volume must be 0-100");
-                            return 1;
-                        }
+                    let mut ps = vec![heos::HeosPlayer {
+                        name: tgt.2.clone(),
+                        pid: tgt.1,
+                        ip: tgt.0.clone(),
+                        ..Default::default()
+                    }];
+                    heos::enrich(&mut ps);
+                    let cur = ps[0].volume.unwrap_or(0);
+                    let Some(lvl) = heos::parse_vol_arg(&v, cur) else {
+                        eprintln!("volume must be 0-100 or +N/-N");
+                        return 1;
                     };
-                    if heos::set_volume(&tgt.0, tgt.1, lvl) {
-                        println!("{} volume → {}%", tgt.2, lvl.clamp(0, 100));
+                    if heos::apply_volume(&tgt.0, tgt.1, lvl, crate::stream::following()) {
+                        println!("{} volume → {}%", tgt.2, lvl);
                         0
                     } else {
                         eprintln!("volume failed");
@@ -803,6 +1070,8 @@ fn cmd_audio(sub: Option<AudioCmd>) -> i32 {
             let cfg = SirenConfig::load();
             cmd_speaker_queue(&cfg, &args)
         },
+        Some(AudioCmd::Probe { json }) => cmd_audio_probe(json),
+        Some(AudioCmd::Follow { action }) => cmd_audio_follow(&cfg, &action),
         Some(AudioCmd::Test) => {
             // now-playing → queue top → library top
             let pick = {
@@ -1326,44 +1595,9 @@ fn main() -> Result<()> {
             }
         },
         Some(Cmd::Play { query }) => cmd_play(&cfg, &query),
-        Some(Cmd::Pause) => {
-            if use_heos(&cfg) {
-                match heos_target(&cfg, None) {
-                    Some(t) => {
-                        let to = heos::toggle(&t.0, t.1);
-                        println!("{} → {to}", t.2);
-                        0
-                    }
-                    None => {
-                        eprintln!("no speaker found");
-                        1
-                    }
-                }
-            } else {
-                queue::cmd_pause();
-                println!("Playback paused / resumed");
-                0
-            }
-        }
-        Some(Cmd::Stop) => {
-            if use_heos(&cfg) {
-                match heos_target(&cfg, None) {
-                    Some(t) => {
-                        heos::set_state(&t.0, t.1, "stop");
-                        println!("{} stopped", t.2);
-                        0
-                    }
-                    None => {
-                        eprintln!("no speaker found");
-                        1
-                    }
-                }
-            } else {
-                queue::cmd_stop();
-                println!("Playback stopped");
-                0
-            }
-        }
+        Some(Cmd::Pause) => cmd_pause(&cfg),
+        Some(Cmd::Stop) => cmd_stop(&cfg),
+        Some(Cmd::Seek { arg }) => cmd_seek(&cfg, &arg),
         Some(Cmd::Next) => {
             if use_heos(&cfg) {
                 match heos_target(&cfg, None) {
@@ -1410,84 +1644,10 @@ fn main() -> Result<()> {
             } else if cached {
                 cmd_now_cached(json)
             } else {
-            if use_heos(&cfg) {
-                match heos_target(&cfg, None) {
-                    Some(t) => {
-                        let mut ps = vec![heos::HeosPlayer {
-                            name: t.2.clone(),
-                            pid: t.1,
-                            model: String::new(),
-                            ip: t.0.clone(),
-                            network: String::new(),
-                            state: None,
-                            volume: None,
-                        }];
-                        heos::enrich(&mut ps);
-                        let p = &ps[0];
-                        println!(
-                            "{} — {}, {}",
-                            p.name,
-                            p.state.as_deref().unwrap_or("?"),
-                            p.volume.map(|v| format!("{v}%")).unwrap_or("?".into())
-                        );
-                        0
-                    }
-                    None => {
-                        eprintln!("no speaker found");
-                        1
-                    }
-                }
-            } else {
-                let label = queue::now_label();
-                if label.is_empty() {
-                    println!("Not playing");
-                } else {
-                    println!("{label}");
-                }
-                0
-            }
+                cmd_now_live(&cfg, json)
             }
         }
-        Some(Cmd::Status) => {
-            if use_heos(&cfg) {
-                match heos_target(&cfg, None) {
-                    Some(t) => {
-                        let mut ps = vec![heos::HeosPlayer {
-                            name: t.2.clone(),
-                            pid: t.1,
-                            model: String::new(),
-                            ip: t.0.clone(),
-                            network: String::new(),
-                            state: None,
-                            volume: None,
-                        }];
-                        heos::enrich(&mut ps);
-                        let p = &ps[0];
-                        println!("status: {}", p.state.as_deref().unwrap_or("?"));
-                        println!("speaker: {} ({})", p.name, p.ip);
-                        println!(
-                            "vol:    {}",
-                            p.volume.map(|v| format!("{v}%")).unwrap_or("?".into())
-                        );
-                        0
-                    }
-                    None => {
-                        eprintln!("no speaker found");
-                        1
-                    }
-                }
-            } else if !player::alive() {
-                let lib = library::scan_library(&cfg);
-                println!("status: idle (no mpv)");
-                println!("library tracks: {}", lib.len());
-                0
-            } else {
-                for line in queue::status_lines(&cfg) {
-                    println!("{line}");
-                }
-                0
-            }
-        }
+        Some(Cmd::Status) => cmd_status(&cfg),
         Some(Cmd::Random) => {
             let lib = library::scan_library(&cfg);
             if lib.is_empty() {
@@ -1633,5 +1793,78 @@ mod deadline_tests {
             std::thread::sleep(std::time::Duration::from_secs(2));
         });
         assert!(start.elapsed().as_secs() < 2, "caller must not wait for the worker");
+    }
+
+    #[test]
+    fn follow_on_fail_closed_when_not_on_lan() {
+        let src = std::fs::read_to_string("src/main.rs").expect("main.rs");
+        let start = src.find("fn cmd_audio_follow").expect("cmd_audio_follow");
+        let end = src[start..]
+            .find("\nfn cmd_audio(")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            body.contains("heos::run_probe()"),
+            "follow on must probe before feeding Cave"
+        );
+        assert!(
+            body.contains("ProbeVerdict::NotOnLan"),
+            "not-on-lan must fail closed"
+        );
+        assert!(
+            body.contains("leaving"),
+            "not-on-lan message names the sink we leave alone"
+        );
+        assert!(
+            !body.contains("follow_on") || body.find("NotOnLan").unwrap() < body.rfind("follow_on").unwrap(),
+            "NotOnLan check must run before follow_on"
+        );
+        assert!(body.contains("wait_while_encoder"), "follow run waits on encoder");
+        assert!(body.contains("\"run\""), "systemd ExecStart is follow run");
+    }
+
+    #[test]
+    fn cmd_audio_prints_follow_health() {
+        let src = std::fs::read_to_string("src/main.rs").expect("main.rs");
+        let start = src.find("fn cmd_audio(").expect("cmd_audio");
+        let end = src[start..]
+            .find("\nfn cmd_speaker_queue")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(body.contains("health_line"), "siren audio names encoder/ESTAB/UPnP");
+        assert!(src.contains("mark_follow_want_stop"), "stop on wav does not reclaim");
+        let st = src.find("fn cmd_status").expect("cmd_status");
+        let st_end = src[st..]
+            .find("\nfn print_heos_status")
+            .or_else(|| src[st..].find("\nfn cmd_"))
+            .map(|i| st + i)
+            .unwrap_or(src.len());
+        // cmd_status sits before print_heos_status in older trees; live
+        // tree has print_heos_status first. Slice the function by next fn.
+        let st_body = &src[st..st_end.min(st + 800)];
+        assert!(
+            st_body.contains("following()"),
+            "siren status uses Cave UPnP while follow is on"
+        );
+    }
+
+    #[test]
+    fn stale_heos_snap_names_the_speaker() {
+        let p = crate::heos::HeosPlayer {
+            name: "Vanguarda Office".into(),
+            ip: "192.168.8.184".into(),
+            ..Default::default()
+        };
+        let v = super::heos_snap(&p, true);
+        assert_eq!(v["name"], "Vanguarda Office");
+        assert_eq!(v["ip"], "192.168.8.184");
+        assert_eq!(v["stale"], true);
+        assert!(
+            v["label"].as_str().unwrap().contains("Vanguarda Office"),
+            "label={}",
+            v["label"]
+        );
     }
 }

@@ -1,0 +1,57 @@
+#!/bin/bash
+# Speaker-LAN NAT so Cave UPnP :60006 can reach DNS + WAN.
+# LAN is the box ethernet; WAN is the default-route iface (USB tether).
+# FORWARD rules are inserted at position 1 so they sit in front of UFW DROP.
+set -euo pipefail
+
+LAN_NET="${SIREN_LAN_NET:-192.168.11.0/24}"
+LAN_IFACE="${SIREN_LAN_IFACE:-enp39s0}"
+WAN="${SIREN_WAN_IFACE:-}"
+if [[ -z "$WAN" ]]; then
+  WAN="$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')"
+fi
+
+ensure_forward() {
+  iptables -C FORWARD "$@" 2>/dev/null && return 0
+  iptables -I FORWARD 1 "$@"
+}
+
+drop_forward() {
+  iptables -D FORWARD "$@" 2>/dev/null || true
+}
+
+ensure_nat() {
+  iptables -t nat -C POSTROUTING "$@" 2>/dev/null && return 0
+  iptables -t nat -A POSTROUTING "$@"
+}
+
+drop_nat() {
+  iptables -t nat -D POSTROUTING "$@" 2>/dev/null || true
+}
+
+cmd="${1:-start}"
+case "$cmd" in
+  start)
+    if [[ -z "$WAN" || "$WAN" == "$LAN_IFACE" ]]; then
+      echo "siren-heos-forward: no WAN iface distinct from ${LAN_IFACE} — skip NAT" >&2
+      exit 0
+    fi
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    ensure_nat -s "$LAN_NET" -o "$WAN" -j MASQUERADE
+    ensure_forward -s "$LAN_NET" -j ACCEPT
+    ensure_forward -d "$LAN_NET" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    echo "siren-heos-forward: ${LAN_NET} → ${WAN} (MASQUERADE, FORWARD before UFW)"
+    ;;
+  stop)
+    if [[ -n "$WAN" && "$WAN" != "$LAN_IFACE" ]]; then
+      drop_nat -s "$LAN_NET" -o "$WAN" -j MASQUERADE
+    fi
+    drop_forward -s "$LAN_NET" -j ACCEPT
+    drop_forward -d "$LAN_NET" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    echo "siren-heos-forward: NAT rules removed"
+    ;;
+  *)
+    echo "usage: siren-heos-forward start|stop" >&2
+    exit 2
+    ;;
+esac

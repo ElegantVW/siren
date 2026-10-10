@@ -13,7 +13,69 @@ use std::net::{TcpStream, UdpSocket};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-pub const DEFAULT_SPEAKER: &str = "Vanguarda Office";
+pub const DEFAULT_SPEAKER: &str = "Cave";
+pub const HEOS_CLI_PORT: u16 = 1255;
+/// Per-host TCP budget for the /24 scan. 64 workers × 254 hosts ≲ 2s.
+pub const SWEEP_MS: u64 = 350;
+pub const SWEEP_WORKERS: usize = 64;
+
+/// Worst-case wall time for a full /24 with SWEEP_WORKERS (ms).
+pub fn sweep_budget_ms() -> u64 {
+    let hosts = 254u64;
+    let w = SWEEP_WORKERS as u64;
+    hosts.div_ceil(w) * SWEEP_MS
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeVerdict {
+    Ok,
+    IpMoved,
+    NotOnLan,
+}
+
+impl ProbeVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::IpMoved => "ip-moved",
+            Self::NotOnLan => "not-on-lan",
+        }
+    }
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Ok => 0,
+            Self::NotOnLan => 1,
+            Self::IpMoved => 2,
+        }
+    }
+}
+
+/// Cached row + LAN 1255 hits → one of three honest verdicts.
+pub fn probe_verdict(cached_live: usize, lan_hits: usize) -> ProbeVerdict {
+    if cached_live > 0 {
+        ProbeVerdict::Ok
+    } else if lan_hits > 0 {
+        ProbeVerdict::IpMoved
+    } else {
+        ProbeVerdict::NotOnLan
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedRow {
+    pub name: String,
+    pub ip: String,
+    pub arp: bool,
+    pub cli: bool,
+    pub upnp: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProbeReport {
+    pub cached: Vec<CachedRow>,
+    pub lan_1255: Vec<String>,
+    pub verdict: ProbeVerdict,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct HeosPlayer {
@@ -24,6 +86,7 @@ pub struct HeosPlayer {
     pub network: String,
     pub state: Option<String>,
     pub volume: Option<i32>,
+    pub song: Option<String>,
 }
 
 
@@ -225,67 +288,89 @@ fn apply_msg(p: &mut HeosPlayer, objs: &[Value]) {
             if let Some(n) = pl.get("level").and_then(|x| x.as_i64()) {
                 p.volume = Some(n as i32);
             }
+            if let Some(s) = pl.get("song").and_then(|x| x.as_str()) {
+                if !s.is_empty() {
+                    p.song = Some(s.to_string());
+                }
+            }
         }
     }
 }
 
-pub fn roster() -> Vec<HeosPlayer> {
-    // any fleet member answers with the whole roster; try cached IP first
+pub fn parse_get_players(objs: &[Value], fallback_ip: &str) -> Vec<HeosPlayer> {
     let mut out = Vec::new();
-    for ip in sweep_known() {
-        for o in rpc(&ip, &["heos://player/get_players".into()]) {
-            if let Some(pl) = o.get("payload").and_then(|p| p.as_array()) {
-                for p in pl {
-                    out.push(HeosPlayer {
-                        name: p.get("name").and_then(|x| x.as_str()).unwrap_or("?").into(),
-                        pid: p.get("pid").and_then(|x| x.as_i64()).unwrap_or(0),
-                        model: p.get("model").and_then(|x| x.as_str()).unwrap_or("?").into(),
-                        ip: p.get("ip").and_then(|x| x.as_str()).unwrap_or(&ip).into(),
-                        network: p.get("network").and_then(|x| x.as_str()).unwrap_or("").into(),
-                        state: None,
-                        volume: None,
-                    });
-                }
-                if !out.is_empty() {
-                    return out;
-                }
+    for o in objs {
+        if let Some(pl) = o.get("payload").and_then(|p| p.as_array()) {
+            for p in pl {
+                out.push(HeosPlayer {
+                    name: p.get("name").and_then(|x| x.as_str()).unwrap_or("?").into(),
+                    pid: p.get("pid").and_then(|x| x.as_i64()).unwrap_or(0),
+                    model: p.get("model").and_then(|x| x.as_str()).unwrap_or("?").into(),
+                    ip: p.get("ip").and_then(|x| x.as_str()).unwrap_or(fallback_ip).into(),
+                    network: p.get("network").and_then(|x| x.as_str()).unwrap_or("").into(),
+                    state: None,
+                    volume: None,
+                    song: None,
+                });
+            }
+            if !out.is_empty() {
+                return out;
             }
         }
     }
     out
 }
 
-/// IPs to try before a full sweep: ether cache + last-known fleet.
+fn roster_from(ips: Vec<String>) -> Vec<HeosPlayer> {
+    // any fleet member answers with the whole roster
+    for ip in ips {
+        let objs = rpc(&ip, &["heos://player/get_players".into()]);
+        let out = parse_get_players(&objs, &ip);
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    Vec::new()
+}
+
+pub fn roster() -> Vec<HeosPlayer> {
+    // known IPs only — the /24 sweep belongs to refresh_roster (deadline-bounded)
+    roster_from(sweep_known())
+}
+
+fn push_unique(ips: &mut Vec<String>, ip: &str) {
+    if !ip.is_empty() && !ips.iter().any(|x| x == ip) {
+        ips.push(ip.to_string());
+    }
+}
+
+/// IPs to try before a full sweep: ether cache + last roster (any LAN).
+/// Shop 192.168.8.x is not a fallback — identity is not a cached IP.
 fn sweep_known() -> Vec<String> {
     let mut ips = Vec::new();
-    // ether's cache (written by `ether speakers`)
     if let Ok(raw) = std::fs::read_to_string(
-        std::env::var("HOME").map(|h| format!("{h}/.config/ether/heos.json")).unwrap_or_default(),
+        std::env::var("HOME")
+            .map(|h| format!("{h}/.config/ether/heos.json"))
+            .unwrap_or_default(),
     ) {
         if let Ok(v) = serde_json::from_str::<Value>(&raw) {
             if let Some(ps) = v.get("players").and_then(|p| p.as_array()) {
                 for p in ps {
                     if let Some(ip) = p.get("ip").and_then(|x| x.as_str()) {
-                        if !ips.contains(&ip.to_string()) {
-                            ips.push(ip.to_string());
-                        }
+                        push_unique(&mut ips, ip);
                     }
                 }
             }
         }
     }
-    for fallback in ["192.168.8.184", "192.168.8.185"] {
-        if !ips.contains(&fallback.to_string()) {
-            ips.push(fallback.into());
+    if let Some(ps) = read_roster_stale() {
+        for p in ps {
+            push_unique(&mut ips, &p.ip);
         }
     }
-    // verify each on 1255, then full sweep if none answer
-    let live: Vec<String> = ips.into_iter().filter(|ip| tcp_open(ip, 1255, 400)).collect();
-    if live.is_empty() {
-        sweep()
-    } else {
-        live
-    }
+    ips.into_iter()
+        .filter(|ip| tcp_open(ip, 1255, 400))
+        .collect()
 }
 
 fn tcp_open(ip: &str, port: u16, ms: u64) -> bool {
@@ -296,7 +381,166 @@ fn tcp_open(ip: &str, port: u16, ms: u64) -> bool {
     .is_ok()
 }
 
-pub fn local_ip() -> Option<String> {
+/// Parallel TCP connect. One SYN per addr, capped at SWEEP_WORKERS.
+pub fn parallel_open(addrs: &[(String, u16)], timeout_ms: u64) -> Vec<(String, u16)> {
+    if addrs.is_empty() {
+        return Vec::new();
+    }
+    let i = Mutex::new(0usize);
+    let found = Mutex::new(Vec::new());
+    let nworkers = SWEEP_WORKERS.min(addrs.len()).max(1);
+    std::thread::scope(|s| {
+        for _ in 0..nworkers {
+            s.spawn(|| {
+                loop {
+                    let idx = {
+                        let mut g = i.lock().unwrap();
+                        if *g >= addrs.len() {
+                            return;
+                        }
+                        let n = *g;
+                        *g += 1;
+                        n
+                    };
+                    let (host, port) = &addrs[idx];
+                    if tcp_open(host, *port, timeout_ms) {
+                        found.lock().unwrap().push((host.clone(), *port));
+                    }
+                }
+            });
+        }
+    });
+    let mut v = found.into_inner().unwrap();
+    v.sort();
+    v
+}
+
+/// /proc/net/arp flag 0x2 = complete (NUD_REACHABLE / STALE with a MAC).
+pub fn arp_flag_complete(flags: &str) -> bool {
+    let t = flags.trim().trim_start_matches("0x");
+    u32::from_str_radix(t, 16).unwrap_or(0) & 0x2 != 0
+}
+
+pub fn arp_complete(ip: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string("/proc/net/arp") else {
+        return false;
+    };
+    for line in raw.lines().skip(1) {
+        let mut cols = line.split_whitespace();
+        let addr = cols.next().unwrap_or("");
+        let _hwtype = cols.next();
+        let flags = cols.next().unwrap_or("0x0");
+        if addr == ip {
+            return arp_flag_complete(flags);
+        }
+    }
+    false
+}
+
+/// One IPv4 on a named iface (`ip -o -4 addr`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IfaceAddr {
+    pub name: String,
+    pub ip: String,
+    pub prefix: u8,
+    pub is_usb: bool,
+}
+
+fn skip_iface_name(name: &str) -> bool {
+    matches!(name, "lo" | "tailscale0" | "docker0")
+        || name.starts_with("veth")
+        || name.starts_with("br-")
+        || name.starts_with("virbr")
+        || name.starts_with("wg")
+}
+
+pub fn is_rfc1918(ip: &str) -> bool {
+    if ip.starts_with("10.") || ip.starts_with("192.168.") {
+        return true;
+    }
+    if let Some(rest) = ip.strip_prefix("172.") {
+        if let Some(oct) = rest.split('.').next() {
+            if let Ok(n) = oct.parse::<u8>() {
+                return (16..=31).contains(&n);
+            }
+        }
+    }
+    false
+}
+
+/// Parse `ip -o -4 addr show` lines.
+pub fn parse_ip_o_addr(text: &str) -> Vec<(String, String, u8)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 || parts[2] != "inet" {
+            continue;
+        }
+        let name = parts[1].trim_end_matches(':');
+        let Some((ip, pfx)) = parts[3].split_once('/') else {
+            continue;
+        };
+        let prefix: u8 = pfx.parse().unwrap_or(32);
+        out.push((name.to_string(), ip.to_string(), prefix));
+    }
+    out
+}
+
+pub fn iface_is_usb(name: &str) -> bool {
+    if name.to_ascii_lowercase().contains("usb") {
+        return true;
+    }
+    let sub = format!("/sys/class/net/{name}/device/subsystem");
+    std::fs::read_link(&sub)
+        .ok()
+        .and_then(|p| p.file_name().map(|s| s == "usb"))
+        .unwrap_or(false)
+}
+
+/// Speaker LAN: wired RFC1918 /24, not the USB tether, not the default-route src
+/// when another private iface exists. `prefer_iface` is `SIREN_LAN_IFACE`.
+pub fn pick_lan_ipv4(
+    ifaces: &[IfaceAddr],
+    default_src: Option<&str>,
+    prefer_iface: Option<&str>,
+) -> Option<String> {
+    let usable = |i: &IfaceAddr| {
+        !skip_iface_name(&i.name)
+            && is_rfc1918(&i.ip)
+            && (8..=24).contains(&i.prefix)
+            && !i.ip.starts_with("127.")
+            && !i.ip.starts_with("169.254.")
+            && !i.ip.starts_with("100.")
+    };
+    let wired: Vec<&IfaceAddr> = ifaces
+        .iter()
+        .filter(|i| usable(i) && !i.is_usb)
+        .collect();
+    let cands = if wired.is_empty() {
+        ifaces.iter().filter(|i| usable(i)).collect()
+    } else {
+        wired
+    };
+    if cands.is_empty() {
+        return None;
+    }
+    if let Some(want) = prefer_iface {
+        if let Some(i) = cands.iter().find(|i| i.name == want) {
+            return Some(i.ip.clone());
+        }
+    }
+    if let Some(i) = cands.iter().find(|i| i.name == "enp39s0") {
+        return Some(i.ip.clone());
+    }
+    if let Some(def) = default_src {
+        if let Some(i) = cands.iter().find(|i| i.ip != def) {
+            return Some(i.ip.clone());
+        }
+    }
+    Some(cands[0].ip.clone())
+}
+
+fn default_route_src() -> Option<String> {
     let s = UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("1.1.1.1:80").ok()?;
     let ip = s.local_addr().ok()?.ip().to_string();
@@ -305,6 +549,44 @@ pub fn local_ip() -> Option<String> {
     } else {
         Some(ip)
     }
+}
+
+fn list_ifaces() -> Vec<IfaceAddr> {
+    let out = std::process::Command::new("ip")
+        .args(["-o", "-4", "addr", "show"])
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    parse_ip_o_addr(&String::from_utf8_lossy(&out.stdout))
+        .into_iter()
+        .map(|(name, ip, prefix)| IfaceAddr {
+            is_usb: iface_is_usb(&name),
+            name,
+            ip,
+            prefix,
+        })
+        .collect()
+}
+
+/// Address speakers can reach (follow wav, /24 sweep). Never the USB
+/// tether when `enp39s0` (or another wired RFC1918 /24) is up.
+/// Override: `SIREN_LAN_IP` or `SIREN_LAN_IFACE`.
+pub fn local_ip() -> Option<String> {
+    if let Ok(ip) = std::env::var("SIREN_LAN_IP") {
+        let ip = ip.trim();
+        if !ip.is_empty() {
+            return Some(ip.to_string());
+        }
+    }
+    let prefer = std::env::var("SIREN_LAN_IFACE").ok();
+    let default_src = default_route_src();
+    pick_lan_ipv4(
+        &list_ifaces(),
+        default_src.as_deref(),
+        prefer.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()),
+    )
+    .or(default_src)
 }
 
 /// Parallel TCP/1255 sweep of the local /24 (unicast — SSDP is broken here).
@@ -317,27 +599,68 @@ pub fn sweep() -> Vec<String> {
         Some((b, _)) => b.to_string(),
         None => return Vec::new(),
     };
-    let found = std::sync::Mutex::new(Vec::new());
-    std::thread::scope(|s| {
-        for chunk in (1..255).collect::<Vec<_>>().chunks(64) {
-            let found = &found;
-            let base = base.clone();
-            let mine = local.clone();
-            let chunk: Vec<u8> = chunk.to_vec();
-            s.spawn(move || {
-                for n in chunk {
-                    let cand = format!("{base}.{n}");
-                    if cand == mine {
-                        continue;
-                    }
-                    if tcp_open(&cand, 1255, 600) {
-                        found.lock().unwrap().push(cand);
-                    }
-                }
-            });
+    let addrs: Vec<(String, u16)> = (1u8..255)
+        .filter_map(|n| {
+            let cand = format!("{base}.{n}");
+            if cand == local {
+                None
+            } else {
+                Some((cand, HEOS_CLI_PORT))
+            }
+        })
+        .collect();
+    parallel_open(&addrs, SWEEP_MS)
+        .into_iter()
+        .map(|(ip, _)| ip)
+        .collect()
+}
+
+/// Unpooled RPC to host:port — tests bind ephemeral ports; production uses :1255.
+pub fn rpc_at(host: &str, port: u16, uris: &[String]) -> Vec<Value> {
+    let s = TcpStream::connect_timeout(
+        &format!("{host}:{port}").parse().ok().unwrap_or_else(|| "0.0.0.0:80".parse().unwrap()),
+        Duration::from_secs(3),
+    );
+    let Ok(mut s) = s else {
+        return Vec::new();
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_millis(600)));
+    let _ = s.set_write_timeout(Some(Duration::from_secs(3)));
+    rpc_once_wait(&mut s, uris, 25).unwrap_or_default()
+}
+
+/// LAN doctor: cached IPs vs a fast /24 :1255 scan. `ip-moved` adopts the new roster.
+pub fn run_probe() -> ProbeReport {
+    let cached_ps = read_roster_stale().unwrap_or_default();
+    let mut cached = Vec::new();
+    let mut cached_live = 0usize;
+    for p in &cached_ps {
+        let cli = tcp_open(&p.ip, HEOS_CLI_PORT, SWEEP_MS);
+        let upnp = tcp_open(&p.ip, 60006, SWEEP_MS);
+        if cli {
+            cached_live += 1;
         }
-    });
-    found.into_inner().unwrap()
+        cached.push(CachedRow {
+            name: p.name.clone(),
+            ip: p.ip.clone(),
+            arp: arp_complete(&p.ip),
+            cli,
+            upnp,
+        });
+    }
+    let lan_1255 = sweep();
+    let verdict = probe_verdict(cached_live, lan_1255.len());
+    if verdict == ProbeVerdict::IpMoved {
+        let players = roster_from(lan_1255.clone());
+        if !players.is_empty() {
+            write_roster_cache(&players);
+        }
+    }
+    ProbeReport {
+        cached,
+        lan_1255,
+        verdict,
+    }
 }
 
 pub fn enrich(players: &mut [HeosPlayer]) {
@@ -354,6 +677,7 @@ pub fn enrich(players: &mut [HeosPlayer]) {
             &[
                 format!("heos://player/get_play_state?pid={}", p.pid),
                 format!("heos://player/get_volume?pid={}", p.pid),
+                format!("heos://player/get_now_playing_media?pid={}", p.pid),
             ],
         );
         apply_msg(p, &objs);
@@ -385,22 +709,54 @@ fn player_from_json(v: &Value) -> Option<HeosPlayer> {
         network: v.get("network").and_then(|x| x.as_str()).unwrap_or("").into(),
         state: None,
         volume: None,
+        song: None,
     })
 }
 
-pub fn read_roster_cache() -> Option<Vec<HeosPlayer>> {
+fn players_from_roster_file() -> Option<(Vec<HeosPlayer>, f64)> {
     let raw = std::fs::read_to_string(roster_cache_path()).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
     let ts = v.get("ts")?.as_f64()?;
-    if now_epoch() - ts > ROSTER_TTL {
-        return None;
-    }
     let arr = v.get("players")?.as_array()?;
     let ps: Vec<HeosPlayer> = arr.iter().filter_map(player_from_json).collect();
     if ps.is_empty() {
         return None;
     }
+    Some((ps, ts))
+}
+
+pub fn read_roster_cache() -> Option<Vec<HeosPlayer>> {
+    let (ps, ts) = players_from_roster_file()?;
+    if now_epoch() - ts > ROSTER_TTL {
+        return None;
+    }
     Some(ps)
+}
+
+/// Last-known fleet even after TTL. Status commands use this so a
+/// down speaker still has a name instead of a blank "unreachable".
+pub fn read_roster_stale() -> Option<Vec<HeosPlayer>> {
+    players_from_roster_file().map(|(ps, _)| ps)
+}
+
+/// Pick by name fragment / pid, else Cave, else first.
+/// `pick_named("Office")` still finds Office when it joins.
+pub fn pick_named<'a>(players: &'a [HeosPlayer], hint: &str) -> Option<&'a HeosPlayer> {
+    let lo = hint.to_lowercase();
+    let named = if lo.is_empty() {
+        None
+    } else {
+        players
+            .iter()
+            .find(|p| p.name.to_lowercase().contains(&lo) || p.pid.to_string() == lo)
+    };
+    named
+        .or_else(|| {
+            players
+                .iter()
+                .find(|p| p.name.to_lowercase().contains("cave"))
+        })
+        .or_else(|| players.first())
 }
 
 fn write_roster_cache(players: &[HeosPlayer]) {
@@ -421,47 +777,68 @@ fn write_roster_cache(players: &[HeosPlayer]) {
     if std::fs::write(&tmp, v.to_string()).is_ok() {
         let _ = std::fs::rename(&tmp, roster_cache_path());
     }
+    write_ether_cache(players);
+}
+
+/// Refresh Ether's HEOS file so `ether status` and sweep_known share one fleet.
+fn write_ether_cache(players: &[HeosPlayer]) {
+    if players.is_empty() {
+        return;
+    }
+    let path = std::env::var("HOME")
+        .map(|h| format!("{h}/.config/ether/heos.json"))
+        .unwrap_or_default();
+    if path.is_empty() {
+        return;
+    }
+    let arr: Vec<Value> = players
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.name, "pid": p.pid, "model": p.model,
+                "ip": p.ip, "network": p.network,
+            })
+        })
+        .collect();
+    let v = serde_json::json!({ "ts": now_epoch() as i64, "players": arr });
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, v.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// Live discovery + rewrite the cache (timer calls this; best effort).
+/// Known IPs first; /24 sweep only when those are silent.
 pub fn refresh_roster() {
-    let players = roster();
+    let mut players = roster();
+    if players.is_empty() {
+        players = roster_from(sweep());
+    }
     if !players.is_empty() {
         write_roster_cache(&players);
     }
 }
 
-/// Resolve a speaker by name fragment (default: Vanguarda Office).
+/// Resolve a speaker by name fragment (default: Cave).
 pub fn resolve(hint: Option<&str>) -> Option<(String, i64, HeosPlayer)> {
-    let mut players = read_roster_cache().unwrap_or_else(|| {
-        let live = roster();
-        if !live.is_empty() {
-            write_roster_cache(&live);
-        }
-        live
-    });
+    let players = read_roster_cache()
+        .or_else(read_roster_stale)
+        .unwrap_or_else(|| {
+            let live = roster();
+            if !live.is_empty() {
+                write_roster_cache(&live);
+            }
+            live
+        });
     if players.is_empty() {
         return None;
     }
-    let pick = |players: &[HeosPlayer]| -> Option<HeosPlayer> {
-        if let Some(h) = hint {
-            let lo = h.to_lowercase();
-            players
-                .iter()
-                .find(|p| {
-                    p.name.to_lowercase().contains(&lo) || p.pid.to_string() == lo
-                })
-                .cloned()
-        } else {
-            players
-                .iter()
-                .find(|p| p.name.to_lowercase().contains("vanguarda"))
-                .or_else(|| players.first())
-                .cloned()
-        }
-    };
-    pick(&players).map(|p| {
-        let mut v = vec![p.clone()];
+    let h = hint.unwrap_or(DEFAULT_SPEAKER);
+    pick_named(&players, h).cloned().map(|p| {
+        let mut v = vec![p];
         enrich(&mut v);
         let e = v.into_iter().next().unwrap();
         (e.ip.clone(), e.pid, e)
@@ -827,10 +1204,43 @@ pub fn play_url(ip: &str, pid: i64, url: &str) -> bool {
     ))
 }
 
-/// HEAD a stream URL to check it's alive before telling the speaker
-/// to play it. Returns true on HTTP 200 with an audio content-type
-/// (or any 2xx when the server hides its type). Fast (3s timeout) —
-/// a dead URL fails here instead of silently "playing" on the speaker.
+fn http_looks_alive(head: &str) -> bool {
+    let h = head.to_lowercase();
+    h.contains(" 200")
+        || h.contains(" 206")
+        || h.contains(" 301")
+        || h.contains(" 302")
+        || h.contains("audio/")
+        || h.contains("mpegurl")
+        || h.contains("x-mpegurl")
+}
+
+fn http_no_retry(head: &str) -> bool {
+    let h = head.to_lowercase();
+    h.contains(" 404") || h.contains(" 410") || h.contains(" 401")
+}
+
+fn http_exchange(host: &str, port: u16, req: &str) -> String {
+    use std::io::{Read, Write};
+    let mut s = match std::net::TcpStream::connect_timeout(
+        &format!("{host}:{port}").parse().ok().unwrap_or_else(|| "0.0.0.0:80".parse().unwrap()),
+        std::time::Duration::from_secs(3),
+    ) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    if s.write_all(req.as_bytes()).is_err() {
+        return String::new();
+    }
+    let mut buf = [0u8; 1024];
+    let n = s.read(&mut buf).unwrap_or(0);
+    String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+/// Probe a stream URL before telling the speaker to play it.
+/// HEAD first; Icecast/Shoutcast often 400/405 HEAD while GET 200
+/// (OXIGÉNIO 102.6 is that shape). 404/410/401 on HEAD stay dead.
 pub fn url_alive(url: &str) -> bool {
     // HTTPS: no TLS in std, so we cannot check. Assume alive and let
     // `confirm_play` decide — it catches every failure mode except a
@@ -839,36 +1249,24 @@ pub fn url_alive(url: &str) -> bool {
     if url.starts_with("https://") {
         return true;
     }
-    use std::io::{Read, Write};
-    // minimal HTTP client over TcpStream: parse host, port, path
     let (host, port, path) = match parse_http_url(url) {
         Some(t) => t,
         None => return false,
     };
-    let mut s = match std::net::TcpStream::connect_timeout(
-        &format!("{host}:{port}").parse().ok().unwrap_or_else(|| "0.0.0.0:80".parse().unwrap()),
-        std::time::Duration::from_secs(3),
-    ) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
-    let req = format!("HEAD {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: siren\r\n\r\n");
-    if s.write_all(req.as_bytes()).is_err() {
+    let head_req = format!(
+        "HEAD {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: siren\r\nConnection: close\r\n\r\n"
+    );
+    let head = http_exchange(&host, port, &head_req);
+    if http_looks_alive(&head) {
+        return true;
+    }
+    if http_no_retry(&head) {
         return false;
     }
-    let mut buf = [0u8; 1024];
-    let n = s.read(&mut buf).unwrap_or(0);
-    let head = String::from_utf8_lossy(&buf[..n]).to_lowercase();
-    // accept 200 outright; also accept 206/301/302 (relays, redirects)
-    // and audio content-types even on odd statuses
-    head.contains(" 200")
-        || head.contains(" 206")
-        || head.contains(" 301")
-        || head.contains(" 302")
-        || head.contains("audio/")
-        || head.contains("mpegurl")
-        || head.contains("x-mpegurl")
+    let get_req = format!(
+        "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: siren\r\nConnection: close\r\n\r\n"
+    );
+    http_looks_alive(&http_exchange(&host, port, &get_req))
 }
 
 /// Split http(s)://host[:port][/path] into parts. HTTPS treated as
@@ -1031,6 +1429,39 @@ pub fn ungroup(ip: &str, leader: i64) -> bool {
     ))
 }
 
+/// `+10` / `-10` / `26` / `26%` against a current level.
+pub fn parse_vol_arg(arg: &str, current: i32) -> Option<i32> {
+    let a = arg.trim().trim_end_matches('%').trim();
+    if a.is_empty() {
+        return None;
+    }
+    if a.starts_with('+') || a.starts_with('-') {
+        let d: i32 = a.parse().ok()?;
+        return Some((current + d).clamp(0, 100));
+    }
+    let n: i32 = a.parse().ok()?;
+    Some(n.clamp(0, 100))
+}
+
+/// Group id for a player, if it sits in a group.
+pub fn gid_for_player(groups: &[HeosGroup], pid: i64) -> Option<i64> {
+    groups
+        .iter()
+        .find(|g| g.gid == pid || g.players.iter().any(|p| p.pid == pid))
+        .map(|g| g.gid)
+}
+
+/// Following → group volume when grouped, else player volume.
+pub fn apply_volume(ip: &str, pid: i64, level: i32, following: bool) -> bool {
+    let level = level.clamp(0, 100);
+    if following {
+        if let Some(gid) = gid_for_player(&get_groups(ip), pid) {
+            return group_set_volume(ip, gid, level);
+        }
+    }
+    set_volume(ip, pid, level)
+}
+
 /// Group volume (0-100). Applies to every member.
 pub fn group_set_volume(ip: &str, gid: i64, level: i32) -> bool {
     let level = level.clamp(0, 100);
@@ -1139,7 +1570,7 @@ pub fn dlna_cast(ip: &str, pid: i64, path: &std::path::Path, aid: i64) -> Result
         sid = find_dlna_sid(ip);
     }
     let sid = sid.ok_or_else(|| {
-        "DLNA VANGUARDA-DLNA not found — is minidlna on 192.168.8.186:8200 running?".to_string()
+        "DLNA VANGUARDA-DLNA not found — is minidlna on :8200 running?".to_string()
     })?;
     // Fresh files (downloads, transcodes) may not be indexed yet — the
     // rescan nudge above can't signal root's minidlnad, so poll a while.
@@ -1300,6 +1731,355 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].name, "Late");
     }
+
+    fn office() -> HeosPlayer {
+        HeosPlayer {
+            name: "Vanguarda Office".into(),
+            pid: -105329903,
+            model: "HEOS 1".into(),
+            ip: "192.168.8.184".into(),
+            network: "wifi".into(),
+            state: None,
+            volume: None,
+            song: None,
+        }
+    }
+
+    #[test]
+    fn pick_named_matches_speaker_hint() {
+        let cave = HeosPlayer { name: "Cave".into(), pid: 1, ip: "192.168.8.185".into(), ..HeosPlayer::default() };
+        let ps = vec![cave, office()];
+        assert_eq!(pick_named(&ps, "Office").unwrap().ip, "192.168.8.184");
+        assert_eq!(pick_named(&ps, "cave").unwrap().name, "Cave");
+    }
+
+    #[test]
+    fn pick_named_defaults_to_cave() {
+        let ps = vec![
+            office(),
+            HeosPlayer { name: "Cave".into(), ..HeosPlayer::default() },
+        ];
+        assert_eq!(pick_named(&ps, "").unwrap().name, "Cave");
+        assert_eq!(pick_named(&ps, "Office").unwrap().name, "Vanguarda Office");
+        let office_only = vec![office()];
+        assert_eq!(pick_named(&office_only, "").unwrap().name, "Vanguarda Office");
+    }
+
+    #[test]
+    fn write_roster_refreshes_ether_cache() {
+        let src = std::fs::read_to_string("src/heos.rs").expect("heos.rs");
+        let start = src.find("fn write_roster_cache").expect("write_roster_cache");
+        let end = src[start..]
+            .find("\n/// Live discovery")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(body.contains("write_ether_cache"), "live roster updates Ether");
+        assert!(src.contains(".config/ether/heos.json"), "Ether file path");
+    }
+
+    #[test]
+    fn http_looks_alive_accepts_200_and_audio() {
+        assert!(http_looks_alive("HTTP/1.0 200 OK\r\n"));
+        assert!(http_looks_alive("HTTP/1.1 200 ok\r\ncontent-type: audio/aac"));
+        assert!(http_looks_alive("icy-name: x\r\ncontent-type: audio/mpeg"));
+        assert!(!http_looks_alive("HTTP/1.0 400 Bad Request\r\n"));
+        assert!(!http_looks_alive("HTTP/1.0 404 Not Found\r\n"));
+    }
+
+    #[test]
+    fn http_no_retry_on_404() {
+        assert!(http_no_retry("HTTP/1.0 404 Not Found\r\n"));
+        assert!(!http_no_retry("HTTP/1.0 400 Bad Request\r\n"));
+    }
+
+    #[test]
+    fn sweep_budget_fits_refresh_deadline() {
+        assert!(
+            sweep_budget_ms() < 4000,
+            "sweep budget {}ms must fit in the 5s now --refresh deadline",
+            sweep_budget_ms()
+        );
+    }
+
+    #[test]
+    fn probe_verdict_table() {
+        assert_eq!(probe_verdict(1, 0), ProbeVerdict::Ok);
+        assert_eq!(probe_verdict(1, 3), ProbeVerdict::Ok);
+        assert_eq!(probe_verdict(0, 1), ProbeVerdict::IpMoved);
+        assert_eq!(probe_verdict(0, 0), ProbeVerdict::NotOnLan);
+        assert_eq!(ProbeVerdict::Ok.exit_code(), 0);
+        assert_eq!(ProbeVerdict::NotOnLan.exit_code(), 1);
+        assert_eq!(ProbeVerdict::IpMoved.exit_code(), 2);
+        assert_eq!(ProbeVerdict::NotOnLan.as_str(), "not-on-lan");
+    }
+
+    fn dual_home() -> Vec<IfaceAddr> {
+        vec![
+            IfaceAddr {
+                name: "enp39s0".into(),
+                ip: "192.168.11.125".into(),
+                prefix: 24,
+                is_usb: false,
+            },
+            IfaceAddr {
+                name: "enp49s0f3u1".into(),
+                ip: "192.168.48.49".into(),
+                prefix: 24,
+                is_usb: true,
+            },
+            IfaceAddr {
+                name: "lo".into(),
+                ip: "127.0.0.1".into(),
+                prefix: 8,
+                is_usb: false,
+            },
+            IfaceAddr {
+                name: "tailscale0".into(),
+                ip: "100.80.90.117".into(),
+                prefix: 32,
+                is_usb: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn pick_lan_prefers_wired_over_usb_tether() {
+        let ip = pick_lan_ipv4(&dual_home(), Some("192.168.48.49"), None);
+        assert_eq!(ip.as_deref(), Some("192.168.11.125"));
+    }
+
+    #[test]
+    fn pick_lan_usb_only_falls_back_to_tether() {
+        let only = vec![IfaceAddr {
+            name: "enp49s0f3u1".into(),
+            ip: "192.168.48.49".into(),
+            prefix: 24,
+            is_usb: true,
+        }];
+        assert_eq!(
+            pick_lan_ipv4(&only, Some("192.168.48.49"), None).as_deref(),
+            Some("192.168.48.49")
+        );
+    }
+
+    #[test]
+    fn pick_lan_honor_prefer_iface() {
+        let ip = pick_lan_ipv4(&dual_home(), Some("192.168.48.49"), Some("enp39s0"));
+        assert_eq!(ip.as_deref(), Some("192.168.11.125"));
+    }
+
+    #[test]
+    fn parse_ip_o_addr_reads_prefix() {
+        let text = "\
+2: enp39s0    inet 192.168.11.125/24 metric 100 brd 192.168.11.255 scope global dynamic enp39s0
+6: enp49s0f3u1    inet 192.168.48.49/24 metric 100 scope global dynamic enp49s0f3u1
+";
+        let v = parse_ip_o_addr(text);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0], ("enp39s0".into(), "192.168.11.125".into(), 24));
+        assert_eq!(v[1], ("enp49s0f3u1".into(), "192.168.48.49".into(), 24));
+    }
+
+    #[test]
+    fn rfc1918_table() {
+        assert!(is_rfc1918("192.168.11.125"));
+        assert!(is_rfc1918("10.0.0.1"));
+        assert!(is_rfc1918("172.16.0.1"));
+        assert!(is_rfc1918("172.31.255.1"));
+        assert!(!is_rfc1918("172.15.0.1"));
+        assert!(!is_rfc1918("8.8.8.8"));
+        assert!(!is_rfc1918("100.80.90.117"));
+    }
+
+    #[test]
+    fn sweep_known_has_no_shop_ip_fallback() {
+        let src = std::fs::read_to_string("src/heos.rs").expect("heos.rs");
+        let start = src.find("fn sweep_known").expect("sweep_known");
+        let end = src[start..]
+            .find("\nfn tcp_open")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            !body.contains("192.168.8.187") && !body.contains("192.168.8.192"),
+            "shop IPs are last-known roster, not hardcoded fallbacks"
+        );
+        assert!(body.contains("read_roster_stale"), "try last roster on any LAN");
+    }
+
+    #[test]
+    fn tui_dlna_probe_is_loopback() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("tui.rs");
+        assert!(
+            !src.contains("192.168.8.186"),
+            "TUI must not pin shop IP for minidlna"
+        );
+        assert!(src.contains("127.0.0.1:8200"), "DLNA liveness is local :8200");
+    }
+
+    #[test]
+    fn arp_flag_complete_parses_proc_net_arp() {
+        assert!(arp_flag_complete("0x2"));
+        assert!(arp_flag_complete("0x6"));
+        assert!(!arp_flag_complete("0x0"));
+        assert!(!arp_flag_complete("0x1"));
+    }
+
+    #[test]
+    fn parse_get_players_reads_payload() {
+        let objs = vec![json!({
+            "heos": {"command": "player/get_players", "result": "success", "message": ""},
+            "payload": [{
+                "name": "Cave", "pid": 258957015, "ip": "192.168.8.185",
+                "model": "HEOS 5", "network": "wifi"
+            }]
+        })];
+        let ps = parse_get_players(&objs, "127.0.0.1");
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].name, "Cave");
+        assert_eq!(ps[0].ip, "192.168.8.185");
+        assert_eq!(ps[0].pid, 258957015);
+    }
+
+    #[test]
+    fn parallel_open_finds_listeners() {
+        use std::net::TcpListener;
+        let a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let pa = a.local_addr().unwrap().port();
+        let pb = b.local_addr().unwrap().port();
+        let addrs = vec![
+            ("127.0.0.1".into(), pa),
+            ("127.0.0.1".into(), pb),
+            ("127.0.0.1".into(), 1),
+        ];
+        let found = parallel_open(&addrs, 200);
+        let ports: Vec<u16> = found.iter().map(|(_, p)| *p).collect();
+        assert!(ports.contains(&pa), "missing {pa} in {ports:?}");
+        assert!(ports.contains(&pb), "missing {pb} in {ports:?}");
+        assert!(!ports.contains(&1));
+    }
+
+    #[test]
+    fn rpc_at_mock_get_players() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = s.read(&mut buf);
+                let body = concat!(
+                    r#"{"heos":{"command":"player/get_players","result":"success","message":""},"payload":[{"name":"Cave","pid":1,"ip":"192.168.8.185","model":"HEOS 5","network":"wifi"}]}"#,
+                    "\r\n"
+                );
+                let _ = s.write_all(body.as_bytes());
+            }
+        });
+        thread::sleep(std::time::Duration::from_millis(30));
+        let objs = rpc_at("127.0.0.1", port, &["heos://player/get_players".into()]);
+        let ps = parse_get_players(&objs, "127.0.0.1");
+        assert_eq!(ps.len(), 1, "objs={objs:?}");
+        assert_eq!(ps[0].name, "Cave");
+    }
+
+    #[test]
+    fn parse_vol_arg_relative_and_absolute() {
+        assert_eq!(parse_vol_arg("+10", 26), Some(36));
+        assert_eq!(parse_vol_arg("-10", 26), Some(16));
+        assert_eq!(parse_vol_arg("-40", 26), Some(0));
+        assert_eq!(parse_vol_arg("+90", 26), Some(100));
+        assert_eq!(parse_vol_arg("38", 0), Some(38));
+        assert_eq!(parse_vol_arg("38%", 0), Some(38));
+        assert_eq!(parse_vol_arg("nope", 26), None);
+        assert_eq!(parse_vol_arg("", 26), None);
+    }
+
+    #[test]
+    fn gid_for_player_matches_leader_or_member() {
+        let g = HeosGroup {
+            name: "Office + Cave".into(),
+            gid: -105329903,
+            players: vec![
+                GroupPlayer { name: "Office".into(), pid: -105329903, role: "leader".into() },
+                GroupPlayer { name: "Cave".into(), pid: 258957015, role: "member".into() },
+            ],
+        };
+        assert_eq!(gid_for_player(&[g.clone()], -105329903), Some(-105329903));
+        assert_eq!(gid_for_player(&[g.clone()], 258957015), Some(-105329903));
+        assert_eq!(gid_for_player(&[g], 1), None);
+    }
+}
+
+#[cfg(test)]
+mod url_alive_tests {
+    use super::url_alive;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    fn spawn_head400_get200() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let mut data = Vec::new();
+                let mut buf = [0u8; 512];
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            data.extend_from_slice(&buf[..n]);
+                            if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let req = String::from_utf8_lossy(&data);
+                let body = if req.starts_with("HEAD") {
+                    "HTTP/1.0 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                } else {
+                    "HTTP/1.0 200 OK\r\nConnection: close\r\nContent-Type: audio/aac\r\n\r\nxxxx"
+                };
+                let _ = s.write_all(body.as_bytes());
+            }
+        });
+        thread::sleep(Duration::from_millis(30));
+        port
+    }
+
+    fn spawn_head404() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let mut buf = [0u8; 512];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.0 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        thread::sleep(Duration::from_millis(30));
+        port
+    }
+
+    #[test]
+    fn icecast_head400_get200_is_alive() {
+        // OXIGÉNIO shape: HEAD 400, GET 200
+        let port = spawn_head400_get200();
+        assert!(url_alive(&format!("http://127.0.0.1:{port}/oxigenio_aac")));
+    }
+
+    #[test]
+    fn head_404_stays_dead() {
+        let port = spawn_head404();
+        assert!(!url_alive(&format!("http://127.0.0.1:{port}/missing")));
+    }
 }
 
 #[cfg(test)]
@@ -1316,7 +2096,23 @@ mod url_alive_live_tests {
 
     #[test]
     #[ignore]
-    fn dead_evspt_is_dead() {
-        assert!(!url_alive("http://proic1.evspt.com/oxigenio_aac"));
+    fn live_oxigenio_get_is_alive() {
+        // HEAD 400, GET 200 — url_alive must retry GET
+        assert!(url_alive("http://proic1.evspt.com/oxigenio_aac"));
+    }
+}
+
+#[cfg(test)]
+mod live_lan_tests {
+    /// Speakers powered ≠ HEOS CLI on this ethernet LAN.
+    /// `cargo test -- --ignored` when Office/Cave should answer :1255 here.
+    #[test]
+    #[ignore]
+    fn live_lan_has_heos_cli() {
+        let hits = super::sweep();
+        assert!(
+            !hits.is_empty(),
+            "no HEOS CLI (:1255) on the LAN — AP isolation, guest WiFi, or WiFi sleep. hits={hits:?}"
+        );
     }
 }

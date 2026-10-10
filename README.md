@@ -100,7 +100,7 @@ calls and everything except that music. Follow pins mpv to
 `Siren_Master`; the encoder captures `Siren_Master.monitor`, serves
 WAV/L16 on `:8899/siren.wav`, UPnP to Cave. `follow off` unpins mpv and
 leaves the headset default. Login unit `siren-follow.service` runs
-`follow on`. `now` labels follow as **Siren Follow** (UPnP, not CLI
+`follow run` (stays up with the encoder). `now` labels follow as **Siren Follow** (UPnP, not CLI)
 `unknown`). Seek is skipped on the live wav. Volume keys move HEOS
 group volume. Queue `s` shuffles. `p` / ← → are global pause and seek.
 

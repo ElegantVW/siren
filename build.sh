@@ -19,6 +19,10 @@ if [[ "${1:-}" == "install" ]]; then
   mkdir -p "$LIB" "$HOME/bin"
   cp -f "$BIN" "$LIB/siren"
   chmod +x "$LIB/siren"
+  if [[ -f "$ROOT/scripts/siren-stream" ]]; then
+    cp -f "$ROOT/scripts/siren-stream" "$LIB/siren-stream"
+    chmod +x "$LIB/siren-stream"
+  fi
 
   install_launcher() {
     local dest="$1"
@@ -28,9 +32,6 @@ if [[ "${1:-}" == "install" ]]; then
   }
 
   install_launcher "$HOME/bin/siren"
-  if [[ -d "$HOME/faeOS/bin" ]]; then
-    echo "note: ~/faeOS/bin/siren is the archived python player — not overwritten."
-  fi
 
   if [[ -w /usr/local/bin ]] || sudo -n true 2>/dev/null; then
     if [[ -w /usr/local/bin ]]; then
@@ -42,6 +43,21 @@ if [[ "${1:-}" == "install" ]]; then
     fi
   else
     echo "note: once for sudo PATH: sudo install -m 755 $WRAP_SRC /usr/local/bin/siren"
+  fi
+
+  UNIT_SRC="$ROOT/systemd/siren-follow.service"
+  UNIT_DST="$HOME/.config/systemd/user/siren-follow.service"
+  if [[ -f "$UNIT_SRC" ]]; then
+    mkdir -p "$HOME/.config/systemd/user"
+    cp -f "$UNIT_SRC" "$UNIT_DST"
+    systemctl --user daemon-reload
+    systemctl --user enable siren-follow.service
+    # restart re-runs ExecStart; start is a no-op if RemainAfterExit is already active
+    if systemctl --user restart siren-follow.service; then
+      echo "user unit       → $UNIT_DST (enabled, started)"
+    else
+      echo "user unit       → $UNIT_DST (enabled; start failed — speakers off?)"
+    fi
   fi
 
   echo "installed engine → $LIB/siren"

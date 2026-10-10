@@ -55,7 +55,7 @@ fn d_output() -> String {
     "local".into()
 }
 fn d_speaker() -> String {
-    "Vanguarda Office".into()
+    "Cave".into()
 }
 
 impl Default for SirenConfig {

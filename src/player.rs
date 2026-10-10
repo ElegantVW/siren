@@ -35,7 +35,7 @@ pub fn spawn(cfg: &SirenConfig) -> bool {
             "--idle=yes",
             "--no-video",
             "--audio-display=no",
-            "--gapless-audio=yes",
+            &format!("--gapless-audio={gapless}"),
             "--volume-max=150",
             &format!("--input-ipc-server={sock}"),
         ])
@@ -59,7 +59,6 @@ pub fn spawn(cfg: &SirenConfig) -> bool {
     }
     std::thread::sleep(Duration::from_millis(150));
     apply_runtime_prefs(cfg);
-    let _ = gapless;
     true
 }
 
@@ -72,7 +71,23 @@ pub fn apply_runtime_prefs(cfg: &SirenConfig) {
     ]));
     if alive() {
         send(&json!(["set_property", "volume", cfg.default_volume]));
+        let follow = std::env::var("HOME")
+            .ok()
+            .map(|h| std::path::PathBuf::from(format!("{h}/.cache/siren/follow.json")))
+            .filter(|p| p.is_file())
+            .is_some();
+        apply_follow_route(follow);
     }
+}
+
+/// Pin mpv to Siren_Master (follow music → Cave) or `auto` (headset default).
+pub fn apply_follow_route(on: bool) {
+    let dev = if on {
+        "pulse/Siren_Master"
+    } else {
+        "auto"
+    };
+    let _ = send(&json!(["set_property", "audio-device", dev]));
 }
 
 /// Send one command. True on any reply (mirrors `Player.send`).
@@ -149,4 +164,110 @@ pub fn now_path() -> String {
         return stripped.to_string();
     }
     p
+}
+
+/// Seconds from `90`, `1:30`, or `00:01:30`.
+pub fn parse_time_token(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.contains(':') {
+        let parts: Vec<&str> = s.split(':').collect();
+        match parts.as_slice() {
+            [m, sec] => {
+                let m: f64 = m.parse().ok()?;
+                let sec: f64 = sec.parse().ok()?;
+                Some(m * 60.0 + sec)
+            }
+            [h, m, sec] => {
+                let h: f64 = h.parse().ok()?;
+                let m: f64 = m.parse().ok()?;
+                let sec: f64 = sec.parse().ok()?;
+                Some(h * 3600.0 + m * 60.0 + sec)
+            }
+            _ => None,
+        }
+    } else {
+        s.parse().ok()
+    }
+}
+
+pub fn fmt_rel_time(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+/// `+5` / `-5` / `30%` / `1:30` / `90` → absolute seconds.
+pub fn parse_seek(arg: &str, pos: f64, dur: f64) -> Option<f64> {
+    let a = arg.trim();
+    if a.is_empty() {
+        return None;
+    }
+    let clamp = |x: f64| {
+        if dur > 0.0 {
+            x.clamp(0.0, dur)
+        } else {
+            x.max(0.0)
+        }
+    };
+    if let Some(rest) = a.strip_suffix('%') {
+        let pct: f64 = rest.trim().parse().ok()?;
+        if dur > 0.0 {
+            return Some((dur * pct / 100.0).clamp(0.0, dur));
+        }
+        return Some(0.0);
+    }
+    if let Some(rest) = a.strip_prefix('+') {
+        return Some(clamp(pos + parse_time_token(rest)?));
+    }
+    if let Some(rest) = a.strip_prefix('-') {
+        return Some(clamp(pos - parse_time_token(rest)?));
+    }
+    Some(clamp(parse_time_token(a)?))
+}
+
+pub fn apply_local_seek(arg: &str) -> Result<String, String> {
+    let pos = get_f64("time-pos");
+    let dur = get_f64("duration");
+    let next = parse_seek(arg, pos, dur).ok_or_else(|| "bad seek".to_string())?;
+    if send(&serde_json::json!(["set_property", "time-pos", next])) {
+        Ok(format!("seek {}", fmt_rel_time(next)))
+    } else {
+        Err("seek failed".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_time_token_seconds_and_clock() {
+        assert_eq!(parse_time_token("90"), Some(90.0));
+        assert_eq!(parse_time_token("1:30"), Some(90.0));
+        assert_eq!(parse_time_token("00:01:30"), Some(90.0));
+        assert_eq!(parse_time_token(""), None);
+        assert_eq!(parse_time_token("nope"), None);
+    }
+
+    #[test]
+    fn parse_seek_relative_percent_absolute() {
+        assert_eq!(parse_seek("+5", 10.0, 100.0), Some(15.0));
+        assert_eq!(parse_seek("-5", 10.0, 100.0), Some(5.0));
+        assert_eq!(parse_seek("-20", 10.0, 100.0), Some(0.0));
+        assert_eq!(parse_seek("+20", 90.0, 100.0), Some(100.0));
+        assert_eq!(parse_seek("30%", 0.0, 100.0), Some(30.0));
+        assert_eq!(parse_seek("1:30", 0.0, 200.0), Some(90.0));
+        assert_eq!(parse_seek("90", 0.0, 200.0), Some(90.0));
+        assert_eq!(parse_seek("+5", 10.0, 0.0), Some(15.0));
+        assert_eq!(parse_seek("", 0.0, 10.0), None);
+    }
+
+    #[test]
+    fn fmt_rel_time_pads() {
+        assert_eq!(fmt_rel_time(0.0), "00:00:00");
+        assert_eq!(fmt_rel_time(90.0), "00:01:30");
+        assert_eq!(fmt_rel_time(3661.0), "01:01:01");
+    }
 }

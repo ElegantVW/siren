@@ -58,7 +58,7 @@ fn tunein_find(ip: &str, title: &str) -> Option<heos::TuneinHit> {
             }
         }
     }
-    let mut pool: Vec<crate::radio::Station> = hits
+    let pool: Vec<crate::radio::Station> = hits
         .iter()
         .map(|h| crate::radio::Station {
             uuid: String::new(),
@@ -150,9 +150,8 @@ pub fn play_from(cfg: &SirenConfig, index: usize) -> Result<String, String> {
             slice[0].display.clone()
         };
         // 1. Try the favorite's own URL first — but only if it's
-        // alive. The old code threw the URL away and searched TuneIn
-        // by name. Dead URLs are skipped here (fast HEAD check) so
-        // the speaker never gets a 404 to "play" silently.
+        // alive. Icecast often 400s HEAD while GET 200; url_alive
+        // retries GET. Dead URLs skip so the speaker never "plays" a 404.
         if heos::url_alive(&url) {
             play_log(&format!("direct: {url} -> {ip} pid={pid}"));
             if heos::play_url(&ip, pid, &url) && heos::confirm_play_url(&ip, &url, 4) {

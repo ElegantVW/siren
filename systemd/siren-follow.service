@@ -1,0 +1,12 @@
+[Unit]
+Description=Siren follow: PC audio → HEOS
+After=pipewire.service pipewire-pulse.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/bin/siren audio follow run
+ExecStop=%h/bin/siren audio follow off
+
+[Install]
+WantedBy=default.target

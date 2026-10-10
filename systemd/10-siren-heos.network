@@ -1,0 +1,15 @@
+# Speaker LAN on the box ethernet jack. USB tether keeps the default
+# route. Lexicographic name beats 20-ethernet.network for enp39s0 only.
+# 169.254.200.1 stays so AutoIP Cave is reachable while it DISCOVERs.
+# networkd DHCPServer bound :67 and logged STARTED, but never OFFERed
+# Cave's DISCOVER (sniffed). siren-heos-dhcpd.service owns the lease.
+[Match]
+Name=enp39s0
+
+[Network]
+DHCP=no
+Address=192.168.11.1/24
+Address=169.254.200.1/16
+DHCPServer=no
+IPv6AcceptRA=no
+LinkLocalAddressing=ipv6

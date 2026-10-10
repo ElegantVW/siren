@@ -1,5 +1,5 @@
-//! Two-box TUI (Option A): top = content view, bottom = focused view's menu.
-//! Tab cycles browser → queue → waves → audio. Waves stays on top.
+//! Two-box TUI: top = content view, bottom = focused view's menu.
+//! Tab cycles browser → queue → audio → trove → radio → viz.
 //! Playback stays mpv-over-IPC; audio view + `c` drive the HEOS speaker.
 
 use crate::{config::SirenConfig, heos, library, player, playlist, queue, radio};
@@ -51,8 +51,8 @@ impl View {
     fn menu(&self) -> &'static str {
         match self {
             View::Browser => "enter open/play · a add · c cast · backspace up · / filter · S save · L load · R rm",
-            View::Queue => "enter play-from · d remove · C clear",
-            View::Audio => "o output · S speaker · j/k src · m mute · -/+ vol · g group · W stream",
+            View::Queue => "enter play-from · d remove · C clear · s shuffle",
+            View::Audio => "o local/heos · S speaker · W follow · j/k src · m mute · +/- vol · g group",
             View::Trove => "s search · enter vers · D dl · j/k · M more · A all · F format",
             View::Radio => "enter play · C country · s search · f fav · A add url · M more · j/k",
             View::Viz => "t toggle h/v · V cycle zoom · tab cycle · q quit",
@@ -175,6 +175,7 @@ struct RadioState {
 /// never block on these (pactl alone takes 233-477ms per call).
 struct BackgroundPoll {
     stream_up: bool,
+    stream_follow: bool,
     stream_master: bool,
     stream_clients: usize,
     viz_on: bool,
@@ -217,6 +218,7 @@ struct App {
     stream_port: u16,
     stream_msg: String,
     stream_up: bool,
+    stream_follow: bool,
     stream_master: bool,
     stream_clients: usize,
     viz_on: bool,
@@ -327,6 +329,7 @@ impl App {
             stream_port: crate::stream::DEFAULT_PORT,
             stream_msg: String::new(),
             stream_up: false,
+            stream_follow: false,
             stream_master: false,
             stream_clients: 0,
             viz_on: false,
@@ -537,7 +540,8 @@ impl App {
         self.bg_rx = Some(rx);
         std::thread::spawn(move || {
             let mut p = BackgroundPoll {
-                stream_up: crate::stream::running(),
+                stream_up: crate::stream::encoder_alive(),
+                stream_follow: crate::stream::following(),
                 stream_master: false,
                 stream_clients: 0,
                 viz_on: crate::viz::running(),
@@ -546,7 +550,7 @@ impl App {
             };
             // each of these costs ~250-500ms (pactl) — that is why
             // they live here and not in the draw path
-            if crate::stream::running() {
+            if crate::stream::encoder_alive() {
                 p.stream_master = crate::stream::master_is_default();
                 p.stream_clients = crate::stream::master_clients();
             }
@@ -568,6 +572,7 @@ impl App {
             match rx.try_recv() {
                 Ok(p) => {
                     self.stream_up = p.stream_up;
+                    self.stream_follow = p.stream_follow;
                     self.stream_master = p.stream_master;
                     self.stream_clients = p.stream_clients;
                     self.viz_on = p.viz_on;
@@ -643,7 +648,7 @@ impl App {
                 let mut roster = heos::roster();
                 heos::enrich(&mut roster);
                 let dlna_ok = std::net::TcpStream::connect_timeout(
-                    &"192.168.8.186:8200".parse().unwrap(),
+                    &"127.0.0.1:8200".parse().unwrap(),
                     Duration::from_millis(400),
                 )
                 .is_ok();
@@ -662,25 +667,19 @@ impl App {
     }
 
     fn adjust_volume(&mut self, delta: i64) {
-        if self.is_heos() {
+        if crate::stream::following() || self.is_heos() {
             if let Some((ip, pid, name)) = self.speaker_target() {
-                let cur = heos::rpc(&ip, &[format!("heos://player/get_volume?pid={pid}")]);
-                let mut lvl = 20;
-                for o in &cur {
-                    let msg = o.get("heos").and_then(|h| h.get("message")).and_then(|m| m.as_str()).unwrap_or("");
-                    for kv in msg.split('&') {
-                        if let Some((k, v)) = kv.split_once('=') {
-                            if k == "level" {
-                                if let Ok(n) = v.parse() {
-                                    lvl = n;
-                                }
-                            }
-                        }
-                    }
-                }
-                let next = (lvl + delta as i32).clamp(0, 100);
-                if heos::set_volume(&ip, pid, next) {
-                    patch_roster(self, None, Some(next)); // optimistic
+                let cur = self
+                    .audio
+                    .roster
+                    .iter()
+                    .find(|p| p.pid == pid)
+                    .and_then(|p| p.volume)
+                    .unwrap_or(20);
+                let next = (cur + delta as i32).clamp(0, 100);
+                if heos::apply_volume(&ip, pid, next, crate::stream::following()) {
+                    patch_roster(self, None, Some(next));
+                    self.group_volume = next;
                     self.say(format!("{name} volume → {next}%"));
                 } else {
                     self.say("volume failed");
@@ -761,9 +760,8 @@ pub fn run() -> anyhow::Result<()> {
 
     let mut app = App::new();
     app.poll_mpv();
-    // auto-start the live stream: every client lands in Siren_Master,
-    // we encode it and feed the HEOS group. Stopped on exit below.
-    if !crate::stream::running() {
+    // encoder for viz + follow; W (follow_on) is what feeds HEOS.
+    if !crate::stream::encoder_alive() {
         if crate::stream::start(app.stream_port) {
             app.stream_msg = format!("stream live on :{}", app.stream_port);
         } else {
@@ -774,7 +772,10 @@ pub fn run() -> anyhow::Result<()> {
     crate::viz::start(&crate::stream::capture_source());
     app.viz_on = crate::viz::running();
     let res = event_loop(&mut terminal, &mut app);
-    crate::stream::stop();
+    // Leave the sound-card feed up if follow is on (systemd / CLI).
+    if !crate::stream::following() {
+        crate::stream::stop();
+    }
 
     disable_raw_mode()?;
     if mouse_on {
@@ -900,6 +901,20 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
         }
         KeyCode::Char('b') => {
             transport_prev(app);
+            return false;
+        }
+        KeyCode::Char('p') => {
+            mpv_toggle_pause(app);
+            return false;
+        }
+        KeyCode::Left => {
+            let arg = if mods.contains(KeyModifiers::SHIFT) { "-30" } else { "-5" };
+            do_seek(app, arg);
+            return false;
+        }
+        KeyCode::Right => {
+            let arg = if mods.contains(KeyModifiers::SHIFT) { "+30" } else { "+5" };
+            do_seek(app, arg);
             return false;
         }
         KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -2101,6 +2116,7 @@ fn handle_queue(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
             queue::maybe_resync_queue();
             app.say("Queue cleared.");
         }
+        KeyCode::Char('s') => toggle_shuffle(app),
         KeyCode::Char('S') => {
             app.input = Some(InputMode::SavePl);
             app.input_buf.clear();
@@ -2118,6 +2134,16 @@ fn handle_queue(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
 }
 
 fn mpv_toggle_pause(app: &mut App) {
+    if crate::stream::following() {
+        if let Some(ip) = crate::stream::follow_speaker_ip().or_else(|| app.speaker_target().map(|t| t.0)) {
+            let to = crate::stream::toggle_follow_pause(&ip);
+            patch_roster(app, Some(to), None);
+            app.say(format!("follow → {to}"));
+        } else {
+            app.say("no speaker found");
+        }
+        return;
+    }
     if app.is_heos() {
         if let Some((ip, pid, name)) = app.speaker_target() {
             let to = heos::toggle(&ip, pid);
@@ -2129,6 +2155,22 @@ fn mpv_toggle_pause(app: &mut App) {
     } else {
         player::send(&serde_json::json!(["cycle", "pause"]));
     }
+}
+
+fn do_seek(app: &mut App, arg: &str) {
+    if crate::stream::following() {
+        app.say("seek skipped (live stream)");
+        return;
+    }
+    let msg = if app.is_heos() {
+        match app.speaker_target() {
+            Some((ip, _, _)) => crate::stream::apply_heos_seek(&ip, arg).unwrap_or_else(|e| e),
+            None => "no speaker found".into(),
+        }
+    } else {
+        player::apply_local_seek(arg).unwrap_or_else(|e| e)
+    };
+    app.say(msg);
 }
 
 /// Transport following `audio_output` (shared by global keys).
@@ -2153,9 +2195,8 @@ fn transport_prev(app: &mut App) {
 }
 
 fn toggle_shuffle(app: &mut App) {
-    let cur = player::get_bool("shuffle", false);
-    player::send(&serde_json::json!(["set_property", "shuffle", !cur]));
-    app.say(format!("shuffle {}", if !cur { "on" } else { "off" }));
+    queue::shuffle_queue();
+    app.say("queue shuffled");
 }
 
 fn cycle_repeat(app: &mut App) {
@@ -2211,7 +2252,6 @@ fn patch_roster(app: &mut App, state: Option<&str>, vol: Option<i32>) {
 fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
     match code {
         KeyCode::Char('p') | KeyCode::Char(' ') => mpv_toggle_pause(app),
-        KeyCode::Char('S') => toggle_shuffle(app),
         KeyCode::Char('r') => cycle_repeat(app),
         KeyCode::Char('o') => {
             app.cfg.audio_output = if app.is_heos() { "local".into() } else { "heos".into() };
@@ -2328,32 +2368,24 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
             }
         }
         KeyCode::Char('W') => {
-            // start/stop the live stream: encoder+server, then feed group leader
-            if crate::stream::running() {
-                crate::stream::stop();
-                app.stream_msg = "stream stopped".into();
-                app.say("stream stopped");
-            } else if !crate::stream::start(app.stream_port) {
-                app.stream_msg = "stream failed to start".into();
-                app.say("stream failed to start");
+            if crate::stream::following() {
+                crate::stream::follow_off(true);
+                app.stream_msg = "follow off".into();
+                app.say("follow off");
             } else {
-                let url = match crate::heos::local_ip() {
-                    Some(ip) => crate::stream::url(&ip, app.stream_port),
-                    None => format!("http://127.0.0.1:{}/siren.mp3", app.stream_port),
-                };
                 match app.speaker_target() {
                     Some((sip, _, name)) => {
-                        if crate::stream::play_stream(&sip, &url) {
-                            app.stream_msg = format!("streaming → {name}");
-                            app.say(format!("streaming → {name}"));
+                        if crate::stream::follow_on(app.stream_port, &sip) {
+                            app.stream_msg = format!("follow → {name}");
+                            app.say(format!("follow → {name}"));
                         } else {
-                            app.stream_msg = "stream up, feed failed".into();
-                            app.say("stream up, feed failed");
+                            app.stream_msg = "follow failed".into();
+                            app.say("follow failed");
                         }
                     }
                     None => {
-                        app.stream_msg = format!("stream up at {url} (no speaker)");
-                        app.say("stream up (no speaker to feed)");
+                        app.stream_msg = "follow: no speaker".into();
+                        app.say("follow: no speaker");
                     }
                 }
             }
@@ -2496,15 +2528,19 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         Line::from(Span::raw("")),
     ];
 
-    // global keys
+    // global keys — must match handle_key, not the wish-list
     lines.push(Line::from(Span::styled("  global", Style::default().fg(silver).add_modifier(Modifier::BOLD))));
     for (k, d) in [
         ("tab / shift+tab", "cycle views"),
-        ("j / k  or  ↑ / ↓", "navigate"),
+        ("j / k  or  ↑ / ↓", "navigate (in the focused view)"),
         ("enter", "open / play / activate"),
+        ("n / b", "next / previous"),
+        ("p", "pause / resume"),
+        ("← / →", "seek ±5s (shift ±30s)"),
+        ("+ / -", "volume (HEOS while following)"),
         ("h", "this help"),
         ("q", "quit"),
-        ("esc", "cancel / back"),
+        ("esc", "quit (closes a picker first)"),
     ] {
         lines.push(Line::from(vec![
             Span::raw("    "),
@@ -2530,22 +2566,21 @@ fn draw_help(f: &mut Frame, app: &mut App) {
             ("enter", "play from cursor"),
             ("d", "remove from queue"),
             ("C", "clear queue"),
+            ("s", "shuffle queue"),
         ]),
         View::Audio => ("audio", &[
-            ("o", "toggle output local/heos"),
+            ("o", "local = mpv (radio rides follow); heos = Cave fetches"),
             ("S", "cycle speaker"),
+            ("W", "Siren music → Cave; headset stays analog"),
             ("r", "cycle repeat"),
-            ("p / space", "pause/resume"),
             ("v", "refresh speakers"),
             ("t", "test cast"),
-            ("m", "mute source (or speaker if none)"),
-            ("j / k", "select source"),
-            ("- / +", "source volume"),
+            ("m", "mute mixer source (or speaker if none)"),
+            ("j / k", "select mixer source"),
             ("g", "group all speakers"),
             ("u", "ungroup"),
             ("G", "group mute toggle"),
-            (" ,  .", "group volume -/+"),
-            ("W", "start/stop live stream → group"),
+            (",  .", "group volume -/+"),
         ]),
         View::Trove => ("trove", &[
             ("s", "search"),
@@ -2866,7 +2901,7 @@ fn waves_lines(app: &App) -> Vec<Line<'static>> {
     let accent = Color::Rgb(142, 196, 200);
     let ok = Color::Rgb(61, 214, 140);
     let dim = Color::Rgb(138, 138, 150);
-    let silver = Color::Rgb(192, 192, 200);
+    let _silver = Color::Rgb(192, 192, 200);
 
     if app.is_heos() {
         match speaker_entry(app) {
@@ -3191,6 +3226,7 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         let up = app.stream_up;
         let master = app.stream_master;
         let n = app.stream_clients;
+        let follow = app.stream_follow;
         lines.push(Line::from(vec![
             Span::raw("  stream  "),
             Span::styled(
@@ -3198,11 +3234,12 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 Style::default().fg(if up { Color::Rgb(61, 214, 140) } else { Color::Rgb(138, 138, 150) }).add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                "   master:{}  clients:{}",
+                "   master:{}  clients:{}  follow:{}",
                 if master { "default" } else { "NOT default" },
                 n,
+                if follow { "on" } else { "off" },
             )),
-            Span::styled("   (W start/stop)", Style::default().fg(Color::Rgb(138, 138, 150))),
+            Span::styled("   (W follow)", Style::default().fg(Color::Rgb(138, 138, 150))),
         ]));
         if !app.stream_msg.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -3370,7 +3407,7 @@ mod viz_key_tests {
     }
 
     #[test]
-    fn V_cycles_zoom_1_2_3() {
+    fn v_cycles_zoom_1_2_3() {
         let mut app = viz_app();
         assert_eq!(app.viz_zoom, 1);
         handle_viz(&mut app, KeyCode::Char('V'), KeyModifiers::NONE);
@@ -3504,6 +3541,26 @@ mod no_blocking_tests {
         }
     }
 
+    /// Leaving the TUI must not tear down the systemd sound-card feed.
+    #[test]
+    fn tui_exit_leaves_follow_up() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("read tui.rs");
+        let start = src.find("let res = event_loop").expect("event_loop return");
+        let end = src[start..]
+            .find("disable_raw_mode")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            body.contains("crate::stream::following()"),
+            "TUI exit must check following() before stop"
+        );
+        assert!(
+            body.contains("if !crate::stream::following()"),
+            "stop only when follow is off"
+        );
+    }
+
     /// poll_stream must be a pure harvest — no I/O at all.
     #[test]
     fn poll_stream_is_pure_harvest() {
@@ -3514,5 +3571,74 @@ mod no_blocking_tests {
         for bad in ["Command::new", "list_inputs", "master_", "get_groups", "list short"] {
             assert!(!body.contains(bad), "poll_stream must not call {bad}");
         }
+    }
+
+    #[test]
+    fn seek_and_shuffle_are_bound() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("tui.rs");
+        assert!(src.contains("KeyCode::Left"), "← seek");
+        assert!(src.contains("KeyCode::Right"), "→ seek");
+        assert!(src.contains("do_seek"), "shared seek helper");
+        assert!(src.contains("seek skipped (live stream)"));
+        let q = src.find("fn handle_queue").expect("handle_queue");
+        let q_end = src[q..]
+            .find("\nfn mpv_toggle_pause")
+            .map(|i| q + i)
+            .unwrap_or(src.len());
+        assert!(
+            src[q..q_end].contains("toggle_shuffle"),
+            "queue view s shuffles"
+        );
+        let p = src.find("fn mpv_toggle_pause").expect("pause");
+        let p_end = src[p..]
+            .find("\nfn do_seek")
+            .map(|i| p + i)
+            .unwrap_or(src.len());
+        assert!(
+            src[p..p_end].contains("toggle_follow_pause"),
+            "follow pause is UPnP"
+        );
+        let v = src.find("fn adjust_volume").expect("vol");
+        let v_end = src[v..]
+            .find("\n    fn cast_path")
+            .map(|i| v + i)
+            .unwrap_or(src.len());
+        assert!(
+            src[v..v_end].contains("apply_volume"),
+            "TUI vol uses group law when following"
+        );
+    }
+
+    #[test]
+    fn help_overlay_matches_global_keys() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("tui.rs");
+        let start = src.find("fn draw_help").expect("draw_help");
+        let end = src[start..]
+            .find("\nfn draw(")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(body.contains("n / b"), "help lists next/prev");
+        assert!(body.contains("+ / -"), "help lists global volume");
+        assert!(
+            body.contains("Siren music → Cave; headset stays analog"),
+            "W is music-only follow"
+        );
+        assert!(
+            !body.contains("speakers as PC output"),
+            "old steal-the-default copy"
+        );
+        assert!(
+            !body.contains("source volume"),
+            "mixer +/- never reach handle_audio"
+        );
+        assert!(
+            body.contains("quit (closes a picker first)"),
+            "Esc quits when no picker"
+        );
+        assert!(
+            src.contains("o local/heos · S speaker · W follow · j/k src · m mute · +/- vol · g group"),
+            "audio menu: +/- is global volume, W is follow"
+        );
     }
 }

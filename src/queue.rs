@@ -634,6 +634,78 @@ pub fn cli_add_path(path: &str, prepend: bool) {
 }
 
 /// Quiet clear (playlist load path — no resync, no print).
+/// Shuffle the persisted queue in place (Fisher-Yates). Resyncs mpv
+/// if this process is driving it. Does not recast a live HEOS URI.
+pub fn shuffle_queue() {
+    {
+        let mut q = queue();
+        shuffle_in_place(&mut q.items);
+    }
+    save_queue();
+    maybe_resync_queue();
+}
+
 pub fn cli_clear_quiet() {
     queue().clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(path: &str) -> QueueItem {
+        QueueItem {
+            path: path.into(),
+            display: String::new(),
+            title: String::new(),
+            artist: String::new(),
+            duration: 0.0,
+        }
+    }
+
+    #[test]
+    fn validate_keeps_http_urls() {
+        let mut q = Queue {
+            items: vec![
+                item("http://proic1.evspt.com/oxigenio_aac"),
+                item("https://stream-icy.bauermedia.pt/cidade.mp3"),
+                item("/no/such/siren-track.mp3"),
+            ],
+        };
+        let removed = q.validate();
+        assert_eq!(q.items.len(), 2, "URLs must survive validate");
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].0.path.ends_with("siren-track.mp3"));
+    }
+
+    #[test]
+    fn validate_keeps_existing_files() {
+        let cargo = std::env::current_dir()
+            .unwrap()
+            .join("Cargo.toml")
+            .to_string_lossy()
+            .into_owned();
+        let mut q = Queue {
+            items: vec![item(&cargo), item("/definitely/missing/x.mp3")],
+        };
+        let removed = q.validate();
+        assert_eq!(q.items.len(), 1);
+        assert_eq!(removed.len(), 1);
+    }
+
+    #[test]
+    fn shuffle_in_place_is_a_permutation() {
+        let mut v: Vec<i32> = (0..16).collect();
+        let orig = v.clone();
+        shuffle_in_place(&mut v);
+        let mut a = orig.clone();
+        a.sort();
+        let mut b = v.clone();
+        b.sort();
+        assert_eq!(a, b);
+        shuffle_in_place(&mut v);
+        let mut c = v.clone();
+        c.sort();
+        assert_eq!(a, c);
+    }
 }
