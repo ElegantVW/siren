@@ -117,12 +117,11 @@ fn play_log(msg: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if let Some(home) = std::env::var("HOME").ok() {
-        let path = format!("{home}/.cache/siren/play.log");
-        let _ = std::fs::create_dir_all(format!("{home}/.cache/siren"));
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(f, "[{ts}] {msg}");
-        }
+    let dir = crate::paths::cache_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("play.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{ts}] {msg}");
     }
 }
 

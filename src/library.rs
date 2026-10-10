@@ -13,12 +13,7 @@ pub const AUDIO_EXT: &[&str] = &[
 ];
 
 fn expand_home(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-        PathBuf::from(home).join(rest)
-    } else {
-        PathBuf::from(p)
-    }
+    crate::paths::expand_home(p)
 }
 
 pub fn library_roots(cfg: &SirenConfig) -> Vec<PathBuf> {

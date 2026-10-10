@@ -348,11 +348,7 @@ fn push_unique(ips: &mut Vec<String>, ip: &str) {
 /// Shop 192.168.8.x is not a fallback — identity is not a cached IP.
 fn sweep_known() -> Vec<String> {
     let mut ips = Vec::new();
-    if let Ok(raw) = std::fs::read_to_string(
-        std::env::var("HOME")
-            .map(|h| format!("{h}/.config/ether/heos.json"))
-            .unwrap_or_default(),
-    ) {
+    if let Ok(raw) = std::fs::read_to_string(crate::paths::ether_heos()) {
         if let Ok(v) = serde_json::from_str::<Value>(&raw) {
             if let Some(ps) = v.get("players").and_then(|p| p.as_array()) {
                 for p in ps {
@@ -689,8 +685,7 @@ pub fn enrich(players: &mut [HeosPlayer]) {
 const ROSTER_TTL: f64 = 120.0;
 
 fn roster_cache_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    std::path::PathBuf::from(format!("{home}/.cache/siren/heos-roster.json"))
+    crate::paths::join_cache("heos-roster.json")
 }
 
 fn now_epoch() -> f64 {
@@ -785,12 +780,11 @@ fn write_ether_cache(players: &[HeosPlayer]) {
     if players.is_empty() {
         return;
     }
-    let path = std::env::var("HOME")
-        .map(|h| format!("{h}/.config/ether/heos.json"))
-        .unwrap_or_default();
-    if path.is_empty() {
+    let path = crate::paths::ether_heos();
+    if path.as_os_str().is_empty() {
         return;
     }
+    let path = path.to_string_lossy().into_owned();
     let arr: Vec<Value> = players
         .iter()
         .map(|p| {
@@ -1079,8 +1073,7 @@ fn dlna_find(ip: &str, sid: i64, target: &std::path::Path) -> Option<(String, St
 /// Record a cast for the TUI's elapsed-time clock (firmware gives no
 /// position API). Readers (TUI strip) interpolate from this.
 pub fn note_cast(path: &std::path::Path) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let dir = format!("{home}/.cache/siren");
+    let dir = crate::paths::cache_dir();
     let _ = std::fs::create_dir_all(&dir);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1090,7 +1083,7 @@ pub fn note_cast(path: &std::path::Path) {
         "path": path.to_string_lossy(),
         "ts": now,
     });
-    let _ = std::fs::write(format!("{dir}/heos-now.json"), v.to_string());
+    let _ = std::fs::write(dir.join("heos-now.json"), v.to_string());
 }
 
 /// A TuneIn station hit (search `scid=4`): `mid` plays via
@@ -1486,8 +1479,7 @@ pub fn group_set_state(ip: &str, leader: i64, state: &str) -> bool {
 
 /// Record a radio play for the elapsed clock + now displays.
 pub fn note_radio(url: &str, title: &str) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let dir = format!("{home}/.cache/siren");
+    let dir = crate::paths::cache_dir();
     let _ = std::fs::create_dir_all(&dir);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1498,21 +1490,19 @@ pub fn note_radio(url: &str, title: &str) {
         "title": title,
         "ts": now,
     });
-    let _ = std::fs::write(format!("{dir}/heos-now.json"), v.to_string());
+    let _ = std::fs::write(dir.join("heos-now.json"), v.to_string());
 }
 
 /// Station title for the current radio play, if any.
 pub fn last_radio_title() -> Option<String> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let raw = std::fs::read_to_string(format!("{home}/.cache/siren/heos-now.json")).ok()?;
+    let raw = std::fs::read_to_string(crate::paths::join_cache("heos-now.json")).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
     v.get("title").and_then(|t| t.as_str()).map(|s| s.to_string())
 }
 
 /// Last cast recorded by any siren (CLI or TUI): (path, epoch secs).
 pub fn last_cast() -> Option<(std::path::PathBuf, f64)> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let raw = std::fs::read_to_string(format!("{home}/.cache/siren/heos-now.json")).ok()?;
+    let raw = std::fs::read_to_string(crate::paths::join_cache("heos-now.json")).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
     let p = v.get("path")?.as_str()?;
     let ts = v.get("ts")?.as_f64()?;
@@ -1541,9 +1531,10 @@ pub fn dlna_cast_many(ip: &str, pid: i64, paths: &[std::path::PathBuf]) -> (usiz
 /// file isn't already served (~/Music and /tmp/dlna are minidlna roots).
 /// `aid`: 1 play-now (default), 2 play-next, 3 add-to-end, 4 replace-and-play.
 pub fn dlna_cast(ip: &str, pid: i64, path: &std::path::Path, aid: i64) -> Result<(), String> {
-    let served = ["/tmp/dlna", &format!("{}/Music", std::env::var("HOME").unwrap_or_default())];
+    let music = crate::paths::music_dir().to_string_lossy().into_owned();
+    let served = ["/tmp/dlna".to_string(), music];
     let abs = path.to_string_lossy().into_owned();
-    let in_dlna = served.iter().any(|d| abs.starts_with(d));
+    let in_dlna = served.iter().any(|d| abs.starts_with(d.as_str()));
     let target: std::path::PathBuf;
     if in_dlna {
         target = path.to_path_buf();

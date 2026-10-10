@@ -35,8 +35,7 @@ fn pending() -> std::sync::MutexGuard<'static, HashSet<String>> {
 }
 
 fn disk_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    PathBuf::from(format!("{home}/.cache/siren/meta.json"))
+    crate::paths::join_cache("meta.json")
 }
 
 fn mtime_ns(path: &Path) -> i64 {

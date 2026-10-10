@@ -1,23 +1,46 @@
 //! mpv IPC client — mirrors Python `Player` (`faeOS/bin/siren`).
 //!
-//! Protocol: one JSON `{"command": [...]}` line per Unix-socket
-//! connection, short reply read. `get` never spawns mpv.
+//! Protocol: one JSON `{"command": [...]}` line per connection.
+//! Unix: socket. Windows: named pipe. `get` never spawns mpv.
 
 use crate::config::SirenConfig;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 static SPAWN_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 pub fn sock_path() -> String {
-    std::env::var("SIREN_SOCK").unwrap_or_else(|_| "/tmp/siren-mpv.sock".into())
+    crate::paths::mpv_ipc()
+}
+
+#[cfg(unix)]
+fn connect() -> Option<std::os::unix::net::UnixStream> {
+    let s = std::os::unix::net::UnixStream::connect(sock_path()).ok()?;
+    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
+    Some(s)
+}
+
+#[cfg(windows)]
+fn connect() -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(sock_path())
+        .ok()
 }
 
 pub fn alive() -> bool {
-    std::path::Path::new(&sock_path()).exists()
+    #[cfg(unix)]
+    {
+        std::path::Path::new(&sock_path()).exists() || connect().is_some()
+    }
+    #[cfg(windows)]
+    {
+        connect().is_some()
+    }
 }
 
 /// Start idle mpv once per process (mirrors `Player.spawn` + prefs).
@@ -30,25 +53,30 @@ pub fn spawn(cfg: &SirenConfig) -> bool {
     }
     let sock = sock_path();
     let gapless = if cfg.gapless { "yes" } else { "no" };
-    let r = std::process::Command::new("mpv")
-        .args([
-            "--idle=yes",
-            "--no-video",
-            "--audio-display=no",
-            &format!("--gapless-audio={gapless}"),
-            "--volume-max=150",
-            &format!("--input-ipc-server={sock}"),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .stdin(std::process::Stdio::null())
-        .spawn();
+    let mut cmd = std::process::Command::new("mpv");
+    cmd.args([
+        "--idle=yes",
+        "--no-video",
+        "--audio-display=no",
+        &format!("--gapless-audio={gapless}"),
+        "--volume-max=150",
+        &format!("--input-ipc-server={sock}"),
+    ])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let r = cmd.spawn();
     if r.is_err() {
         return false;
     }
     // detach: Command without wait drops the handle; child keeps running
     std::mem::forget(r);
-    for _ in 0..20 {
+    for _ in 0..40 {
         if alive() {
             break;
         }
@@ -71,12 +99,7 @@ pub fn apply_runtime_prefs(cfg: &SirenConfig) {
     ]));
     if alive() {
         send(&json!(["set_property", "volume", cfg.default_volume]));
-        let follow = std::env::var("HOME")
-            .ok()
-            .map(|h| std::path::PathBuf::from(format!("{h}/.cache/siren/follow.json")))
-            .filter(|p| p.is_file())
-            .is_some();
-        apply_follow_route(follow);
+        apply_follow_route(crate::paths::follow_json().is_file());
     }
 }
 
@@ -96,9 +119,9 @@ pub fn send(argv: &Value) -> bool {
     if !spawn(&cfg) {
         return false;
     }
-    let mut stream = match UnixStream::connect(sock_path()) {
-        Ok(s) => s,
-        Err(_) => return false,
+    let mut stream = match connect() {
+        Some(s) => s,
+        None => return false,
     };
     let payload = format!("{}\n", json!({ "command": argv }));
     if stream.write_all(payload.as_bytes()).is_err() {
@@ -113,10 +136,7 @@ pub fn get(prop: &str) -> Option<Value> {
     if !alive() {
         return None;
     }
-    let mut stream = UnixStream::connect(sock_path()).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .ok()?;
+    let mut stream = connect()?;
     let payload = format!("{}\n", json!({ "command": ["get_property", prop] }));
     stream.write_all(payload.as_bytes()).ok()?;
     let mut data = Vec::new();
@@ -241,6 +261,26 @@ pub fn apply_local_seek(arg: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipc_endpoint_is_portable() {
+        let s = sock_path();
+        #[cfg(windows)]
+        assert!(
+            crate::paths::is_windows_pipe(&s) || std::env::var("SIREN_SOCK").is_ok(),
+            "{s}"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            s.ends_with("siren-mpv.sock") || std::env::var("SIREN_SOCK").is_ok(),
+            "{s}"
+        );
+        let src = std::fs::read_to_string("src/player.rs").expect("player.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert!(prod.contains("#[cfg(windows)]"), "named pipe client");
+        assert!(prod.contains("#[cfg(unix)]"), "unix socket client");
+        assert!(prod.contains("connect()"), "alive is connect, not exists-only");
+    }
 
     #[test]
     fn parse_time_token_seconds_and_clock() {

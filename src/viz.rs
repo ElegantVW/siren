@@ -59,11 +59,22 @@ pub fn running() -> bool {
 }
 
 fn kill_pid(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 /// Stop the PCM reader. Follow's encoder is a different process — this

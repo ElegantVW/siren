@@ -1,5 +1,13 @@
 # Siren changelog
 
+## 2026-10-10 — portable local playback
+
+- Paths use `$HOME` / `%USERPROFILE%` (no `/root`, no host home).
+- mpv IPC: unix socket or Windows named pipe. `pactl` / ffmpeg / follow
+  skip when missing. `./build.sh install` → `~/.local/bin`; `--house`
+  is the faeOS follow unit.
+- Looking for testers: README + [`docs/PORT.md`](docs/PORT.md).
+
 ## 2026-10-10 — five TUI palettes
 
 - Global `T` cycles pixie / blush / silver / siren / cave (house pinks +

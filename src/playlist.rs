@@ -7,10 +7,7 @@ use serde_json::json;
 use std::path::PathBuf;
 
 fn dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let cfg = std::env::var("SIREN_CONFIG_DIR")
-        .unwrap_or_else(|_| format!("{home}/.config/siren"));
-    PathBuf::from(cfg).join("playlists")
+    crate::paths::config_dir().join("playlists")
 }
 
 fn file(name: &str) -> PathBuf {

@@ -117,12 +117,11 @@ fn script_path() -> PathBuf {
             }
         }
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let p = PathBuf::from(format!("{home}/.local/lib/faeos/siren-stream"));
+    let p = crate::paths::home_dir().join(".local/lib/faeos/siren-stream");
     if p.is_file() {
         return p;
     }
-    PathBuf::from("/home/evenweaker/siren/scripts/siren-stream")
+    crate::paths::home_dir().join("siren/scripts/siren-stream")
 }
 
 /// Start the encoder+server (monitor → PCM HTTP). Idempotent across processes.
@@ -674,8 +673,7 @@ pub fn toggle_follow_pause(ip: &str) -> &'static str {
 }
 
 fn follow_file() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(format!("{home}/.cache/siren/follow.json"))
+    crate::paths::follow_json()
 }
 
 /// Keep a hardware prev_default across repeated `follow on`. Never store Master.
@@ -1317,8 +1315,12 @@ mod tests {
     fn build_sh_restarts_follow_unit() {
         let sh = std::fs::read_to_string("build.sh").expect("build.sh");
         assert!(
+            sh.contains("install --house") || sh.contains("--house"),
+            "follow unit only on house install"
+        );
+        assert!(
             sh.contains("systemctl --user restart siren-follow.service"),
-            "RemainAfterExit start is a no-op; install must restart"
+            "RemainAfterExit start is a no-op; house install must restart"
         );
         assert!(sh.contains("systemctl --user enable siren-follow.service"));
         assert!(

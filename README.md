@@ -2,19 +2,24 @@
 
 # Siren — the Aether's music vessel 🎵
 
-faeOS first-party media player. mpv-backed local playback plus HEOS
-network-speaker control, in one remote.
+A terminal music player. Local files through **mpv**, a two-box TUI,
+optional HEOS speakers on the same LAN. Linux, Windows, and macOS.
 
-**Status:** default engine (v0.1.0, cut over 2026-09-23). Ported: config,
-library/fuzzy, mpv IPC, queue/playlist, transport CLI, two-box TUI,
-audio menu + `cast`, trove (CLI + TUI), tags (`ffprobe`), directory
-browser — all live-verified. `~/bin/siren` is the thin launcher to the
-Rust binary. The kit Python player was removed 2026-09-27. The remaining Python is
-the `:8899` stream encoder (`scripts/siren-stream`), not a second player.
+**Status:** 0.1.0 — looking for testers. Hard dependency: **mpv** on
+PATH. Port notes and the smoke list: [`docs/PORT.md`](docs/PORT.md).
+House follow / Cave wiring: [`docs/AUDIO.md`](docs/AUDIO.md).
 
-House audio: [`docs/AUDIO.md`](docs/AUDIO.md).
+For: flac/mp3/ogg in `~/Music` (Windows: `%USERPROFILE%\Music`), radio,
+a HEOS box on your LAN. Not for: Spotify apps, Bluetooth as a Siren
+path.
 
-For: local files + HEOS speakers from one remote. Not for: Spotify/streaming apps, Bluetooth, multi-OS.
+## Looking for testers
+
+We want reports from **Linux** (Debian, Q4OS, others), **Windows 10/11**,
+and **macOS**. Open a [GitHub issue](https://github.com/ElegantVW/siren/issues)
+with the smoke list in [`docs/PORT.md`](docs/PORT.md), or email
+evenweaker@disroot.org with subject `[siren test]`. OS, terminal, mpv
+version, file type, what you heard, what broke.
 
 ## Look
 
@@ -32,8 +37,9 @@ For: local files + HEOS speakers from one remote. Not for: Spotify/streaming app
 ## Layout
 
 - `src/` — rust engine (`cargo build --release`)
-- `scripts/siren` — thin launcher (never a prebuilt ELF in git)
-- `build.sh install` — engine → `~/.local/lib/faeos/siren`, launcher → `~/bin/siren`
+- `scripts/siren` — thin unix launcher (never a prebuilt ELF in git)
+- `./build.sh install` — ELF → `~/.local/bin/siren`
+- `./build.sh install --house` — faeOS engine path + follow unit
 
 ## TUI
 
@@ -186,6 +192,14 @@ Guards: `.part` resume, skip-if-exists, 40-file cap, 32MB confirm,
 ## Build
 
 ```bash
-./build.sh          # debug-check: cargo build --release
-./build.sh install  # engine + launchers + siren-follow.service
+./build.sh                 # cargo build --release
+./build.sh install         # ELF → ~/.local/bin/siren
+./build.sh install --house # faeOS engine + follow unit
 ```
+
+Needs a Rust toolchain and **mpv**. See [`docs/PORT.md`](docs/PORT.md)
+for Windows / Q4OS / macOS.
+
+**Tests:** `cargo test --offline`. Helpers (path shape, JSON, IPC cfg)
+over live LAN. `#[ignore]` only for boxes that must be on the wire.
+

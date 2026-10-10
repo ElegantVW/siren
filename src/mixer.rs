@@ -119,6 +119,16 @@ Sink Input #467
 "#;
 
     #[test]
+    fn missing_helper_is_empty() {
+        assert!(parse_inputs("").is_empty());
+        let src = std::fs::read_to_string("src/mixer.rs").expect("mixer.rs");
+        assert!(
+            src.contains("return Vec::new()"),
+            "pactl missing must not crash the TUI"
+        );
+    }
+
+    #[test]
     fn parses_two_inputs() {
         let v = parse_inputs(SAMPLE);
         assert_eq!(v.len(), 2);

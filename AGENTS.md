@@ -5,7 +5,9 @@
 faeOS first-party media player. mpv-backed local playback plus HEOS
 network-speaker control, in one remote.
 
-**Status:** default engine (v0.1.0, cut over 2026-09-23). Ported: config,
+**Status:** default engine (v0.1.0). Local files + TUI ship on Linux /
+Windows / macOS (`docs/PORT.md`). Follow / Cave / NAT stay this house.
+Ported: config,
 library/fuzzy, mpv IPC, queue/playlist, transport CLI, two-box TUI,
 audio menu + `cast`, trove (CLI + TUI), tags (`ffprobe`), directory
 browser — all live-verified. `~/bin/siren` is the thin launcher to the
@@ -30,7 +32,8 @@ not a second player.
 
 - `src/` — rust engine (`cargo build --release`)
 - `scripts/siren` — thin launcher (never a prebuilt ELF in git)
-- `build.sh install` — engine → `~/.local/lib/faeos/siren`, launcher → `~/bin/siren`
+- `build.sh install` — ELF → `~/.local/bin/siren`
+- `build.sh install --house` — faeOS engine + follow unit
 
 ## TUI
 
@@ -276,8 +279,9 @@ Guards: `.part` resume, skip-if-exists, 40-file cap, 32MB confirm,
 ## Build
 
 ```bash
-./build.sh          # debug-check: cargo build --release
-./build.sh install  # engine + launchers + siren-follow.service
+./build.sh                 # cargo build --release
+./build.sh install         # ~/.local/bin/siren
+./build.sh install --house # faeOS engine + follow unit
 ```
 
 **Tests:** every new behavior lands with a unit or source-scan test in

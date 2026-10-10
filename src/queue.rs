@@ -93,13 +93,7 @@ static QUEUE_LOADED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 fn queue_file() -> std::path::PathBuf {
-    let base = std::env::var("SIREN_CONFIG_DIR").unwrap_or_else(|_| {
-        format!(
-            "{}/.config/siren",
-            std::env::var("HOME").unwrap_or_else(|_| "/root".into())
-        )
-    });
-    std::path::PathBuf::from(base).join("queue.json")
+    crate::paths::join_config("queue.json")
 }
 
 fn queue() -> std::sync::MutexGuard<'static, Queue> {

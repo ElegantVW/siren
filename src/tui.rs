@@ -243,9 +243,10 @@ impl App {
         let cfg = SirenConfig::load();
         queue::ensure_loaded();
         let lib = library::scan_library(&cfg);
-        let first_root = library::library_roots(&cfg).into_iter().next().unwrap_or_else(|| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
-        });
+        let first_root = library::library_roots(&cfg)
+            .into_iter()
+            .next()
+            .unwrap_or_else(crate::paths::music_dir);
         let mut app = Self {
             cfg,
             focus: 0,
@@ -440,7 +441,7 @@ impl App {
 
     /// Short printable cwd (~/Music/trove/…).
     fn cwd_display(&self) -> String {
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = crate::paths::home_dir().to_string_lossy().into_owned();
         let s = self.bcwd.to_string_lossy().into_owned();
         if !home.is_empty() {
             if let Some(rest) = s.strip_prefix(&home) {

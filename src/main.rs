@@ -13,6 +13,7 @@ mod radio;
 mod playlist;
 mod queue;
 mod mixer;
+mod paths;
 mod spectrum;
 mod stream;
 mod theme;
@@ -571,10 +572,11 @@ fn cmd_sleep(args: &[String]) -> i32 {
                     return 2;
                 }
             };
-            let siren = format!(
-                "{}/bin/siren",
-                std::env::var("HOME").unwrap_or_else(|_| "/root".into())
-            );
+            let siren = crate::paths::home_dir()
+                .join("bin")
+                .join("siren")
+                .to_string_lossy()
+                .into_owned();
             // cancel any previous timer first
             ctl(&["stop", &format!("{unit}.timer")]);
             let st = Command::new("systemd-run")
@@ -602,16 +604,11 @@ fn cmd_sleep(args: &[String]) -> i32 {
 }
 
 fn shellexpand(p: &str) -> String {
-    if let Some(rest) = p.strip_prefix("~/") {
-        format!("{}/{rest}", std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
-    } else {
-        p.to_string()
-    }
+    crate::paths::expand_home(p).to_string_lossy().into_owned()
 }
 
 fn now_cache_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    std::path::PathBuf::from(format!("{home}/.cache/siren/now.json"))
+    crate::paths::join_cache("now.json")
 }
 
 fn now_epoch() -> f64 {
@@ -1510,7 +1507,7 @@ fn cmd_video(args: &[String]) -> i32 {
             "--print",
             "after_move:filepath",
             "--paths",
-            &format!("{}/.cache/siren/videos", std::env::var("HOME").unwrap_or_default()),
+            crate::paths::cache_dir().join("videos").to_str().unwrap_or("."),
             &query,
         ])
         .output()

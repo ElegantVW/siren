@@ -23,19 +23,13 @@ pub const PREFETCH_WITHIN: usize = 6;
 fn audio_dir() -> PathBuf {
     std::env::var("TROVE_AUDIO_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
-                .join("Music/trove")
-        })
+        .unwrap_or_else(|_| crate::paths::music_dir().join("trove"))
 }
 
 fn video_dir() -> PathBuf {
     std::env::var("TROVE_VIDEO_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
-                .join("Videos/trove")
-        })
+        .unwrap_or_else(|_| crate::paths::home_dir().join("Videos/trove"))
 }
 
 fn max_total() -> u64 {

@@ -65,18 +65,11 @@ fn curl_text(url: &str) -> Result<String, String> {
 }
 
 fn cache_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    std::path::PathBuf::from(format!("{home}/.cache/siren"))
+    crate::paths::cache_dir()
 }
 
 fn state_path() -> std::path::PathBuf {
-    let base = std::env::var("SIREN_CONFIG_DIR").unwrap_or_else(|_| {
-        format!(
-            "{}/.config/siren",
-            std::env::var("HOME").unwrap_or_else(|_| "/root".into())
-        )
-    });
-    std::path::PathBuf::from(base).join("radio.json")
+    crate::paths::join_config("radio.json")
 }
 
 /// Lowercase + fold Latin diacritics so "Rádio" matches "radio".

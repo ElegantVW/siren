@@ -125,8 +125,7 @@ impl TrackSpec {
 }
 
 fn cache_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    PathBuf::from(home).join(".cache/siren/spectrum")
+    crate::paths::cache_dir().join("spectrum")
 }
 
 fn cache_key(path: &Path) -> Option<String> {

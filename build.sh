@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — produce release siren; install into faeOS engine paths
+# build.sh — release binary. install → ~/.local/bin. install --house → faeOS paths + follow unit.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
@@ -8,12 +8,23 @@ BIN="$ROOT/target/release/siren"
 echo "built: $BIN"
 ls -la "$BIN"
 
-if [[ "${1:-}" == "install" ]]; then
-  # DEPS: mpv (local playback over IPC). HEOS/minidlna only for casting.
-  if ! command -v mpv >/dev/null 2>&1; then
-    echo "siren: WARNING — mpv not found; local playback will fail." >&2
-    echo "siren:   next:  sudo pacman -S mpv" >&2
-  fi
+if [[ "${1:-}" != "install" ]]; then
+  exit 0
+fi
+shift || true
+HOUSE=0
+if [[ "${1:-}" == "--house" ]]; then
+  HOUSE=1
+fi
+
+if ! command -v mpv >/dev/null 2>&1; then
+  echo "siren: WARNING — mpv not found; local playback will fail." >&2
+  echo "siren:   linux:  sudo pacman -S mpv   |  sudo apt install mpv" >&2
+  echo "siren:   mac:    brew install mpv" >&2
+  echo "siren:   windows: https://mpv.io" >&2
+fi
+
+if [[ "$HOUSE" -eq 1 ]]; then
   LIB="$HOME/.local/lib/faeos"
   WRAP_SRC="$ROOT/scripts/siren"
   mkdir -p "$LIB" "$HOME/bin"
@@ -33,18 +44,6 @@ if [[ "${1:-}" == "install" ]]; then
 
   install_launcher "$HOME/bin/siren"
 
-  if [[ -w /usr/local/bin ]] || sudo -n true 2>/dev/null; then
-    if [[ -w /usr/local/bin ]]; then
-      install_launcher /usr/local/bin/siren
-      echo "launcher        → /usr/local/bin/siren (sudo-visible)"
-    else
-      sudo install -m 755 "$WRAP_SRC" /usr/local/bin/siren
-      echo "launcher        → /usr/local/bin/siren (sudo-visible)"
-    fi
-  else
-    echo "note: once for sudo PATH: sudo install -m 755 $WRAP_SRC /usr/local/bin/siren"
-  fi
-
   UNIT_SRC="$ROOT/systemd/siren-follow.service"
   UNIT_DST="$HOME/.config/systemd/user/siren-follow.service"
   if [[ -f "$UNIT_SRC" ]]; then
@@ -52,7 +51,6 @@ if [[ "${1:-}" == "install" ]]; then
     cp -f "$UNIT_SRC" "$UNIT_DST"
     systemctl --user daemon-reload
     systemctl --user enable siren-follow.service
-    # restart re-runs ExecStart; start is a no-op if RemainAfterExit is already active
     if systemctl --user restart siren-follow.service; then
       echo "user unit       → $UNIT_DST (enabled, started)"
     else
@@ -62,4 +60,12 @@ if [[ "${1:-}" == "install" ]]; then
 
   echo "installed engine → $LIB/siren"
   echo "launcher        → $HOME/bin/siren"
+else
+  DEST="$HOME/.local/bin/siren"
+  mkdir -p "$(dirname "$DEST")"
+  cp -f "$BIN" "$DEST"
+  chmod +x "$DEST"
+  echo "installed → $DEST"
+  echo "put ~/.local/bin on PATH. mpv is the only hard dependency."
+  echo "house follow unit: ./build.sh install --house"
 fi

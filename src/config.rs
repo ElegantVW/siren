@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 fn config_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    PathBuf::from(home).join(".config/siren/config.json")
+    crate::paths::config_dir().join("config.json")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,7 +45,7 @@ fn d_volume() -> i32 {
     75
 }
 fn d_roots() -> Vec<String> {
-    vec!["~/Music".into()]
+    crate::paths::default_library_roots()
 }
 fn d_true() -> bool {
     true
