@@ -66,6 +66,17 @@ Windows native: `siren.exe` + mpv. If the named pipe IPC is ugly, WSL
 
 macOS: unix binary + `brew install mpv`. Same keys as Linux.
 
+## How we test on the development box
+
+No Windows QEMU here (`/dev/kvm` is missing). Three layers:
+
+1. `cargo test --offline --test compat_play` — isolated `HOME`, `SIREN_AO=null`
+   (mpv decodes, no analog, no Cave). Needs host `mpv`.
+2. `scripts/compat-debian.sh` — Debian bookworm nspawn (Q4OS family),
+   rustup + mpv, same tests. Builds **inside** the guest.
+3. `scripts/compat-wine.sh` — `siren.exe` `--help` / `config get palette`
+   under Wine. Play-under-Wine waits for a Windows mpv.
+
 ## What we do not need in a first report
 
 House follow, Cave, NAT, minidlna. Those live on the development box.

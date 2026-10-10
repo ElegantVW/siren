@@ -1,5 +1,11 @@
 # Siren changelog
 
+## 2026-10-10 — compat tests on this box
+
+- `tests/compat_play.rs` plays a generated wav through the siren binary
+  with isolated HOME and `SIREN_AO=null` (no analog, no Cave).
+- `scripts/compat-debian.sh` (nspawn) and `scripts/compat-wine.sh` (CLI).
+
 ## 2026-10-10 — portable local playback
 
 - Paths use `$HOME` / `%USERPROFILE%` (no `/root`, no host home).

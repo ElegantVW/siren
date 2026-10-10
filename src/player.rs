@@ -61,10 +61,16 @@ pub fn spawn(cfg: &SirenConfig) -> bool {
         &format!("--gapless-audio={gapless}"),
         "--volume-max=150",
         &format!("--input-ipc-server={sock}"),
-    ])
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null())
-    .stdin(std::process::Stdio::null());
+    ]);
+    // Tests / headless: SIREN_AO=null decodes with no analog and no Cave.
+    if let Ok(ao) = std::env::var("SIREN_AO") {
+        if !ao.is_empty() {
+            cmd.arg(format!("--ao={ao}"));
+        }
+    }
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -280,6 +286,7 @@ mod tests {
         assert!(prod.contains("#[cfg(windows)]"), "named pipe client");
         assert!(prod.contains("#[cfg(unix)]"), "unix socket client");
         assert!(prod.contains("connect()"), "alive is connect, not exists-only");
+        assert!(prod.contains("SIREN_AO"), "headless tests set --ao=null");
     }
 
     #[test]
