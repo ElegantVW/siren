@@ -48,6 +48,53 @@ pub fn capture_source() -> String {
     }
 }
 
+/// HTTP(S) stream URL, or None for TuneIn ids / empty / pulse names.
+pub fn http_url(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.starts_with("http://") || s.starts_with("https://") {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
+/// Where viz ffmpeg reads PCM.
+/// Follow → Master. HEOS radio with an http mid → that URL. Else default sink.
+pub fn viz_input(follow: bool, heos_url: Option<&str>, default_sink: Option<&str>) -> String {
+    viz_candidates(follow, heos_url, default_sink)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| monitor_of(MASTER))
+}
+
+/// Hunt list: cheap Pulse monitors first, HTTP last.
+/// Follow puts Master ahead of analog. One reader walks this on silence.
+pub fn viz_candidates(
+    follow: bool,
+    heos_url: Option<&str>,
+    default_sink: Option<&str>,
+) -> Vec<String> {
+    let analog = capture_from_default(default_sink);
+    let master = monitor_of(MASTER);
+    let mut out = Vec::new();
+    let mut push = |s: String| {
+        if !s.is_empty() && !out.iter().any(|x| x == &s) {
+            out.push(s);
+        }
+    };
+    if follow {
+        push(master.clone());
+        push(analog);
+    } else {
+        push(analog);
+        push(master);
+    }
+    if let Some(u) = heos_url.and_then(http_url) {
+        push(u);
+    }
+    out
+}
+
 #[allow(dead_code)]
 pub const MONITOR: &str = "Siren_Master.monitor";
 
@@ -82,7 +129,7 @@ pub fn running() -> bool {
     }
 }
 
-/// Encoder alive in this process **or** another (systemd / leftover python).
+/// Encoder alive in this process **or** another (systemd / leftover serve).
 pub fn encoder_alive() -> bool {
     running() || !encoder_pids().is_empty()
 }
@@ -108,45 +155,24 @@ pub fn url_l16(local_ip: &str, port: u16) -> String {
     format!("http://{local_ip}:{port}{STREAM_PATH_L16}")
 }
 
-fn script_path() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("siren-stream");
-            if p.is_file() {
-                return p;
-            }
-        }
-    }
-    let p = crate::paths::home_dir().join(".local/lib/faeos/siren-stream");
-    if p.is_file() {
-        return p;
-    }
-    crate::paths::home_dir().join("siren/scripts/siren-stream")
-}
-
 /// Start the encoder+server (monitor → PCM HTTP). Idempotent across processes.
 pub fn start(port: u16) -> bool {
+    reap_legacy_python();
     if encoder_alive() {
         return true;
     }
     let cap = monitor_of(MASTER);
-    let script = script_path();
-    let port_s = port.to_string();
-    let r = if script.is_file() {
-        Command::new("python3")
-            .args([script.as_os_str(), std::ffi::OsStr::new(&port_s), cap.as_ref()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .stdin(Stdio::null())
-            .spawn()
-    } else {
-        Command::new("python3")
-            .args(["-c", &server_script(port)])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .stdin(Stdio::null())
-            .spawn()
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => PathBuf::from("siren"),
     };
+    let port_s = port.to_string();
+    let r = Command::new(&exe)
+        .args(["stream", "serve", &port_s, &cap])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn();
     match r {
         Ok(c) => {
             state().lock().unwrap().child = Some(c);
@@ -163,8 +189,8 @@ pub fn start(port: u16) -> bool {
 }
 
 /// Kill the encoder child and leftover python servers.
-/// Do not `pkill -f siren-stream`: that substring lives in unrelated
-/// command lines (install scripts, agent shells) and SIGTERMs them.
+/// Do not `pkill -f`: that substring lives in unrelated command lines
+/// (install scripts, agent shells) and SIGTERMs them.
 fn stop_encoder() {
     let child = state().lock().unwrap().child.take();
     if let Some(mut c) = child {
@@ -175,10 +201,21 @@ fn stop_encoder() {
     for pid in encoder_pids() {
         let _ = Command::new("kill").arg(pid.to_string()).status();
     }
+    reap_legacy_python();
 }
 
-/// Python processes whose argv contains a `siren-stream` *path* argument.
+fn reap_legacy_python() {
+    for pid in pids_matching(cmdline_is_legacy_python) {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+}
+
+/// `siren stream serve` processes (this ELF), any pid.
 fn encoder_pids() -> Vec<u32> {
+    pids_matching(cmdline_is_encoder)
+}
+
+fn pids_matching(pred: fn(&[&[u8]]) -> bool) -> Vec<u32> {
     let mut pids = Vec::new();
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return pids;
@@ -193,15 +230,34 @@ fn encoder_pids() -> Vec<u32> {
             Err(_) => continue,
         };
         let args: Vec<&[u8]> = raw.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
-        if !cmdline_is_encoder(&args) {
-            continue;
+        if pred(&args) {
+            pids.push(pid);
         }
-        pids.push(pid);
     }
     pids
 }
 
+/// argv is `siren stream serve …` — never the TUI, never `audio follow run`.
 fn cmdline_is_encoder(args: &[&[u8]]) -> bool {
+    let mut saw_stream = false;
+    for (i, a) in args.iter().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        if *a == b"stream" {
+            saw_stream = true;
+            continue;
+        }
+        if saw_stream && *a == b"serve" {
+            return true;
+        }
+        saw_stream = false;
+    }
+    false
+}
+
+/// Leftover kit encoder: python with a `siren-stream` path argument.
+fn cmdline_is_legacy_python(args: &[&[u8]]) -> bool {
     let Some(argv0) = args.first() else {
         return false;
     };
@@ -210,7 +266,8 @@ fn cmdline_is_encoder(args: &[&[u8]]) -> bool {
     if !base.starts_with("python") {
         return false;
     }
-    args.iter().any(|a| a.ends_with(b"/siren-stream") || *a == b"siren-stream")
+    args.iter()
+        .any(|a| a.ends_with(b"/siren-stream") || *a == b"siren-stream")
 }
 
 /// Stop then start so ffmpeg binds the current default-sink monitor.
@@ -230,74 +287,6 @@ fn port_open(port: u16) -> bool {
         Duration::from_millis(300),
     )
     .is_ok()
-}
-
-fn server_script(port: u16) -> String {
-    let cap = capture_source().replace('\\', "\\\\").replace('"', "\\\"");
-    format!(
-        r#"
-import os, signal, subprocess
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-CAP = "{cap}"
-CHUNK = {chunk}
-FFC = ["ffmpeg","-hide_banner","-loglevel","error","-fflags","nobuffer","-flags","low_delay","-probesize","32","-analyzeduration","0","-f","pulse","-fragment_size","1920","-i",CAP,"-ac","2","-ar","48000"]
-KIDS = []
-def cleanup(*_):
-    for p in list(KIDS):
-        try: p.kill()
-        except OSError: pass
-    os._exit(0)
-signal.signal(signal.SIGTERM, cleanup)
-signal.signal(signal.SIGINT, cleanup)
-class H(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    def log_message(self, *a): pass
-    def _pick(self):
-        p = self.path.split("?",1)[0]
-        if p == "/siren.wav": return "audio/wav", FFC+["-f","wav","-"]
-        if p == "/siren.l16": return "audio/L16;rate=48000;channels=2", FFC+["-f","s16be","-"]
-        return None, None
-    def do_HEAD(self):
-        mime,_ = self._pick()
-        if not mime:
-            self.send_response(404); self.end_headers(); return
-        self.send_response(200)
-        self.send_header("Content-Type", mime)
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-    def do_GET(self):
-        mime, ff = self._pick()
-        if not mime:
-            self.send_response(404); self.end_headers(); return
-        self.send_response(200)
-        self.send_header("Content-Type", mime)
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        p = None
-        try:
-            p = subprocess.Popen(ff, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, bufsize=0)
-            KIDS.append(p)
-            while True:
-                chunk = p.stdout.read(CHUNK)
-                if not chunk: break
-                try:
-                    self.wfile.write(chunk); self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError): break
-        except Exception:
-            pass
-        finally:
-            if p is not None:
-                try: p.kill()
-                except OSError: pass
-                try: KIDS.remove(p)
-                except ValueError: pass
-ThreadingHTTPServer(("0.0.0.0", {port}), H).serve_forever()
-"#,
-        cap = cap,
-        chunk = CHUNK_BYTES,
-        port = port,
-    )
 }
 
 /// POST a SOAP action to a speaker's UPnP AVTransport endpoint.
@@ -619,7 +608,7 @@ pub fn count_estab_on_port(text: &str, port: u16) -> usize {
         .count()
 }
 
-/// Block until the encoder child / leftover python is gone (follow run).
+/// Block until the encoder child / leftover serve is gone (follow run).
 pub fn wait_while_encoder() {
     loop {
         if !encoder_alive() {
@@ -1097,23 +1086,44 @@ mod tests {
     }
 
     #[test]
-    fn encoder_pid_scan_ignores_shell_minus_c() {
+    fn encoder_pid_scan_matches_stream_serve_only() {
         let zsh: Vec<&[u8]> = b"zsh\0-c\0pgrep -af siren-stream\0"
             .split(|b| *b == 0)
             .filter(|a| !a.is_empty())
             .collect();
         assert!(!cmdline_is_encoder(&zsh));
+        assert!(!cmdline_is_legacy_python(&zsh));
+        let rust: Vec<&[u8]> =
+            b"/home/evenweaker/.local/lib/faeos/siren\0stream\0serve\08899\0Siren_Master.monitor\0"
+                .split(|b| *b == 0)
+                .filter(|a| !a.is_empty())
+                .collect();
+        assert!(cmdline_is_encoder(&rust));
+        assert!(!cmdline_is_legacy_python(&rust));
+        let tui: Vec<&[u8]> = b"/home/evenweaker/.local/lib/faeos/siren\0"
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .collect();
+        assert!(!cmdline_is_encoder(&tui));
+        let follow_run: Vec<&[u8]> =
+            b"/home/evenweaker/.local/lib/faeos/siren\0audio\0follow\0run\0"
+                .split(|b| *b == 0)
+                .filter(|a| !a.is_empty())
+                .collect();
+        assert!(!cmdline_is_encoder(&follow_run));
         let py: Vec<&[u8]> =
             b"/usr/bin/python3\0/home/evenweaker/.local/lib/faeos/siren-stream\08899\0Siren_Master.monitor\0"
                 .split(|b| *b == 0)
                 .filter(|a| !a.is_empty())
                 .collect();
-        assert!(cmdline_is_encoder(&py));
+        assert!(!cmdline_is_encoder(&py));
+        assert!(cmdline_is_legacy_python(&py));
         let embedded: Vec<&[u8]> = b"python3\0-c\0from http.server import ThreadingHTTPServer\0"
             .split(|b| *b == 0)
             .filter(|a| !a.is_empty())
             .collect();
         assert!(!cmdline_is_encoder(&embedded));
+        assert!(!cmdline_is_legacy_python(&embedded));
         let empty: Vec<&[u8]> = vec![];
         assert!(!cmdline_is_encoder(&empty));
         let ffmpeg: Vec<&[u8]> = b"ffmpeg\0-f\0pulse\0-i\0Siren_Master.monitor\0"
@@ -1121,6 +1131,50 @@ mod tests {
             .filter(|a| !a.is_empty())
             .collect();
         assert!(!cmdline_is_encoder(&ffmpeg));
+    }
+
+    #[test]
+    fn viz_input_follow_url_analog() {
+        assert_eq!(
+            viz_input(true, Some("http://example.invalid/a.aac"), Some("headset")),
+            "Siren_Master.monitor"
+        );
+        assert_eq!(
+            viz_input(false, Some("http://example.invalid/a.aac"), Some("headset")),
+            "headset.monitor",
+            "hunt starts on cheap analog, HTTP last"
+        );
+        assert_eq!(
+            viz_input(false, Some("s12345"), Some("headset")),
+            "headset.monitor"
+        );
+        assert_eq!(
+            viz_input(false, None, Some("headset")),
+            "headset.monitor"
+        );
+        assert_eq!(http_url("http://x/y"), Some("http://x/y".into()));
+        assert_eq!(http_url("s12345"), None);
+        assert_eq!(http_url(""), None);
+    }
+
+    #[test]
+    fn viz_candidates_http_last() {
+        let v = viz_candidates(false, Some("http://example.invalid/a.aac"), Some("headset"));
+        assert_eq!(
+            v,
+            vec![
+                "headset.monitor".to_string(),
+                "Siren_Master.monitor".to_string(),
+                "http://example.invalid/a.aac".to_string(),
+            ]
+        );
+        let f = viz_candidates(true, Some("http://x/s"), Some("headset"));
+        assert_eq!(f[0], "Siren_Master.monitor");
+        assert_eq!(f[1], "headset.monitor");
+        assert_eq!(f.last().map(String::as_str), Some("http://x/s"));
+        let one = viz_candidates(false, None, Some("headset"));
+        assert_eq!(one.len(), 2);
+        assert!(!one.iter().any(|s| s.contains("://")));
     }
 
     #[test]
@@ -1194,6 +1248,31 @@ mod tests {
             body.contains("monitor_of(MASTER)"),
             "encoder captures Siren_Master, not the headset default"
         );
+        assert!(
+            body.contains("stream") && body.contains("serve"),
+            "encoder is siren stream serve"
+        );
+        assert!(
+            !body.contains("python3"),
+            "encoder must not spawn python3"
+        );
+    }
+
+    #[test]
+    fn production_stream_has_no_python_encoder() {
+        let src = std::fs::read_to_string("src/stream.rs").expect("stream.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        for (i, line) in prod.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") || t.starts_with("///") {
+                continue;
+            }
+            assert!(
+                !t.contains("python3") && !t.contains("http.server"),
+                "python encoder leftover at stream.rs:{}",
+                i + 1
+            );
+        }
     }
 
     #[test]
@@ -1326,6 +1405,10 @@ mod tests {
         assert!(
             !sh.contains("enable --now siren-follow"),
             "enable --now skips ExecStart when already active"
+        );
+        assert!(
+            !sh.contains("scripts/siren-stream"),
+            "house install must not copy a python encoder"
         );
     }
 

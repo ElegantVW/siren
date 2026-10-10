@@ -5,15 +5,15 @@
 faeOS first-party media player. mpv-backed local playback plus HEOS
 network-speaker control, in one remote.
 
-**Status:** default engine (v0.1.0). Local files + TUI ship on Linux /
-Windows / macOS (`docs/PORT.md`). Follow / Cave / NAT stay this house.
+**Status:** default engine (v0.1.1). Local files + TUI ship on Linux /
+Windows (`docs/PORT.md`, Grove download buttons). macOS is source.
+Follow / Cave / NAT stay this house.
 Ported: config,
 library/fuzzy, mpv IPC, queue/playlist, transport CLI, two-box TUI,
 audio menu + `cast`, trove (CLI + TUI), tags (`ffprobe`), directory
 browser — all live-verified. `~/bin/siren` is the thin launcher to the
-Rust binary. The kit Python player was removed 2026-09-27. The remaining
-Python is the `:8899` stream encoder (`stream.rs` / `scripts/siren-stream`),
-not a second player.
+Rust binary. The kit Python player was removed 2026-09-27. The `:8899`
+encoder is `siren stream serve` in the same ELF (`encode.rs`), not Python.
 
 ## Look
 
@@ -69,7 +69,7 @@ House audio diagram: [`docs/AUDIO.md`](docs/AUDIO.md).
 | audio | `o` local/heos · `S` speaker · `W` follow · `r` repeat · `v` refresh · `t` test · mixer `j`/`k`/`m` · `g`/`u`/`G` group · `,`/`.` group vol |
 | trove | `s` search · Enter version · `D` download · `M` more · `A` all · `F` format |
 | radio | Enter/space play · `C` country · `s` search · `f` fav · `A` URL · `M` more |
-| viz | `t`/space flip · `V` zoom |
+| viz | Tab cycles (top pane pushes) |
 
 **Group control** (audio view): `g` groups all speakers under current
 speaker as leader, `u` ungroups, `G` toggles group mute, `,`/`.` adjust
@@ -136,18 +136,22 @@ update. The draw path spawns nothing. Regression-tested by
 `std::thread::spawn`). `stream::running()` is `try_wait` — cheap, and
 fine to call anywhere.
 
-**Visualizer** (`viz.rs`, `V` view): live FFT from the PipeWire
-monitor (`stream.rs::capture_source`), so it follows real audio —
-not file-decoded. **Latency**: `HOP`=256 slides the window (11.6ms
-updates) while `WINDOW`=2048 keeps frequency resolution; the event
-loop renders at 60fps only while `animating()` (Viz view, live
-spectrum, or a play job) and falls back to a 500ms tick otherwise —
+**Visualizer** (`viz.rs`, `V` view): live FFT from `stream::viz_candidates`
+— analog monitor, then `Siren_Master.monitor`, HEOS `mid` HTTP last
+(follow puts Master first). One ffmpeg walks the list; a silent
+source is dropped in ~140ms (Pulse) or ~0.5s (HTTP). Not a file FFT.
+**Latency**: `HOP`=128 slides the window (5.8ms updates) while
+`WINDOW`=2048 keeps frequency resolution; viz ffmpeg uses `nobuffer` /
+`low_delay` / Pulse `fragment_size` 1920, curl `-N` on HTTP. The event
+loop is a 60Hz target clock (`1e9/60` ns) while `animating()` (Viz
+view, live spectrum, or a play job) — period from the tick, not
+draw-end + sleep — and falls back to a 500ms tick otherwise.
 CPU stays proportional to visible motion. Network polls never run
 at frame rate. Braille packer (2×4 dots/cell) is pure + tested.
-Orientations: `render_horizontal` (bars up) / `render_vertical`
-(bars right). `t`/`space` flips, `V` zooms 1×/2×/3×. Smoothing is
-attack-fast/release-slow; peak caps tick down. Other views keep a
-compact horizontal strip; the viz tab is the full canvas.
+TUI waves are horizontal only. `render_vertical` stays as a pure
+helper. Tab / Shift-Tab push the top pane (~180ms ease-out).
+Smoothing is attack-fast/release-slow; peak caps tick down. Other
+views keep a compact horizontal strip; the viz tab is the full canvas.
 
 **Follow** (audio view `W`, or `siren audio follow on|off`): Cave is
 Siren's speaker, **not** the PC sound card. Headset (front combo

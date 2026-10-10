@@ -9,9 +9,9 @@
 //! still shows 16 amplitude levels — the reason block glyphs looked
 //! chunky is they only give one level per row.
 //!
-//! The PCM comes from the PipeWire monitor that `stream.rs` already
-//! captures: `Siren_Master.monitor` while follow is on, headset analog
-//! when follow is off. Radio, files, Cave — same bars. Not a file FFT.
+//! PCM from one source at a time. If that source stays silent, viz
+//! steps to the next candidate (local monitors first, HTTP last).
+//! One ffmpeg (and optional curl). Not a file FFT.
 
 use crate::spectrum::{live_bands, smooth_bands, tick_peaks, BANDS};
 use std::process::{Command, Stdio};
@@ -33,7 +33,9 @@ struct Live {
     peak: f32,
     running: bool,
     monitor: String,
+    sources: Vec<String>,
     ffmpeg_pid: Option<u32>,
+    curl_pid: Option<u32>,
     gen: u64,
 }
 
@@ -47,7 +49,9 @@ fn live() -> &'static Mutex<Live> {
             peak: 1e-3,
             running: false,
             monitor: String::new(),
+            sources: Vec::new(),
             ffmpeg_pid: None,
+            curl_pid: None,
             gen: 0,
         })
     })
@@ -78,27 +82,80 @@ fn kill_pid(pid: u32) {
 }
 
 /// Stop the PCM reader. Follow's encoder is a different process — this
-/// only kills the viz ffmpeg.
+/// only kills the viz ffmpeg (and curl when tapping a HEOS URL).
 pub fn stop() {
-    let pid = {
+    let (ff, curl) = {
         let mut g = live().lock().unwrap();
         g.gen = g.gen.wrapping_add(1);
         g.running = false;
         g.monitor.clear();
-        g.ffmpeg_pid.take()
+        (g.ffmpeg_pid.take(), g.curl_pid.take())
     };
-    if let Some(pid) = pid {
+    if let Some(pid) = ff {
+        kill_pid(pid);
+    }
+    if let Some(pid) = curl {
         kill_pid(pid);
     }
 }
 
-/// Start the PCM reader: ffmpeg decodes the monitor to f32le mono.
-/// Same monitor + alive → no-op. A new name stops the old child first
-/// so follow-on waves leave the silent headset analog.
+/// Hop is loud enough to count as "this source has audio".
+pub(crate) fn hop_loud(hop: &[f32]) -> bool {
+    hop.iter().any(|x| x.abs() >= 0.01)
+}
+
+pub(crate) fn is_network_src(s: &str) -> bool {
+    s.contains("://")
+}
+
+/// Fail-fast on a dead Pulse monitor; give HTTP a second to connect.
+pub(crate) fn probe_hops(network: bool) -> u32 {
+    if network { 86 } else { 24 }
+}
+
+/// After a lock, wait longer before abandoning (a pause in the song).
+pub(crate) fn hold_hops() -> u32 {
+    172
+}
+
+pub(crate) fn next_source_idx(idx: usize, n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        (idx + 1) % n
+    }
+}
+
+fn dedup_sources(src: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in src {
+        let t = s.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|x| x == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// Start the PCM reader on one source. Same name + alive → no-op.
 pub fn start(monitor: &str) -> bool {
+    start_hunt(&[monitor.to_string()])
+}
+
+/// Walk `sources` until one has PCM. One ffmpeg at a time. HTTP last
+/// in the caller's list. After a silent round, pause so we do not
+/// respawn curl in a loop.
+pub fn start_hunt(sources: &[String]) -> bool {
+    let sources = dedup_sources(sources);
+    if sources.is_empty() {
+        return false;
+    }
     {
         let g = live().lock().unwrap();
-        if g.running && g.monitor == monitor {
+        if g.running && g.sources == sources {
             return true;
         }
     }
@@ -106,79 +163,229 @@ pub fn start(monitor: &str) -> bool {
     let gen = {
         let mut g = live().lock().unwrap();
         g.running = true;
-        g.monitor = monitor.to_string();
+        g.sources = sources.clone();
+        g.monitor = sources[0].clone();
         g.smoothed = [0.0; BANDS];
         g.peaks = [0.0; BANDS];
         g.peak = 1e-3;
         g.gen = g.gen.wrapping_add(1);
         g.gen
     };
-    let monitor = monitor.to_string();
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut child = match Command::new("ffmpeg")
+    std::thread::spawn(move || hunt_loop(gen, sources));
+    true
+}
+
+struct Pcm {
+    ffmpeg: std::process::Child,
+    curl: Option<std::process::Child>,
+    stdout: std::process::ChildStdout,
+}
+
+fn reap_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn close_pcm(mut pcm: Pcm) {
+    reap_child(&mut pcm.ffmpeg);
+    if let Some(mut c) = pcm.curl {
+        reap_child(&mut c);
+    }
+}
+
+fn open_pcm(monitor: &str) -> Option<Pcm> {
+    let mut curl_child = None;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+    ]);
+    if is_network_src(monitor) {
+        // Icecast AAC needs more than 32 bytes to probe. Pulse can
+        // stay tiny because `-f pulse` already names the format.
+        cmd.args([
+            "-probesize",
+            "262144",
+            "-analyzeduration",
+            "1000000",
+        ]);
+        let mut curl = Command::new("curl")
             .args([
-                "-hide_banner", "-loglevel", "error",
-                "-f", "pulse", "-i", &monitor,
-                "-ac", "1", "-ar", "22050",
-                "-f", "f32le", "-",
+                "-sS",
+                "-N",
+                "-L",
+                "--doh-url",
+                "https://1.1.1.1/dns-query",
+                "--connect-timeout",
+                "2",
+                monitor,
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .stdin(Stdio::null())
             .spawn()
+            .ok()?;
+        match curl.stdout.take() {
+            Some(stdout) => {
+                cmd.arg("-i").arg("pipe:0").stdin(stdout);
+                curl_child = Some(curl);
+            }
+            None => {
+                reap_child(&mut curl);
+                return None;
+            }
+        }
+    } else {
+        cmd.args([
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            "-f",
+            "pulse",
+            "-fragment_size",
+            "1920",
+            "-i",
+            monitor,
+        ]);
+    }
+    let mut child = match cmd
+        .args([
+            "-flush_packets",
+            "1",
+            "-ac",
+            "1",
+            "-ar",
+            "22050",
+            "-f",
+            "f32le",
+            "-",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            if let Some(mut c) = curl_child {
+                reap_child(&mut c);
+            }
+            return None;
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            reap_child(&mut child);
+            if let Some(mut c) = curl_child {
+                reap_child(&mut c);
+            }
+            return None;
+        }
+    };
+    Some(Pcm {
+        ffmpeg: child,
+        curl: curl_child,
+        stdout,
+    })
+}
+
+fn hunt_loop(gen: u64, sources: Vec<String>) {
+    use std::io::Read;
+    let n = sources.len();
+    let mut idx = 0usize;
+    loop {
         {
-            Ok(c) => c,
-            Err(_) => {
-                let mut g = live().lock().unwrap();
-                if g.gen == gen {
-                    g.running = false;
-                }
+            let g = live().lock().unwrap();
+            if g.gen != gen {
                 return;
             }
-        };
+        }
+        let src = sources[idx].clone();
         {
             let mut g = live().lock().unwrap();
             if g.gen != gen {
-                let _ = child.kill();
                 return;
             }
-            g.ffmpeg_pid = Some(child.id());
+            g.monitor = src.clone();
         }
-        let mut out = child.stdout.take().unwrap();
-        // Sliding window at HOP granularity: read HOP samples per step
-        // (23ms at 22050Hz) instead of a full WINDOW (92ms). The window
-        // keeps WINDOW samples for frequency resolution; the *update*
-        // rate is what makes the visualiser feel swift.
-        let mut win = vec![0.0f32; crate::spectrum::WINDOW];
-        let mut hop_bytes = vec![0u8; crate::spectrum::HOP * 4];
-        loop {
-            match out.read_exact(&mut hop_bytes) {
-                Ok(()) => {
-                    let hop: Vec<f32> = hop_bytes
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                        .collect();
-                    slide_window(&mut win, &hop);
-                    let mut g = live().lock().unwrap();
-                    if g.gen != gen {
-                        break;
-                    }
-                    let raw = live_bands(&win, &mut g.peak);
-                    let sm = smooth_bands(&g.smoothed, &raw);
-                    tick_peaks(&mut g.peaks, &sm);
-                    g.smoothed = sm;
+        let mut loud = false;
+        if let Some(mut pcm) = open_pcm(&src) {
+            {
+                let mut g = live().lock().unwrap();
+                if g.gen != gen {
+                    close_pcm(pcm);
+                    return;
                 }
-                Err(_) => break,
+                g.ffmpeg_pid = Some(pcm.ffmpeg.id());
+                g.curl_pid = pcm.curl.as_ref().map(|c| c.id());
+            }
+            let net = is_network_src(&src);
+            let mut silent = 0u32;
+            let mut win = vec![0.0f32; crate::spectrum::WINDOW];
+            let mut hop_bytes = vec![0u8; crate::spectrum::HOP * 4];
+            loop {
+                match pcm.stdout.read_exact(&mut hop_bytes) {
+                    Ok(()) => {
+                        let hop: Vec<f32> = hop_bytes
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        slide_window(&mut win, &hop);
+                        let mut g = live().lock().unwrap();
+                        if g.gen != gen {
+                            break;
+                        }
+                        if hop_loud(&hop) {
+                            silent = 0;
+                            loud = true;
+                        } else {
+                            silent = silent.saturating_add(1);
+                        }
+                        let raw = live_bands(&win, &mut g.peak);
+                        let sm = smooth_bands(&g.smoothed, &raw);
+                        tick_peaks(&mut g.peaks, &sm);
+                        g.smoothed = sm;
+                        drop(g);
+                        let limit = if loud {
+                            hold_hops()
+                        } else {
+                            probe_hops(net)
+                        };
+                        if silent >= limit {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            close_pcm(pcm);
+        }
+        {
+            let mut g = live().lock().unwrap();
+            if g.gen != gen {
+                return;
+            }
+            g.ffmpeg_pid = None;
+            g.curl_pid = None;
+        }
+        let next = next_source_idx(idx, n);
+        if next == 0 && !loud {
+            // Full silent round — do not hammer curl. Recheck in a bit.
+            for _ in 0..15 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if live().lock().unwrap().gen != gen {
+                    return;
+                }
             }
         }
-        let _ = child.kill();
-        let mut g = live().lock().unwrap();
-        if g.gen == gen {
-            g.running = false;
-            g.ffmpeg_pid = None;
-        }
-    });
-    true
+        idx = next;
+    }
 }
 
 /// Slide `hop` new samples into `win`, dropping the oldest. Keeps the
@@ -359,16 +566,52 @@ mod tests {
     #[test]
     fn start_retargets_when_monitor_changes() {
         let src = std::fs::read_to_string("src/viz.rs").expect("viz.rs");
-        let start = src.find("pub fn start").expect("start");
+        let start = src.find("pub fn start_hunt").expect("start_hunt");
         let end = src[start..]
             .find("\n/// Slide")
             .map(|i| start + i)
             .unwrap_or(src.len());
         let body = &src[start..end];
-        assert!(body.contains("stop()"), "new monitor stops the old ffmpeg");
+        assert!(body.contains("stop()"), "new list stops the old ffmpeg");
         assert!(
-            body.contains("g.monitor == monitor"),
-            "same monitor is a no-op"
+            body.contains("g.sources == sources"),
+            "same hunt list is a no-op"
+        );
+        assert!(
+            body.contains("://"),
+            "HEOS radio URL uses ffmpeg -i, not pulse"
+        );
+        assert!(
+            body.contains("doh-url") && body.contains("curl"),
+            "station URL goes through curl DoH (system DNS SERVFAILs some hosts)"
+        );
+        assert!(
+            body.contains("nobuffer")
+                && body.contains("low_delay")
+                && body.contains("probesize")
+                && body.contains("fragment_size")
+                && body.contains("flush_packets"),
+            "viz ffmpeg uses the same low-delay flags as the follow encoder"
+        );
+        assert!(
+            body.contains("262144") && body.contains("1000000"),
+            "HTTP probe is large enough to detect Icecast AAC"
+        );
+        assert!(
+            body.contains("\"-N\"") || body.contains("-N"),
+            "curl -N so Icecast is not held in stdout buffer"
+        );
+        assert!(
+            src.contains("fn reap_child") && body.contains("close_pcm"),
+            "killed ffmpeg/curl are wait()ed so they do not zombie"
+        );
+        assert!(
+            body.contains("open_pcm") && body.contains("idx = next"),
+            "one reader walks sources; next after silence"
+        );
+        assert!(
+            body.contains("from_millis(100)"),
+            "silent round parks before respawning curl"
         );
         assert!(src.contains("pub fn stop"), "TUI exit / retarget kills viz ffmpeg");
         let stop = src.find("pub fn stop").expect("stop");
@@ -388,6 +631,43 @@ mod tests {
     }
 
     #[test]
+    fn hop_loud_skips_quiet() {
+        assert!(!hop_loud(&[0.0; 8]));
+        assert!(!hop_loud(&[0.009, -0.009]));
+        assert!(hop_loud(&[0.0, 0.01]));
+        assert!(hop_loud(&[-0.02]));
+    }
+
+    #[test]
+    fn next_source_wraps() {
+        assert_eq!(next_source_idx(0, 0), 0);
+        assert_eq!(next_source_idx(0, 1), 0);
+        assert_eq!(next_source_idx(0, 3), 1);
+        assert_eq!(next_source_idx(2, 3), 0);
+    }
+
+    #[test]
+    fn probe_is_faster_on_pulse_than_http() {
+        assert!(probe_hops(false) < probe_hops(true));
+        assert!(hold_hops() > probe_hops(true));
+        assert!(is_network_src("http://x/s"));
+        assert!(is_network_src("https://x/s"));
+        assert!(!is_network_src("alsa_output.pci-0000_31_00.4.analog-stereo.monitor"));
+    }
+
+    #[test]
+    fn dedup_keeps_order() {
+        let v = dedup_sources(&[
+            "a".into(),
+            " a ".into(),
+            String::new(),
+            "b".into(),
+            "a".into(),
+        ]);
+        assert_eq!(v, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
     fn live_bands_normalizes() {
         let mut peak = 1e-3;
         // a real tone (sine), not DC — flat signal reads as silence
@@ -404,11 +684,12 @@ mod tests {
 mod latency_tests {
     use super::*;
 
-    /// HOP is the update step: 256 samples @ 22050Hz = ~11.6ms.
+    /// HOP is the update step: 128 samples @ 22050Hz = ~5.8ms.
     #[test]
     fn hop_gives_fast_updates() {
+        assert_eq!(crate::spectrum::HOP, 128);
         let step_ms = crate::spectrum::HOP as f64 * 1000.0 / crate::spectrum::SAMPLE_RATE as f64;
-        assert!(step_ms < 25.0, "HOP step should be under 25ms, got {step_ms:.1}ms");
+        assert!(step_ms < 8.0, "HOP step should be under 8ms, got {step_ms:.1}ms");
     }
 
     /// WINDOW still defines resolution: 2048 samples = ~92ms of audio.

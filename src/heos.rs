@@ -87,6 +87,9 @@ pub struct HeosPlayer {
     pub state: Option<String>,
     pub volume: Option<i32>,
     pub song: Option<String>,
+    /// HTTP(S) stream from `get_now_playing_media` `mid` (TuneIn radio).
+    /// Empty for file casts and TuneIn ids that are not URLs.
+    pub stream_url: Option<String>,
 }
 
 
@@ -293,6 +296,9 @@ fn apply_msg(p: &mut HeosPlayer, objs: &[Value]) {
                     p.song = Some(s.to_string());
                 }
             }
+            if let Some(mid) = pl.get("mid").and_then(|x| x.as_str()) {
+                p.stream_url = crate::stream::http_url(mid);
+            }
         }
     }
 }
@@ -311,6 +317,7 @@ pub fn parse_get_players(objs: &[Value], fallback_ip: &str) -> Vec<HeosPlayer> {
                     state: None,
                     volume: None,
                     song: None,
+                    stream_url: None,
                 });
             }
             if !out.is_empty() {
@@ -705,6 +712,7 @@ fn player_from_json(v: &Value) -> Option<HeosPlayer> {
         state: None,
         volume: None,
         song: None,
+        stream_url: None,
     })
 }
 
@@ -1723,6 +1731,33 @@ mod tests {
         assert_eq!(groups[0].name, "Late");
     }
 
+    #[test]
+    fn apply_msg_copies_http_mid() {
+        let mut p = HeosPlayer::default();
+        apply_msg(
+            &mut p,
+            &[json!({
+                "heos": {"command": "player/get_now_playing_media", "result": "success"},
+                "payload": {
+                    "song": "Jazz",
+                    "mid": "http://example.invalid/stream.aac",
+                    "type": "station"
+                }
+            })],
+        );
+        assert_eq!(
+            p.stream_url.as_deref(),
+            Some("http://example.invalid/stream.aac")
+        );
+        apply_msg(&mut p, &[json!({"payload": {"mid": "s12345"}})]);
+        assert_eq!(p.stream_url, None);
+        apply_msg(
+            &mut p,
+            &[json!({"payload": {"mid": "https://ex/s.mp3"}})],
+        );
+        assert_eq!(p.stream_url.as_deref(), Some("https://ex/s.mp3"));
+    }
+
     fn office() -> HeosPlayer {
         HeosPlayer {
             name: "Vanguarda Office".into(),
@@ -1733,6 +1768,7 @@ mod tests {
             state: None,
             volume: None,
             song: None,
+            stream_url: None,
         }
     }
 

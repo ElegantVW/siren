@@ -4,6 +4,7 @@
 //! transport CLI, two-box TUI, audio/HEOS, trove, tags, dir browser.
 
 mod config;
+mod encode;
 mod heos;
 mod library;
 mod meta;
@@ -127,6 +128,12 @@ enum Cmd {
         /// Video URL or "ytsearch:query"
         url: Vec<String>,
     },
+    /// PCM HTTP encoder (follow). Same ELF as the TUI.
+    #[command(hide = true)]
+    Stream {
+        #[command(subcommand)]
+        sub: StreamCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -162,6 +169,15 @@ enum AudioCmd {
     Follow {
         /// on | off | run (run = on, then wait for the encoder — systemd)
         action: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum StreamCmd {
+    /// Serve WAV/L16 from a Pulse monitor
+    Serve {
+        port: Option<u16>,
+        monitor: Option<String>,
     },
 }
 
@@ -1697,6 +1713,14 @@ fn main() -> Result<()> {
         Some(Cmd::Trove { args }) => cmd_trove(&args),
         Some(Cmd::Radio { args }) => cmd_radio(&args),
         Some(Cmd::Video { url }) => cmd_video(&url),
+        Some(Cmd::Stream { sub }) => match sub {
+            StreamCmd::Serve { port, monitor } => {
+                let port = port.unwrap_or(stream::DEFAULT_PORT);
+                let monitor =
+                    monitor.unwrap_or_else(|| stream::monitor_of(stream::MASTER));
+                encode::serve(port, &monitor)
+            }
+        },
         Some(Cmd::Sleep { args }) => cmd_sleep(&args),
         Some(Cmd::Queue { args }) => cmd_queue(&args),
         Some(Cmd::Playlist { args }) => cmd_playlist(&args),
@@ -1820,6 +1844,14 @@ mod deadline_tests {
         );
         assert!(body.contains("wait_while_encoder"), "follow run waits on encoder");
         assert!(body.contains("\"run\""), "systemd ExecStart is follow run");
+        assert!(
+            src.contains("encode::serve"),
+            "siren stream serve is the rust encoder"
+        );
+        assert!(
+            src.contains("StreamCmd::Serve"),
+            "clap Stream Serve wires the encoder"
+        );
     }
 
     #[test]

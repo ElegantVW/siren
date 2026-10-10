@@ -10,14 +10,26 @@ or email evenweaker@disroot.org with subject `[siren test]`.
    Radio/trove if `curl` exists. Needs **mpv** on PATH.
 2. **HEOS remote (optional)** — TCP `:1255` on the **speaker LAN**.
    A laptop on a different network will not see the house speakers.
-3. **House follow** — PipeWire `Siren_Master`, python encoder, systemd.
+3. **House follow** — PipeWire `Siren_Master`, `siren stream serve`, systemd.
    Skip on other machines (empty mixer, quiet waves, follow prints a skip).
 
 Hard dependency: **mpv**. Everything else fails closed.
 
 ## Install
 
-Preferred: **build on the machine you test** (proves the port):
+Prebuilt vessel (linux + windows) is on the Grove card:
+[elegantvw.github.io/grove/#app-siren](https://elegantvw.github.io/grove/#app-siren)
+and on [GitHub Releases](https://github.com/ElegantVW/siren/releases).
+macOS is source this pass.
+
+Windows: install [mpv](https://mpv.io), use **Windows Terminal**, put
+`siren-windows-x86_64.exe` on PATH or next to your music. Waves stay
+quiet (no Pulse). Mixer empty. Follow skip.
+
+Linux prebuilt: `chmod +x siren-linux-x86_64` and put it on PATH, plus
+`mpv`. Built on Arch; older glibc boxes should build from source.
+
+Preferred if you want to prove the port: **build on the machine**:
 
 ```bash
 sudo apt install mpv rustc cargo   # Debian / Q4OS
@@ -25,17 +37,6 @@ brew install mpv rust              # macOS
 git clone https://github.com/ElegantVW/siren.git
 cd siren && ./build.sh install     # ~/.local/bin/siren
 ```
-
-Unix with a prebuilt ELF:
-
-```bash
-chmod +x siren && mv siren ~/.local/bin/
-apt install mpv
-```
-
-Windows: install [mpv](https://mpv.io), copy `siren.exe` next to it or
-onto PATH. Use Windows Terminal. WSL fallback: run the Linux binary
-inside WSL with Linux mpv.
 
 Library default: `~/Music` (Windows: `%USERPROFILE%\Music`).
 Config: `~/.config/siren/config.json`.

@@ -1,5 +1,56 @@
 # Siren changelog
 
+## 2026-10-10 — v0.1.1 vessel downloads
+
+- GitHub Release: linux x86_64 + windows x86_64 `.exe`. Grove card has
+  the buttons. macOS is still source (`docs/PORT.md`). mpv is required.
+  Waves/mixer/follow skip on Windows (no Pulse).
+
+## 2026-10-10 — tab push, no viz flip/zoom
+
+- Viz is horizontal only. `t` / space / `V` no longer flip or zoom.
+- Tab / Shift-Tab push the top pane ~180ms (ease-out cubic). Waves
+  strip and menu snap to the destination. 60Hz while the push is live.
+
+## 2026-10-10 — waves at 60Hz
+
+- Event loop schedules 60Hz from the target tick (period
+  `1e9/60` ns). Draw time is not added as extra sleep. Late frames
+  resync. Smoothing is snappier (attack 0.80 / release 0.45 toward
+  the new hop) so 60 frames read as 60Hz. `HOP` 128, `WINDOW` 2048.
+
+## 2026-10-10 — waves low-delay capture
+
+- Viz ffmpeg matches the follow encoder: `nobuffer` / `low_delay` /
+  Pulse `probesize 32` / `fragment_size 1920`. HTTP probe is 256KiB /
+  1s so Icecast AAC still detects (`probesize 32` on `pipe:0` was
+  `Invalid data` and empty waves). curl `-N`. `HOP` 128 (~5.8ms).
+  Window stays 2048. Draw stays 60fps. Killed ffmpeg/curl are wait()ed.
+
+## 2026-10-10 — waves hunt a live source
+
+- If the current capture is silent, viz steps to the next candidate.
+  Order: analog monitor, `Siren_Master.monitor`, HEOS HTTP last
+  (follow puts Master first). One ffmpeg (and optional curl) at a
+  time. Quiet Pulse ~280ms, HTTP ~1s, then hop. After a full silent
+  round, 1.5s pause so curl does not loop. No extra readers, no
+  follow restart, Cave play left alone.
+
+## 2026-10-10 — waves tap HEOS radio URL
+
+- With `audio_output=heos`, viz taps the station `mid` when it is
+  `http://` / `https://`. curl DoH (`1.1.1.1`) feeds ffmpeg — this
+  box's stub DNS SERVFAILs some radio hosts. Follow still uses
+  `Siren_Master.monitor`. Headset analog stays the local path.
+- Cave play is left alone (no follow restart, no SOAP Stop).
+
+## 2026-10-10 — Rust follow encoder, TUI does not bind :8899
+
+- `siren stream serve` is the WAV/L16 HTTP encoder (same ELF). Python
+  `scripts/siren-stream` is gone. Opening the TUI starts viz ffmpeg
+  only; follow (`W` / `audio follow on`) is what binds `:8899`.
+- Opening the TUI starts viz ffmpeg only. Follow binds `:8899`.
+
 ## 2026-10-10 — compat tests on this box
 
 - `tests/compat_play.rs` plays a generated wav through the siren binary
@@ -122,7 +173,7 @@
 
 - Identity: public command is the Rust engine (`~/bin/siren` launcher →
   `~/.local/lib/faeos/siren`). Kit Python player is gone; `build.sh`
-  no longer mentions it. Stream encoder on `:8899` is still Python.
+  no longer mentions it. Stream encoder on `:8899` is `siren stream serve`.
 - `url_alive` retries GET when HEAD is 400/405. OXIGÉNIO was HEAD 400 /
   GET 200 and was being skipped as dead while a leftover mpv played it.
 - `siren now` / `status` / `audio` use the 5s deadline; expired roster

@@ -16,7 +16,7 @@ Headset default (calls, Zen, WhatsApp)
 Siren music (follow on)
   mpv --audio-device=pulse/Siren_Master
     → Siren_Master.monitor
-    → scripts/siren-stream  :8899/siren.wav
+    → siren stream serve  :8899/siren.wav
     → Cave UPnP SetAVTransportURI  (TCP 60006)
     → Cave HTTP GET 192.168.11.1:8899
 ```
@@ -71,7 +71,7 @@ Speaker LAN addressing is Siren's (`systemd/10-siren-heos.network`,
 |------|-----|-----|
 | TCP 1255 | HEOS CLI | `heos://` newline JSON. IPv4 only. |
 | TCP 60006 | HEOS UPnP | SetAVTransportURI / GetTransportInfo / Pause. RSTs until the speaker has DNS + WAN. |
-| TCP 8899 | `siren-stream` | Cave GETs `/siren.wav` (WAV/L16). UFW must allow speaker LAN. |
+| TCP 8899 | `siren stream serve` | Cave GETs `/siren.wav` (WAV/L16). UFW must allow speaker LAN. |
 | TCP 8200 | minidlna `VANGUARDA-DLNA` | File cast. Stock unit hides `~/Music` under `ProtectHome=yes`. |
 
 Never poll `:1255` in a tight loop — this firmware wedges its CLI.
@@ -112,7 +112,7 @@ off-LAN: **Cave**.
 `siren audio follow on` (TUI `W`, login unit `siren-follow.service`):
 
 1. Pin mpv to `pulse/Siren_Master`. Headset default stays analog.
-2. Encoder (`scripts/siren-stream`, Python) captures
+2. Encoder (`siren stream serve`) captures
    `Siren_Master.monitor`, listens `:8899`.
 3. UPnP SetAVTransportURI to Cave with `http://<lan-ip>:8899/siren.wav`.
 4. Wait until transport is PLAYING **or TRANSITIONING** — the first
@@ -125,10 +125,12 @@ leaves the headset so the box is never silent.
 The login unit is Type=simple `siren audio follow run`: it stays
 active while the encoder is alive and goes inactive when `:8899` dies.
 
-TUI waves (and the viz view) read the same monitor: `Siren_Master.monitor`
-while follow is on, headset analog when follow is off. Opening the TUI
-before follow, then `W` / the login unit, retargets the reader. The
-small strip hides on the viz tab — that tab *is* the waves.
+TUI waves (and the viz view) hunt one source at a time: headset analog,
+then `Siren_Master.monitor`, then the HEOS station HTTP URL (follow
+puts Master first). A silent capture is skipped quickly; HTTP is last
+so curl only runs if Pulse is quiet. Opening the TUI before follow,
+then `W` / the login unit, retargets the hunt list. The small strip
+hides on the viz tab — that tab *is* the waves.
 
 Volume keys move **HEOS** volume, not the null-sink percent. Seek on
 `/siren.wav` (or duration `00:00:00`) is skipped — firmware wedges

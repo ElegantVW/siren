@@ -36,6 +36,7 @@ const VIEWS: [View; 6] = [
     View::Radio,
     View::Viz,
 ];
+const TAB_MS: u64 = 180;
 
 impl View {
     fn title(&self) -> &'static str {
@@ -55,7 +56,7 @@ impl View {
             View::Audio => "o local/heos · S speaker · W follow · j/k src · m mute · +/- vol · g group",
             View::Trove => "s search · enter vers · D dl · j/k · M more · A all · F format",
             View::Radio => "enter play · C country · s search · f fav · A add url · M more · j/k",
-            View::Viz => "t toggle h/v · V cycle zoom · tab cycle · q quit",
+            View::Viz => "tab cycle · q quit",
         }
     }
 }
@@ -229,8 +230,9 @@ struct App {
     play_phase: usize,
     play_pending: bool,
     play_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
-    viz_vert: bool,
-    viz_zoom: usize,
+    tab_from: Option<View>,
+    tab_dir: i8,
+    tab_at: Instant,
     mpv_label: String,
     mpv_pos: f64,
     mpv_dur: f64,
@@ -341,8 +343,9 @@ impl App {
             play_phase: 0,
             play_pending: false,
             play_rx: None,
-            viz_vert: false,
-            viz_zoom: 1,
+            tab_from: None,
+            tab_dir: 1,
+            tab_at: Instant::now() - Duration::from_secs(99),
             mpv_label: String::new(),
             mpv_pos: 0.0,
             mpv_dur: 0.0,
@@ -412,10 +415,48 @@ impl App {
     /// only when a visualiser is live or a play job is running, else a
     /// slow tick. Keeps CPU proportional to visible animation.
     fn animating(&self) -> bool {
-        self.view() == View::Viz || self.play_pending || self.viz_on
+        self.view() == View::Viz || self.play_pending || self.viz_on || self.tab_live()
+    }
+    fn tab_live(&self) -> bool {
+        self.tab_from.is_some() && self.tab_at.elapsed() < Duration::from_millis(TAB_MS)
+    }
+    fn tab_push(&self) -> Option<(View, i8, f32)> {
+        let from = self.tab_from?;
+        let ms = self.tab_at.elapsed().as_millis() as u64;
+        if ms >= TAB_MS {
+            return None;
+        }
+        Some((from, self.tab_dir, ms as f32 / TAB_MS as f32))
+    }
+    fn shift_view(&mut self, dir: i8) {
+        let from = self.view();
+        let n = VIEWS.len();
+        if dir >= 0 {
+            self.focus = (self.focus + 1) % n;
+        } else {
+            self.focus = (self.focus + n - 1) % n;
+        }
+        self.tab_from = Some(from);
+        self.tab_dir = if dir >= 0 { 1 } else { -1 };
+        self.tab_at = Instant::now();
+        if self.view() == View::Audio {
+            self.force_speaker_poll();
+        }
+        if self.view() == View::Radio {
+            self.radio.favs = radio::favs();
+            if self.radio.stations.is_empty()
+                && !self.radio.loading
+                && (self.radio.country.is_some() || !self.radio.query.trim().is_empty())
+            {
+                radio_fetch(self, 1);
+            }
+        }
     }
     fn is_heos(&self) -> bool {
         self.cfg.audio_output == "heos"
+    }
+    fn heos_viz_url(&self) -> Option<String> {
+        speaker_entry(self).and_then(|p| p.stream_url)
     }
     fn pal(&self) -> crate::theme::Palette {
         crate::theme::named(&self.cfg.palette)
@@ -542,8 +583,15 @@ impl App {
         let (want_mixer, want_groups) = need;
         let (tx, rx) = std::sync::mpsc::channel();
         self.bg_rx = Some(rx);
+        let heos_url = self.heos_viz_url();
         std::thread::spawn(move || {
-            crate::viz::start(&crate::stream::capture_source());
+            let follow = crate::stream::following();
+            let sink = crate::stream::default_sink();
+            crate::viz::start_hunt(&crate::stream::viz_candidates(
+                follow,
+                heos_url.as_deref(),
+                sink.as_deref(),
+            ));
             let mut p = BackgroundPoll {
                 stream_up: crate::stream::encoder_alive(),
                 stream_follow: crate::stream::following(),
@@ -631,6 +679,9 @@ impl App {
                         self.audio.dlna_ok = dlna_ok;
                         self.spk_pending = false;
                         self.spk_rx = None;
+                        // Roster may have a new station URL. Hunt walks
+                        // analog → Master → HTTP; do not pin HTTP here.
+                        self.spawn_bg((false, false));
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         self.spk_pending = false;
@@ -765,16 +816,13 @@ pub fn run() -> anyhow::Result<()> {
 
     let mut app = App::new();
     app.poll_mpv();
-    // encoder for viz + follow; W (follow_on) is what feeds HEOS.
-    if !crate::stream::encoder_alive() {
-        if crate::stream::start(app.stream_port) {
-            app.stream_msg = format!("stream live on :{}", app.stream_port);
-        } else {
-            app.stream_msg = "stream failed to start".into();
-        }
-    }
-    // live visualizer: read the same monitor, run the FFT on it.
-    crate::viz::start(&crate::stream::capture_source());
+    // Viz ffmpeg only. Follow (`W` / `audio follow on`) binds :8899.
+    // Hunt walks analog → Master → HEOS HTTP; one reader at a time.
+    crate::viz::start_hunt(&crate::stream::viz_candidates(
+        crate::stream::following(),
+        app.heos_viz_url().as_deref(),
+        None,
+    ));
     app.viz_on = crate::viz::running();
     let res = event_loop(&mut terminal, &mut app);
     crate::viz::stop();
@@ -796,20 +844,17 @@ fn event_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> anyhow::Result<()> {
-    // Adaptive cadence: 60fps redraws only while something animates
-    // (Viz view, live spectrum, or a play job). CPU stays proportional
-    // to visible motion. Network polls keep their own 2-4s cadence —
-    // they never run at frame rate.
-    let frame = Duration::from_micros(16_667); // ~60fps
+    // 60Hz from the target tick, not draw-end + sleep. Idle views stay
+    // on a 500ms tick. Network polls keep their own cadence.
+    let frame = Duration::from_nanos(1_000_000_000 / 60);
     let slow = Duration::from_millis(500);
-    let mut last_draw = Instant::now() - Duration::from_secs(99);
+    let mut next_draw = Instant::now();
     let mut last_poll = Instant::now() - Duration::from_secs(99);
     terminal.draw(|f| draw(f, app))?;
     loop {
-        // wait only as long as the next frame is due
         let anim = app.animating();
-        let next = if anim { last_draw + frame } else { last_poll + slow };
-        let wait = next.saturating_duration_since(Instant::now());
+        let wait_until = if anim { next_draw } else { last_poll + slow };
+        let wait = wait_until.saturating_duration_since(Instant::now());
         if event::poll(wait)? {
             match event::read()? {
                 Event::Key(key) => {
@@ -817,12 +862,10 @@ fn event_loop(
                         return Ok(());
                     }
                     terminal.draw(|f| draw(f, app))?;
-                    last_draw = Instant::now();
                 }
                 Event::Mouse(me) => {
                     if handle_mouse(app, me) {
                         terminal.draw(|f| draw(f, app))?;
-                        last_draw = Instant::now();
                     }
                 }
                 _ => {}
@@ -845,7 +888,6 @@ fn event_loop(
             poll_radio(app);
             if !anim {
                 terminal.draw(|f| draw(f, app))?;
-                last_draw = Instant::now();
             }
         } else if !anim {
             // harvest background results without a full redraw
@@ -853,10 +895,15 @@ fn event_loop(
             poll_trove(app);
             poll_radio(app);
         }
-        // animation frame: redraw at 60fps only while something moves
-        if anim && last_draw.elapsed() >= frame {
-            terminal.draw(|f| draw(f, app))?;
-            last_draw = Instant::now();
+        if anim {
+            let now = Instant::now();
+            if now >= next_draw {
+                terminal.draw(|f| draw(f, app))?;
+                next_draw += frame;
+                if next_draw < Instant::now() {
+                    next_draw = Instant::now() + frame;
+                }
+            }
         }
     }
 }
@@ -943,22 +990,10 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             return false;
         }
         KeyCode::Tab => {
-            app.focus = (app.focus + 1) % VIEWS.len();
-            if app.view() == View::Audio {
-                app.force_speaker_poll();
-            }
-            if app.view() == View::Radio {
-                app.radio.favs = radio::favs();
-                if app.radio.stations.is_empty()
-                    && !app.radio.loading
-                    && (app.radio.country.is_some() || !app.radio.query.trim().is_empty())
-                {
-                    radio_fetch(app, 1);
-                }
-            }
+            app.shift_view(1);
         }
         KeyCode::BackTab => {
-            app.focus = (app.focus + VIEWS.len() - 1) % VIEWS.len();
+            app.shift_view(-1);
         }
         KeyCode::Char('q') => return true,
         KeyCode::Esc => {
@@ -987,7 +1022,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
             View::Audio => handle_audio(app, code, mods),
             View::Trove => handle_trove(app, code, mods),
             View::Radio => handle_radio(app, code, mods),
-            View::Viz => handle_viz(app, code, mods),
+            View::Viz => {}
         },
     }
     false
@@ -2406,7 +2441,11 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                     }
                 }
             }
-            crate::viz::start(&crate::stream::capture_source());
+            crate::viz::start_hunt(&crate::stream::viz_candidates(
+                crate::stream::following(),
+                app.heos_viz_url().as_deref(),
+                crate::stream::default_sink().as_deref(),
+            ));
             app.viz_on = crate::viz::running();
         }
         KeyCode::Char('j') | KeyCode::Down => {
@@ -2471,21 +2510,16 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
 
 // ---- drawing ----
 
-/// Full-screen visualizer. Both orientations:
-///   horizontal (bars grow up)  and  vertical (bars grow right).
-/// Braille 2×4 dots per cell, peak caps, house-palette gradient.
+/// Full-screen visualizer. Horizontal braille bars, peak caps,
+/// house-palette gradient. Flip/zoom live in viz.rs as pure renderers.
 fn draw_viz(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let p = app.pal();
     let (bands, peaks) = crate::viz::snapshot();
     let accent = p.accent;
-    let dim = p.dim;
-    let zoom = app.viz_zoom.max(1);
-    // inner area of the content box
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(format!(" ✦ siren · viz · {} · {}x ✦ ",
-            if app.viz_vert { "vertical" } else { "horizontal" }, zoom))
+        .title(" ✦ siren · viz ✦ ")
         .border_style(Style::default().fg(accent));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2494,42 +2528,14 @@ fn draw_viz(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     if w == 0 || h == 0 {
         return;
     }
-    let rows: Vec<String> = if app.viz_vert {
-        crate::viz::render_vertical(&bands, &peaks, w / zoom, h / zoom)
-    } else {
-        crate::viz::render_horizontal(&bands, &peaks, w / zoom, h / zoom)
-    };
+    let rows = crate::viz::render_horizontal(&bands, &peaks, w, h);
     for (i, r) in rows.iter().enumerate() {
-        let y = if app.viz_vert {
-            inner.y + (i as u16).saturating_mul(zoom as u16)
-        } else {
-            inner.y + (i as u16).saturating_mul(zoom as u16)
-        };
+        let y = inner.y + i as u16;
         if y >= inner.y + inner.height {
             break;
         }
         let styled = Line::from(Span::styled(r.clone(), Style::default().fg(accent)));
         f.render_widget(Paragraph::new(styled), Rect::new(inner.x, y, inner.width, 1));
-    }
-    // footer hint
-    let hint = if app.viz_vert { " vertical · t flip · V zoom " } else { " horizontal · t flip · V zoom " };
-    let hint_y = inner.y + inner.height.saturating_sub(1);
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(dim)))),
-        Rect::new(inner.x, hint_y, inner.width, 1),
-    );
-}
-
-/// Viz view keys: t = flip orientation, V = zoom cycle.
-fn handle_viz(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
-    match code {
-        KeyCode::Char('t') | KeyCode::Char(' ') => {
-            app.viz_vert = !app.viz_vert;
-        }
-        KeyCode::Char('V') => {
-            app.viz_zoom = (app.viz_zoom % 3) + 1;
-        }
-        _ => {}
     }
 }
 
@@ -2620,11 +2626,7 @@ fn draw_help(f: &mut Frame, app: &mut App) {
             ("M", "more results"),
             ("j / k", "navigate"),
         ]),
-        View::Viz => ("viz", &[
-            ("t / space", "flip horizontal / vertical"),
-            ("V", "cycle zoom"),
-            ("j / k", "navigate"),
-        ]),
+        View::Viz => ("viz", &[]),
     };
     lines.push(Line::from(Span::styled(format!("  {title}"), Style::default().fg(silver).add_modifier(Modifier::BOLD))));
     for (k, d) in keys {
@@ -2645,6 +2647,69 @@ fn draw_help(f: &mut Frame, app: &mut App) {
         .border_style(Style::default().fg(accent));
     let para = Paragraph::new(lines).block(block).wrap(ratatui::widgets::Wrap { trim: false });
     f.render_widget(para, area);
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+fn draw_content(f: &mut Frame, app: &mut App, view: View, area: ratatui::layout::Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if view == View::Viz {
+        draw_viz(f, app, area);
+        return;
+    }
+    let p = app.pal();
+    let out_tag = if app.is_heos() { "heos" } else { "local" };
+    let top_title = format!(" ✦ siren · {} · out:{out_tag} ✦ ", view.title());
+    let top_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(top_title)
+        .border_style(Style::default().fg(p.accent));
+    let inner = top_block.inner(area);
+    f.render_widget(top_block, area);
+    match view {
+        View::Browser => draw_browser(f, app, inner),
+        View::Queue => draw_queue(f, app, inner),
+        View::Audio => draw_audio(f, app, inner),
+        View::Trove => draw_trove(f, app, inner),
+        View::Radio => draw_radio(f, app, inner),
+        View::Viz => {}
+    }
+}
+
+fn draw_top_panes(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    if let Some((from, dir, t)) = app.tab_push() {
+        let e = ease_out_cubic(t);
+        let w = area.width;
+        let incoming = ((e * w as f32).round() as u16).min(w);
+        let outgoing = w.saturating_sub(incoming);
+        let (out_r, in_r) = if dir >= 0 {
+            (
+                Rect::new(area.x, area.y, outgoing, area.height),
+                Rect::new(area.x.saturating_add(outgoing), area.y, incoming, area.height),
+            )
+        } else {
+            (
+                Rect::new(area.x.saturating_add(incoming), area.y, outgoing, area.height),
+                Rect::new(area.x, area.y, incoming, area.height),
+            )
+        };
+        if outgoing > 0 {
+            draw_content(f, app, from, out_r);
+        }
+        if incoming > 0 {
+            let to = app.view();
+            draw_content(f, app, to, in_r);
+        }
+    } else {
+        let to = app.view();
+        draw_content(f, app, to, area);
+    }
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
@@ -2669,27 +2734,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         })
         .split(f.area());
 
-    if viz {
-        draw_viz(f, app, chunks[0]);
-    } else {
-        let out_tag = if app.is_heos() { "heos" } else { "local" };
-        let top_title = format!(" ✦ siren · {} · out:{out_tag} ✦ ", focus.title());
-        let top_block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(top_title)
-            .border_style(Style::default().fg(p.accent));
-        let inner = top_block.inner(chunks[0]);
-        f.render_widget(top_block, chunks[0]);
-        match focus {
-            View::Browser => draw_browser(f, app, inner),
-            View::Queue => draw_queue(f, app, inner),
-            View::Audio => draw_audio(f, app, inner),
-            View::Trove => draw_trove(f, app, inner),
-            View::Radio => draw_radio(f, app, inner),
-            View::Viz => {}
-        }
-
+    draw_top_panes(f, app, chunks[0]);
+    if !viz {
         let wave_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -2750,10 +2796,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                     }
                 }
                 View::Queue => format!("{} queued · tab cycle · q quit", queue::snapshot().len()),
-                View::Viz => format!(
-                    "{} · t flip · V zoom · tab cycle · q quit",
-                    if app.viz_vert { "vertical" } else { "horizontal" }
-                ),
+                View::Viz => "waves · tab cycle · q quit".into(),
                 View::Audio => format!("out:{} · spk:{} · tab cycle · q quit", app.cfg.audio_output, app.cfg.audio_speaker),
                 View::Trove => {
                     let st = if app.trove.searching {
@@ -3410,7 +3453,6 @@ mod viz_key_tests {
 
     fn viz_app() -> App {
         let mut app = App::new();
-        // move focus to Viz (last view)
         while app.view() != View::Viz {
             app.focus = (app.focus + 1) % VIEWS.len();
         }
@@ -3424,40 +3466,47 @@ mod viz_key_tests {
     }
 
     #[test]
-    fn t_toggles_orientation() {
+    fn viz_has_no_flip_or_zoom() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("tui.rs");
+        let prod = src.split("mod viz_key_tests").next().unwrap();
+        assert!(!prod.contains("viz_vert"), "no orientation toggle");
+        assert!(!prod.contains("viz_zoom"), "no zoom cycle");
+        assert!(!prod.contains("fn handle_viz"), "viz keys are gone");
+        assert!(!prod.contains("t flip"), "status/help do not mention flip");
         let mut app = viz_app();
-        assert!(!app.viz_vert, "starts horizontal");
-        handle_viz(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
-        assert!(app.viz_vert, "t flips to vertical");
-        handle_viz(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
-        assert!(!app.viz_vert, "t flips back to horizontal");
+        handle_key(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('V'), KeyModifiers::NONE);
+        assert_eq!(app.view(), View::Viz);
     }
 
     #[test]
-    fn space_also_toggles_orientation() {
-        let mut app = viz_app();
-        handle_viz(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
-        assert!(app.viz_vert);
+    fn tab_starts_right_push() {
+        let mut app = App::new();
+        assert_eq!(app.view(), View::Browser);
+        handle_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.view(), View::Queue);
+        assert_eq!(app.tab_from, Some(View::Browser));
+        assert_eq!(app.tab_dir, 1);
+        assert!(app.tab_live());
+        assert!(app.animating(), "push keeps 60Hz even off viz");
     }
 
     #[test]
-    fn v_cycles_zoom_1_2_3() {
-        let mut app = viz_app();
-        assert_eq!(app.viz_zoom, 1);
-        handle_viz(&mut app, KeyCode::Char('V'), KeyModifiers::NONE);
-        assert_eq!(app.viz_zoom, 2);
-        handle_viz(&mut app, KeyCode::Char('V'), KeyModifiers::NONE);
-        assert_eq!(app.viz_zoom, 3);
-        handle_viz(&mut app, KeyCode::Char('V'), KeyModifiers::NONE);
-        assert_eq!(app.viz_zoom, 1, "wraps back to 1");
+    fn backtab_starts_left_push() {
+        let mut app = App::new();
+        handle_key(&mut app, KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(app.view(), View::Viz);
+        assert_eq!(app.tab_from, Some(View::Browser));
+        assert_eq!(app.tab_dir, -1);
+        assert!(app.tab_live());
     }
 
     #[test]
-    fn other_keys_do_not_flip() {
-        let mut app = viz_app();
-        handle_viz(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
-        assert!(!app.viz_vert);
-        assert_eq!(app.viz_zoom, 1);
+    fn ease_out_cubic_is_fast_start() {
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        assert!(ease_out_cubic(0.5) > 0.5, "ease-out front-loads motion");
     }
 }
 
@@ -3492,6 +3541,34 @@ mod animating_tests {
         // browser view, no play job -> slow tick
         assert_eq!(app.view(), View::Browser);
         assert!(!app.animating(), "idle browser should not force 60fps");
+    }
+
+    /// 60Hz from the target tick so draw time is not added as extra sleep.
+    #[test]
+    fn event_loop_schedules_60hz_from_target_tick() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("tui.rs");
+        let start = src.find("fn event_loop").expect("event_loop");
+        let end = src[start..]
+            .find("\n/// True = quit")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            body.contains("1_000_000_000 / 60"),
+            "frame period is exact 60Hz"
+        );
+        assert!(
+            body.contains("next_draw += frame"),
+            "clock advances from the target tick"
+        );
+        assert!(
+            body.contains("next_draw = Instant::now() + frame"),
+            "late frames resync instead of spiraling"
+        );
+        assert!(
+            !body.contains("last_draw = Instant::now()"),
+            "key/mouse draws must not postpone the 60Hz tick"
+        );
     }
 }
 
@@ -3562,12 +3639,12 @@ mod draw_purity_tests {
         );
         let waves = body.find("waves_lines").expect("strip body");
         assert!(
-            body[..waves].contains("} else {"),
+            body[..waves].contains("if !viz"),
             "waves strip only off the viz tab"
         );
         assert!(
-            body.contains("draw_viz(f, app, chunks[0])"),
-            "viz owns the full upper chunk, no second chrome"
+            body.contains("draw_top_panes"),
+            "top pane slides; viz still owns the upper chunk"
         );
         assert!(
             !body.contains("Color::Rgb"),
@@ -3608,6 +3685,30 @@ mod no_blocking_tests {
         }
     }
 
+    /// Opening the TUI must not bind :8899. Viz has its own ffmpeg.
+    #[test]
+    fn tui_run_does_not_start_encoder() {
+        let src = std::fs::read_to_string("src/tui.rs").expect("read tui.rs");
+        let start = src.find("pub fn run()").expect("run");
+        let end = src[start..]
+            .find("\nfn event_loop")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            !body.contains("stream::start"),
+            "TUI must not spawn the follow encoder"
+        );
+        assert!(
+            body.contains("crate::viz::start_hunt"),
+            "TUI still starts the viz ffmpeg hunt"
+        );
+        assert!(
+            body.contains("viz_candidates"),
+            "open walks analog / Master / HTTP, one reader"
+        );
+    }
+
     /// Leaving the TUI must not tear down the systemd sound-card feed.
     #[test]
     fn tui_exit_leaves_follow_up() {
@@ -3642,12 +3743,12 @@ mod no_blocking_tests {
             .unwrap_or(src.len());
         let body = &src[start..end];
         assert!(
-            body.contains("crate::viz::start"),
-            "W must retarget waves onto capture_source"
+            body.contains("crate::viz::start_hunt"),
+            "W must retarget waves onto the hunt list"
         );
         assert!(
-            body.contains("capture_source()"),
-            "W uses Master while following, analog when off"
+            body.contains("viz_candidates"),
+            "W uses Master while following, analog then HTTP when off"
         );
         let bg = src.find("fn spawn_bg").expect("spawn_bg");
         let bg_end = src[bg..]
@@ -3656,12 +3757,30 @@ mod no_blocking_tests {
             .unwrap_or(src.len());
         let bg_body = &src[bg..bg_end];
         assert!(
-            bg_body.contains("crate::viz::start"),
+            bg_body.contains("crate::viz::start_hunt"),
             "worker retargets when systemd follow comes up mid-TUI"
+        );
+        assert!(
+            bg_body.contains("viz_candidates"),
+            "worker hunts analog / Master / HEOS URL"
         );
         assert!(
             bg_body.contains("std::thread::spawn"),
             "retarget stays off the render thread in spawn_bg"
+        );
+        let spk = src.find("fn poll_speaker").expect("poll_speaker");
+        let spk_end = src[spk..]
+            .find("\n    fn force_speaker_poll")
+            .map(|i| spk + i)
+            .unwrap_or(src.len());
+        let spk_body = &src[spk..spk_end];
+        assert!(
+            !spk_body.contains("crate::viz::start(") && !spk_body.contains("crate::viz::start_hunt"),
+            "harvest must not pin waves onto the station URL"
+        );
+        assert!(
+            spk_body.contains("spawn_bg"),
+            "roster harvest lets the worker refresh the hunt list"
         );
     }
 
@@ -3763,6 +3882,10 @@ mod no_blocking_tests {
         assert!(
             body.contains("pixie blush silver siren cave"),
             "help names the five palettes"
+        );
+        assert!(
+            !body.contains("cycle zoom") && !body.contains("flip horizontal"),
+            "help does not list viz flip/zoom"
         );
         assert!(
             src.contains("o local/heos · S speaker · W follow · j/k src · m mute · +/- vol · g group"),

@@ -30,10 +30,7 @@ if [[ "$HOUSE" -eq 1 ]]; then
   mkdir -p "$LIB" "$HOME/bin"
   cp -f "$BIN" "$LIB/siren"
   chmod +x "$LIB/siren"
-  if [[ -f "$ROOT/scripts/siren-stream" ]]; then
-    cp -f "$ROOT/scripts/siren-stream" "$LIB/siren-stream"
-    chmod +x "$LIB/siren-stream"
-  fi
+  rm -f "$LIB/siren-stream"
 
   install_launcher() {
     local dest="$1"

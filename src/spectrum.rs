@@ -13,7 +13,7 @@ use std::sync::{Mutex, OnceLock};
 
 pub const SAMPLE_RATE: u32 = 22050;
 pub const WINDOW: usize = 2048; // ~93ms per FFT
-pub const HOP: usize = 256; // 50% overlap -> 25% step: 8x more updates
+pub const HOP: usize = 128; // ~5.8ms @ 22050; two ticks per 60fps frame
 pub const BANDS: usize = 64;
 pub const FMIN: f32 = 50.0;
 pub const FMAX: f32 = 11025.0;
@@ -256,9 +256,9 @@ pub fn smooth_bands(prev: &[f32; BANDS], cur: &[f32; BANDS]) -> [f32; BANDS] {
     let mut out = [0.0f32; BANDS];
     for i in 0..BANDS {
         out[i] = if cur[i] > prev[i] {
-            prev[i] * 0.35 + cur[i] * 0.65
+            prev[i] * 0.20 + cur[i] * 0.80
         } else {
-            prev[i] * 0.82 + cur[i] * 0.18
+            prev[i] * 0.55 + cur[i] * 0.45
         };
     }
     out

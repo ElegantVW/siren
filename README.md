@@ -5,8 +5,11 @@
 A terminal music player. Local files through **mpv**, a two-box TUI,
 optional HEOS speakers on the same LAN. Linux, Windows, and macOS.
 
-**Status:** 0.1.0 — looking for testers. Hard dependency: **mpv** on
-PATH. Port notes and the smoke list: [`docs/PORT.md`](docs/PORT.md).
+**Status:** 0.1.1 — looking for testers. Hard dependency: **mpv** on
+PATH. Downloads (linux + windows):
+[Grove](https://elegantvw.github.io/grove/#app-siren) /
+[Releases](https://github.com/ElegantVW/siren/releases).
+Port notes and the smoke list: [`docs/PORT.md`](docs/PORT.md).
 House follow / Cave wiring: [`docs/AUDIO.md`](docs/AUDIO.md).
 
 For: flac/mp3/ogg in `~/Music` (Windows: `%USERPROFILE%\Music`), radio,
@@ -73,7 +76,7 @@ any key closes it).
 | audio | `o` local/heos · `S` speaker · `W` follow · mixer `j`/`k`/`m` · `g`/`u`/`G` group · `,`/`.` group vol |
 | trove | `s` search · Enter version · `D` download · `M` more · `A` all · `F` format |
 | radio | Enter/space play · `C` country · `s` search · `f` fav · `A` URL · `M` more |
-| viz | `t`/space flip · `V` zoom |
+| viz | Tab cycles (pane pushes) |
 
 **Group control** (audio view): `g` groups all speakers under current
 speaker as leader, `u` ungroups, `G` toggles group mute, `,`/`.` adjust
@@ -96,11 +99,12 @@ While it runs, the bottom status line shows `| connecting… <name>`
 with an animated `|/-\` spinner. The waves strip is reserved for the
 visualizer and is never used for status.
 
-**Visualizer** (`V` view, last Tab stop): live spectrum from the
-PipeWire monitor. 60fps while animating. Braille rendering (2×4 dots
-per cell). `t`/`space` flips horizontal ↔ vertical; `V` cycles zoom
-1×/2×/3×. Peak-hold caps fall slowly. Other views keep a compact
-horizontal strip; the viz tab is the full canvas (no second box).
+**Visualizer** (`V` view, last Tab stop): live spectrum. Walks analog
+→ Master → HEOS HTTP until one has audio (one reader). 60fps while
+animating. Braille rendering (2×4 dots
+per cell). Horizontal only. Tab / Shift-Tab push the top pane.
+Peak-hold caps fall slowly. Other views keep a compact horizontal
+strip; the viz tab is the full canvas (no second box).
 
 **Follow** (audio view `W`, or `siren audio follow on|off`): Cave plays
 Siren music. Headset (front combo jack) stays the PipeWire default for
