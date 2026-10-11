@@ -2,10 +2,10 @@
 
 ## 2026-10-11 — mixer tab
 
-- New Tab stop: vertical faders for analog phones and live apps.
-  Mouse drag / mute / wheel. On this tab `+/-` is the selected fader,
-  not HEOS, and unshifted arrows pick a channel. Cave stays on the
-  audio tab.
+- New Tab stop: vertical faders for the current speaker, analog
+  phones (and other Pulse sinks), and live apps. Mouse drag / house-wave
+  mute glyph / wheel. On this tab `+/-` is the selected fader, and
+  unshifted arrows pick a channel. `Siren_Master` stays off the board.
 
 ## 2026-10-10 — sea-glass (v0.1.1)
 

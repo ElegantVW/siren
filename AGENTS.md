@@ -67,7 +67,7 @@ House audio diagram: [`docs/AUDIO.md`](docs/AUDIO.md).
 | browser | Enter/space play · `a` add · `c` cast · ⌫ up · `/` filter · `S` save · `L` load · `R` rm |
 | queue | Enter play-from · `d` remove · `C` clear · `s` shuffle |
 | audio | `o` local/heos · `S` speaker · `W` follow · `r` repeat · `v` refresh · `t` test · mixer `j`/`k`/`m` · `g`/`u`/`G` group · `,`/`.` group vol |
-| mixer | drag fader · click mute · `j`/`k`/`←`/`→` select · `+/-` selected · `m` mute |
+| mixer | drag fader · click wave mute · `j`/`k`/`←`/`→` select · `+/-` selected · `m` mute |
 | trove | `s` search · Enter version · `D` download · `M` more · `A` all · `F` format |
 | radio | Enter/space play · `C` country · `s` search · `f` fav · `A` URL · `M` more |
 | viz | Tab cycles (top pane pushes) |
@@ -77,13 +77,16 @@ speaker as leader, `u` ungroups, `G` toggles group mute, `,`/`.` adjust
 group volume. HEOS natively syncs grouped speakers — verified 1–2ms
 drift.
 
-**Mixer** (mixer tab): vertical faders for analog **phones** plus every
-live sink-input. Mouse drag sets volume from Y; click mute; wheel
-nudges the fader under the pointer. On this tab `+/-` is the selected
-fader (eats global HEOS) and unshifted `←`/`→` select a channel
-(Shift still seeks). Loopback is filtered out. `Siren_Master` is
-not a fader — follow stays on the audio tab. Cave/HEOS volume stays
-audio `+/-`. Windows: empty skip (no Pulse). Audio view still lists
+**Mixer** (mixer tab): vertical faders, left to right: current **speaker**
+(HEOS, Cave while that is the pick), every listening Pulse sink
+(analog = **phones**, HDMI / USB / BT when they exist), then live
+sink-inputs. Mouse drag sets volume from Y; click the house-wave
+glyph to mute; wheel nudges the fader under the pointer. On this tab
+`+/-` is the selected fader (eats global HEOS) and unshifted `←`/`→`
+select a channel (Shift still seeks). Loopback is filtered out.
+`Siren_Master` is follow capture, not a column. Audio `S` changes
+which speaker the first fader is. Windows: Pulse columns skip; the
+speaker fader still works off the roster. Audio view still lists
 sources as text (`j/k` `m`).
 
 **Radio honesty**: favorites play their own saved URL first (direct

@@ -892,6 +892,39 @@ pub fn set_mute(ip: &str, pid: i64, on: bool) -> bool {
     ))
 }
 
+/// Mute flag from a HEOS `message` query string. Own parser — `apply_msg`
+/// treats `state=` as play/pause and would clobber transport.
+pub fn parse_mute_state(msg: &str) -> Option<bool> {
+    let q = msg.split('?').nth(1).unwrap_or(msg);
+    for kv in q.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k == "state" {
+                return match v {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => None,
+                };
+            }
+        }
+    }
+    None
+}
+
+pub fn get_mute(ip: &str, pid: i64) -> Option<bool> {
+    let objs = rpc(ip, &[format!("heos://player/get_mute?pid={pid}")]);
+    for o in objs {
+        let msg = o
+            .get("heos")
+            .and_then(|h| h.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        if let Some(b) = parse_mute_state(msg) {
+            return Some(b);
+        }
+    }
+    None
+}
+
 /// NOTE (2026-09-24, verified live): `player/play_stream` with a raw URL
 /// is a dead end on this HEOS 1 unit — accepted then back to `stop`.
 /// But TuneIn browses fine without login (`available:false` lies), and
@@ -1729,6 +1762,30 @@ mod tests {
         let groups = parse_groups(&objs);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].name, "Late");
+    }
+
+    #[test]
+    fn parse_mute_state_reads_on_off() {
+        assert_eq!(
+            parse_mute_state("heos://player/get_mute?pid=1&state=on"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_mute_state("command=player/get_mute&pid=1&state=off"),
+            Some(false)
+        );
+        assert_eq!(parse_mute_state("pid=1"), None);
+        let src = std::fs::read_to_string("src/heos.rs").expect("heos.rs");
+        let start = src.find("pub fn get_mute").expect("get_mute");
+        let end = src[start..]
+            .find("\n///")
+            .or_else(|| src[start..].find("\npub fn "))
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        assert!(
+            !src[start..end].contains("apply_msg"),
+            "get_mute must not reuse apply_msg"
+        );
     }
 
     #[test]

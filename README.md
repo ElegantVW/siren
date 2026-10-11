@@ -74,7 +74,7 @@ any key closes it).
 | browser | Enter/space play · `a` add · `c` cast · ⌫ up · `/` filter · `S` save · `L` load · `R` rm |
 | queue | Enter play-from · `d` remove · `C` clear · `s` shuffle |
 | audio | `o` local/heos · `S` speaker · `W` follow · mixer `j`/`k`/`m` · `g`/`u`/`G` group · `,`/`.` group vol |
-| mixer | drag fader · click mute · `j`/`k`/`←`/`→` select · `+/-` selected · `m` mute |
+| mixer | drag fader · click wave mute · `j`/`k`/`←`/`→` select · `+/-` selected · `m` mute |
 | trove | `s` search · Enter version · `D` download · `M` more · `A` all · `F` format |
 | radio | Enter/space play · `C` country · `s` search · `f` fav · `A` URL · `M` more |
 | viz | Tab cycles (pane pushes) |
@@ -84,10 +84,11 @@ speaker as leader, `u` ungroups, `G` toggles group mute, `,`/`.` adjust
 group volume. HEOS natively syncs grouped speakers — verified 1–2ms
 drift.
 
-**Mixer** (mixer tab): vertical faders for analog phones plus live
-apps. Drag the bar, click mute, wheel to nudge. On this tab `+/-` is
-the selected fader and unshifted `←`/`→` pick a channel. Cave/HEOS
-volume stays audio `+/-`. Windows skips (no Pulse).
+**Mixer** (mixer tab): vertical faders for the current speaker, analog
+phones (and other Pulse sinks), plus live apps. Drag the bar, click
+the wave glyph to mute, wheel to nudge. On this tab `+/-` is the
+selected fader and unshifted `←`/`→` pick a channel. Windows Pulse
+columns skip; the speaker fader still works.
 
 **Radio honesty**: favorites play their own saved URL first (direct
 `play_stream`), TuneIn only as fallback. Playback is verified by

@@ -39,9 +39,10 @@ const VIEWS: [View; 7] = [
     View::Viz,
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MixChan {
-    Phones,
+    Speaker,
+    Out(u8),
     Input(u32),
 }
 
@@ -69,7 +70,7 @@ impl View {
             View::Browser => "enter open/play · a add · c cast · backspace up · / filter · S save · L load · R rm",
             View::Queue => "enter play-from · d remove · C clear · s shuffle",
             View::Audio => "o local/heos · S speaker · W follow · j/k src · m mute · +/- vol · g group",
-            View::Mixer => "drag fader · click mute · j/k/←/→ select · +/- vol · m mute",
+            View::Mixer => "drag fader · click wave mute · j/k/←/→ select · +/- vol · m mute",
             View::Trove => "s search · enter vers · D dl · j/k · M more · A all · F format",
             View::Radio => "enter play · C country · s search · f fav · A add url · M more · j/k",
             View::Viz => "tab cycle · q quit",
@@ -197,7 +198,8 @@ struct BackgroundPoll {
     stream_clients: usize,
     viz_on: bool,
     mixer: Vec<crate::mixer::SinkInput>,
-    phones: Option<crate::mixer::Sink>,
+    outputs: Vec<crate::mixer::Sink>,
+    speaker_muted: Option<bool>,
     mixer_fresh: bool,
     groups: Vec<heos::HeosGroup>,
     groups_fresh: bool,
@@ -245,7 +247,9 @@ struct App {
     mixer: Vec<crate::mixer::SinkInput>,
     mixer_sel: usize,
     mixer_at: Instant,
-    phones: Option<crate::mixer::Sink>,
+    outputs: Vec<crate::mixer::Sink>,
+    speaker_vol: u32,
+    speaker_muted: bool,
     mixer_hits: Vec<FaderHit>,
     mixer_drag: Option<MixChan>,
     mixer_scroll: usize,
@@ -362,7 +366,9 @@ impl App {
             mixer: Vec::new(),
             mixer_sel: 0,
             mixer_at: Instant::now() - Duration::from_secs(99),
-            phones: None,
+            outputs: Vec::new(),
+            speaker_vol: 0,
+            speaker_muted: false,
             mixer_hits: Vec::new(),
             mixer_drag: None,
             mixer_scroll: 0,
@@ -612,6 +618,12 @@ impl App {
         } else {
             None
         };
+        let mute_spk = if need.0 {
+            heos::pick_named(&self.audio.roster, &self.cfg.audio_speaker)
+                .map(|p| (p.ip.clone(), p.pid))
+        } else {
+            None
+        };
         self.bg_pending = true;
         self.bg_at = Instant::now();
         let (want_mixer, want_groups) = need;
@@ -633,7 +645,8 @@ impl App {
                 stream_clients: 0,
                 viz_on: crate::viz::running(),
                 mixer: Vec::new(),
-                phones: None,
+                outputs: Vec::new(),
+                speaker_muted: None,
                 mixer_fresh: false,
                 groups: Vec::new(),
                 groups_fresh: false,
@@ -647,7 +660,10 @@ impl App {
             if want_mixer {
                 p.mixer = crate::mixer::list_inputs();
                 let sinks = crate::mixer::list_sinks();
-                p.phones = crate::mixer::pick_phones(&sinks).cloned();
+                p.outputs = crate::mixer::output_sinks(&sinks);
+                if let Some((ip, pid)) = mute_spk {
+                    p.speaker_muted = crate::heos::get_mute(&ip, pid);
+                }
                 p.mixer_fresh = true;
             }
             if want_groups {
@@ -673,7 +689,15 @@ impl App {
                     if p.mixer_fresh {
                         let drag_pct = self.mixer_drag.map(|c| mixer_vol_mute(self, c).0);
                         self.mixer = p.mixer;
-                        self.phones = p.phones;
+                        self.outputs = p.outputs;
+                        if self.mixer_drag != Some(MixChan::Speaker) {
+                            if let Some(m) = p.speaker_muted {
+                                self.speaker_muted = m;
+                            }
+                            if let Some(v) = mixer_roster_vol(self) {
+                                self.speaker_vol = v;
+                            }
+                        }
                         if let (Some(chan), Some(pct)) = (self.mixer_drag, drag_pct) {
                             mixer_set_local(self, chan, pct);
                         }
@@ -2581,10 +2605,25 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
     }
 }
 
+fn mixer_roster_vol(app: &App) -> Option<u32> {
+    heos::pick_named(&app.audio.roster, &app.cfg.audio_speaker)
+        .and_then(|p| p.volume)
+        .map(|v| v.clamp(0, 100) as u32)
+}
+
+fn mixer_has_speaker(app: &App) -> bool {
+    heos::pick_named(&app.audio.roster, &app.cfg.audio_speaker).is_some()
+}
+
 fn mixer_channels(app: &App) -> Vec<MixChan> {
     let mut out = Vec::new();
-    if app.phones.is_some() {
-        out.push(MixChan::Phones);
+    if mixer_has_speaker(app) {
+        out.push(MixChan::Speaker);
+    }
+    for i in 0..app.outputs.len() {
+        if i < 256 {
+            out.push(MixChan::Out(i as u8));
+        }
     }
     for src in &app.mixer {
         out.push(MixChan::Input(src.id));
@@ -2602,7 +2641,14 @@ fn mixer_selected(app: &App) -> Option<MixChan> {
 
 fn mixer_label(app: &App, chan: MixChan) -> String {
     match chan {
-        MixChan::Phones => "phones".into(),
+        MixChan::Speaker => heos::pick_named(&app.audio.roster, &app.cfg.audio_speaker)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "speaker".into()),
+        MixChan::Out(i) => app
+            .outputs
+            .get(i as usize)
+            .map(crate::mixer::sink_label)
+            .unwrap_or_else(|| "out".into()),
         MixChan::Input(id) => app
             .mixer
             .iter()
@@ -2614,9 +2660,10 @@ fn mixer_label(app: &App, chan: MixChan) -> String {
 
 fn mixer_vol_mute(app: &App, chan: MixChan) -> (u32, bool) {
     match chan {
-        MixChan::Phones => app
-            .phones
-            .as_ref()
+        MixChan::Speaker => (app.speaker_vol, app.speaker_muted),
+        MixChan::Out(i) => app
+            .outputs
+            .get(i as usize)
             .map(|p| (p.volume_pct, p.muted))
             .unwrap_or((0, false)),
         MixChan::Input(id) => app
@@ -2629,29 +2676,47 @@ fn mixer_vol_mute(app: &App, chan: MixChan) -> (u32, bool) {
 }
 
 fn mixer_set_local(app: &mut App, chan: MixChan, pct: u32) {
-    let pct = pct.min(150);
     match chan {
-        MixChan::Phones => {
-            if let Some(p) = app.phones.as_mut() {
-                p.volume_pct = pct;
+        MixChan::Speaker => {
+            app.speaker_vol = pct.min(100);
+        }
+        MixChan::Out(i) => {
+            if let Some(p) = app.outputs.get_mut(i as usize) {
+                p.volume_pct = pct.min(150);
             }
         }
         MixChan::Input(id) => {
             if let Some(s) = app.mixer.iter_mut().find(|s| s.id == id) {
-                s.volume_pct = pct;
+                s.volume_pct = pct.min(150);
             }
         }
     }
 }
 
 fn mixer_apply_vol(app: &mut App, chan: MixChan, pct: u32) {
-    let pct = pct.min(150);
+    let pct = match chan {
+        MixChan::Speaker => pct.min(100),
+        _ => pct.min(150),
+    };
     mixer_set_local(app, chan, pct);
     let name = mixer_label(app, chan);
     let ok = match chan {
-        MixChan::Phones => app
-            .phones
-            .as_ref()
+        MixChan::Speaker => {
+            if let Some((ip, pid, _)) = app.speaker_target() {
+                if heos::apply_volume(&ip, pid, pct as i32, crate::stream::following()) {
+                    patch_roster(app, None, Some(pct as i32));
+                    app.group_volume = pct as i32;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        MixChan::Out(i) => app
+            .outputs
+            .get(i as usize)
             .map(|p| crate::mixer::set_sink_volume(&p.name, pct))
             .unwrap_or(false),
         MixChan::Input(id) => crate::mixer::set_volume(id, pct),
@@ -2664,12 +2729,22 @@ fn mixer_apply_vol(app: &mut App, chan: MixChan, pct: u32) {
 fn mixer_toggle_mute(app: &mut App, chan: MixChan) {
     let name = mixer_label(app, chan);
     match chan {
-        MixChan::Phones => {
-            if let Some(p) = app.phones.as_mut() {
+        MixChan::Speaker => {
+            if let Some((ip, pid, _)) = app.speaker_target() {
+                let next = !app.speaker_muted;
+                if heos::set_mute(&ip, pid, next) {
+                    app.speaker_muted = next;
+                    app.say(format!("{name} mute → {}", if next { "on" } else { "off" }));
+                }
+            }
+        }
+        MixChan::Out(i) => {
+            if let Some(p) = app.outputs.get_mut(i as usize) {
                 let next = !p.muted;
-                if crate::mixer::set_sink_mute(&p.name, next) {
+                let sink = p.name.clone();
+                if crate::mixer::set_sink_mute(&sink, next) {
                     p.muted = next;
-                    app.say(format!("phones mute → {}", if next { "on" } else { "off" }));
+                    app.say(format!("{name} mute → {}", if next { "on" } else { "off" }));
                 }
             }
         }
@@ -2693,7 +2768,11 @@ fn mixer_nudge(app: &mut App, delta: i32) {
         return;
     };
     let (vol, _) = mixer_vol_mute(app, chan);
-    let next = (vol as i32 + delta).clamp(0, 150) as u32;
+    let max = match chan {
+        MixChan::Speaker => 100,
+        _ => 150,
+    };
+    let next = (vol as i32 + delta).clamp(0, max) as u32;
     mixer_apply_vol(app, chan, next);
 }
 
@@ -2906,7 +2985,7 @@ fn draw_help(f: &mut Frame, app: &mut App) {
             (",  .", "group volume -/+"),
         ]),
         View::Mixer => ("mixer", &[
-            ("drag", "set fader (phones + live apps)"),
+            ("drag", "set fader (speaker · outputs · apps)"),
             ("click mute", "mute that channel"),
             ("wheel", "nudge fader under pointer"),
             ("j / k / ← / →", "select channel"),
@@ -3696,14 +3775,14 @@ fn draw_mixer(f: &mut Frame, app: &mut App, area: Rect) {
     if chans.is_empty() {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  nothing playing · Pulse mixer skips on Windows",
+                "  no speaker · Pulse mixer skips on Windows",
                 Style::default().fg(p.dim),
             ))),
             inner,
         );
         return;
     }
-    if inner.width < 6 || inner.height < 6 {
+    if inner.width < 6 || inner.height < 7 {
         return;
     }
     let col_w = ((inner.width / chans.len() as u16).max(6)).min(12);
@@ -3719,10 +3798,10 @@ fn draw_mixer(f: &mut Frame, app: &mut App, area: Rect) {
     let name_y = inner.y;
     let bar_y = inner.y.saturating_add(1);
     let pct_h = 1u16;
-    let mute_h = 1u16;
+    let mute_h = 2u16;
     let bar_h = inner
         .height
-        .saturating_sub(2 + pct_h + mute_h)
+        .saturating_sub(1 + pct_h + mute_h)
         .max(1);
     let pct_y = bar_y.saturating_add(bar_h);
     let mute_y = pct_y.saturating_add(1);
@@ -3774,13 +3853,16 @@ fn draw_mixer(f: &mut Frame, app: &mut App, area: Rect) {
             )),
             Rect::new(x, pct_y, col_w, 1),
         );
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                if muted { "unmute" } else { "mute" },
-                Style::default().fg(if muted { p.warn } else { p.dim }),
-            )),
-            Rect::new(x, mute_y, col_w, 1),
-        );
+        let mark = crate::mixer::mute_mark(muted);
+        let mark_fg = if muted { p.warn } else { p.dim };
+        let mark_w = 5u16.min(col_w);
+        let mark_x = x + col_w.saturating_sub(mark_w) / 2;
+        for (i, line) in mark.iter().enumerate() {
+            f.render_widget(
+                Paragraph::new(Span::styled(*line, Style::default().fg(mark_fg))),
+                Rect::new(mark_x, mute_y.saturating_add(i as u16), mark_w, 1),
+            );
+        }
         app.mixer_hits.push(FaderHit {
             chan: *chan,
             bar: Rect::new(x, bar_y, col_w, bar_h),
@@ -3881,6 +3963,29 @@ mod viz_key_tests {
     }
 
     #[test]
+    fn mixer_speaker_is_first_when_rostered() {
+        let mut app = App::new();
+        app.audio.roster = vec![heos::HeosPlayer {
+            name: "Cave".into(),
+            pid: 1,
+            volume: Some(7),
+            ..heos::HeosPlayer::default()
+        }];
+        app.speaker_vol = 7;
+        app.outputs = vec![crate::mixer::Sink {
+            name: "alsa_output.pci-0000_31_00.4.analog-stereo".into(),
+            description: "HD Audio Controller Analog Stereo".into(),
+            muted: false,
+            volume_pct: 40,
+        }];
+        let ch = mixer_channels(&app);
+        assert_eq!(ch.first().copied(), Some(MixChan::Speaker));
+        assert_eq!(ch.get(1).copied(), Some(MixChan::Out(0)));
+        assert_eq!(mixer_label(&app, MixChan::Out(0)), "phones");
+        assert_eq!(mixer_label(&app, MixChan::Speaker), "Cave");
+    }
+
+    #[test]
     fn mixer_sits_between_audio_and_trove() {
         assert_eq!(VIEWS[2], View::Audio);
         assert_eq!(VIEWS[3], View::Mixer);
@@ -3926,6 +4031,26 @@ mod viz_key_tests {
         assert!(
             !src[draw..draw_end].contains("list_sinks"),
             "draw_mixer must not pactl sinks"
+        );
+        assert!(
+            src[draw..draw_end].contains("mute_mark"),
+            "mixer mute is the house swell"
+        );
+        assert!(
+            !src[draw..draw_end].contains("\"mute\""),
+            "fader must not print mute"
+        );
+        assert!(
+            !src[draw..draw_end].contains("\"unmute\""),
+            "fader must not print unmute"
+        );
+        assert!(
+            !src[draw..draw_end].contains("apply_volume"),
+            "draw_mixer must not HEOS volume"
+        );
+        assert!(
+            !src[draw..draw_end].contains("get_mute"),
+            "draw_mixer must not HEOS mute"
         );
         let harvest = src.find("if p.mixer_fresh").expect("mixer harvest gated");
         let assign = src[harvest..].find("self.mixer = p.mixer").expect("assign");
@@ -4135,7 +4260,7 @@ mod no_blocking_tests {
         // HEOS network round-trip. `stream::running()` is try_wait — a
         // cheap waitpid, fine on the render thread.
         let slow = ["crate::mixer::list_inputs", "crate::mixer::list_sinks",
-                    "crate::stream::master_", "heos::get_groups"];
+                    "crate::stream::master_", "heos::get_groups", "heos::get_mute"];
         let all: Vec<&str> = src.lines().collect();
         // skip our own test module — it contains the needle strings
         let test_start = all.iter().position(|l| l.contains("mod no_blocking_tests"))

@@ -1,8 +1,7 @@
-//! Mixer — analog phones plus per-app output control.
+//! Mixer — speaker, listening sinks, and per-app output control.
 //!
-//! Lists the analog headset sink and every live sink-input, lets the
-//! user mute/unmute and set volume. Synchronous pactl parsing, run
-//! off the render thread. Never writes `Siren_Master` (follow).
+//! Pulse lists run off the render thread. Never writes `Siren_Master`
+//! (follow). HEOS speaker volume lives in the TUI via `heos::apply_volume`.
 
 /// One live audio source.
 #[derive(Debug, Clone, Default)]
@@ -154,13 +153,51 @@ pub fn parse_sinks(text: &str) -> Vec<Sink> {
 pub fn pick_phones(sinks: &[Sink]) -> Option<&Sink> {
     sinks
         .iter()
-        .find(|s| s.name.contains("analog-stereo") && !s.name.contains("Siren"))
-        .or_else(|| {
-            sinks.iter().find(|s| {
-                let d = s.description.to_ascii_lowercase();
-                (d.contains("headphone") || d.contains("analog")) && !s.name.contains("Siren")
-            })
-        })
+        .find(|s| !is_master_sink(&s.name) && sink_label(s) == "phones")
+}
+
+pub fn is_master_sink(name: &str) -> bool {
+    name.contains("Siren_Master")
+}
+
+/// Listening Pulse sinks, analog first. Follow's null sink stays off the board.
+pub fn output_sinks(sinks: &[Sink]) -> Vec<Sink> {
+    let mut out: Vec<Sink> = sinks
+        .iter()
+        .filter(|s| !is_master_sink(&s.name))
+        .cloned()
+        .collect();
+    out.sort_by_key(|s| if sink_label(s) == "phones" { 0u8 } else { 1 });
+    out
+}
+
+pub fn sink_label(s: &Sink) -> String {
+    let n = s.name.to_ascii_lowercase();
+    let d = s.description.to_ascii_lowercase();
+    if n.contains("analog") || d.contains("headphone") || d.contains("analog") {
+        return "phones".into();
+    }
+    if n.contains("hdmi") || d.contains("hdmi") {
+        return "hdmi".into();
+    }
+    if n.contains("bluez") || d.contains("bluetooth") {
+        return "bt".into();
+    }
+    let short = s.name.rsplit('.').next().unwrap_or(s.name.as_str());
+    if short.chars().count() <= 8 {
+        short.to_string()
+    } else {
+        short.chars().take(8).collect()
+    }
+}
+
+/// Two-line house swell used as the mute control (never the word "mute").
+pub fn mute_mark(muted: bool) -> [&'static str; 2] {
+    if muted {
+        ["~ × ~", " ~ ~ "]
+    } else {
+        ["~~~~~", " ~ ~ "]
+    }
 }
 
 pub fn set_sink_mute(name: &str, mute: bool) -> bool {
@@ -281,6 +318,12 @@ Sink Input #467
 	Description: Siren follow null
 	Mute: no
 	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+Sink #4
+	State: SUSPENDED
+	Name: alsa_output.pci-0000_2f_00.1.hdmi-stereo
+	Description: HDMI / DisplayPort
+	Mute: no
+	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
 Sink #57
 	State: SUSPENDED
 	Name: alsa_output.pci-0000_31_00.4.analog-stereo
@@ -292,13 +335,27 @@ Sink #57
     #[test]
     fn parses_sinks_and_picks_phones() {
         let v = parse_sinks(SINKS);
-        assert_eq!(v.len(), 2);
+        assert_eq!(v.len(), 3);
         assert_eq!(v[0].name, "Siren_Master");
-        assert_eq!(v[1].volume_pct, 40);
-        assert!(v[1].muted);
         let p = pick_phones(&v).expect("analog");
         assert!(p.name.contains("analog-stereo"));
         assert!(!p.name.contains("Siren"));
+        let outs = output_sinks(&v);
+        assert_eq!(outs.len(), 2);
+        assert_eq!(sink_label(&outs[0]), "phones");
+        assert_eq!(sink_label(&outs[1]), "hdmi");
+        assert!(outs.iter().all(|s| !is_master_sink(&s.name)));
+    }
+
+    #[test]
+    fn mute_mark_is_house_swell() {
+        let live = mute_mark(false);
+        let quiet = mute_mark(true);
+        assert_eq!(live, ["~~~~~", " ~ ~ "]);
+        assert_eq!(quiet, ["~ × ~", " ~ ~ "]);
+        assert_eq!(live[0].chars().count(), 5);
+        assert_eq!(quiet[0].chars().count(), 5);
+        assert_ne!(live[0], quiet[0]);
     }
 
     #[test]
