@@ -33,25 +33,28 @@ fn connect() -> Option<std::fs::File> {
 }
 
 pub fn alive() -> bool {
-    #[cfg(unix)]
-    {
-        std::path::Path::new(&sock_path()).exists() || connect().is_some()
-    }
-    #[cfg(windows)]
-    {
-        connect().is_some()
-    }
+    connect().is_some()
 }
 
-/// Start idle mpv once per process (mirrors `Player.spawn` + prefs).
+fn unlink_sock() {
+    let p = sock_path();
+    let _ = std::fs::remove_file(&p);
+}
+
+/// Start idle mpv. A leftover sock after logout is not a live player —
+/// unlink and spawn. Failed spawn stays once-per-process so we do not fork-bomb.
 pub fn spawn(cfg: &SirenConfig) -> bool {
-    if alive() {
+    if connect().is_some() {
         return true;
+    }
+    let sock = sock_path();
+    if std::path::Path::new(&sock).exists() {
+        unlink_sock();
+        SPAWN_ATTEMPTED.store(false, Ordering::SeqCst);
     }
     if SPAWN_ATTEMPTED.swap(true, Ordering::SeqCst) {
         return false;
     }
-    let sock = sock_path();
     let gapless = if cfg.gapless { "yes" } else { "no" };
     let mut cmd = std::process::Command::new("mpv");
     cmd.args([
@@ -97,7 +100,11 @@ pub fn spawn(cfg: &SirenConfig) -> bool {
 }
 
 pub fn apply_runtime_prefs(cfg: &SirenConfig) {
-    send(&json!(["set_property", "gapless-audio", if cfg.gapless { "yes" } else { "no" }]));
+    send(&json!([
+        "set_property",
+        "gapless-audio",
+        if cfg.gapless { "yes" } else { "no" }
+    ]));
     send(&json!([
         "set_property",
         "replaygain-mode",
@@ -111,11 +118,7 @@ pub fn apply_runtime_prefs(cfg: &SirenConfig) {
 
 /// Pin mpv to Siren_Master (follow music → Cave) or `auto` (headset default).
 pub fn apply_follow_route(on: bool) {
-    let dev = if on {
-        "pulse/Siren_Master"
-    } else {
-        "auto"
-    };
+    let dev = if on { "pulse/Siren_Master" } else { "auto" };
     let _ = send(&json!(["set_property", "audio-device", dev]));
 }
 
@@ -285,7 +288,22 @@ mod tests {
         let prod = src.split("#[cfg(test)]").next().unwrap();
         assert!(prod.contains("#[cfg(windows)]"), "named pipe client");
         assert!(prod.contains("#[cfg(unix)]"), "unix socket client");
-        assert!(prod.contains("connect()"), "alive is connect, not exists-only");
+        assert!(
+            prod.contains("connect()"),
+            "alive is connect, not exists-only"
+        );
+        let alive_fn = prod
+            .split("pub fn alive()")
+            .nth(1)
+            .unwrap()
+            .split("pub fn")
+            .next()
+            .unwrap();
+        assert!(
+            !alive_fn.contains("exists()"),
+            "alive() must not treat a dangling sock path as up"
+        );
+        assert!(prod.contains("unlink_sock"), "stale sock after logout");
         assert!(prod.contains("SIREN_AO"), "headless tests set --ao=null");
     }
 

@@ -6,6 +6,8 @@ description = "faeOS music vessel — mpv-backed player with HEOS speaker contro
 license = "MIT"
 publish = false
 
+[workspace]
+
 [[bin]]
 name = "siren"
 path = "src/main.rs"

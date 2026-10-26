@@ -8,8 +8,7 @@ use crate::config::SirenConfig;
 use std::path::{Path, PathBuf};
 
 pub const AUDIO_EXT: &[&str] = &[
-    ".mp3", ".flac", ".ogg", ".m4a", ".wav", ".opus", ".mp4", ".mkv", ".mka",
-    ".aac",
+    ".mp3", ".flac", ".ogg", ".m4a", ".wav", ".opus", ".mp4", ".mkv", ".mka", ".aac",
 ];
 
 fn expand_home(p: &str) -> PathBuf {

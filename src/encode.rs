@@ -79,9 +79,8 @@ fn handle_client(mut sock: TcpStream, monitor: &str) {
         return;
     };
     let Some((mime, fmt)) = stream_route(&path) else {
-        let _ = sock.write_all(
-            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        );
+        let _ = sock
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     };
     let headers = format!(
@@ -230,14 +229,8 @@ mod tests {
     #[test]
     fn route_wav_and_l16() {
         assert_eq!(stream_route("/siren.wav"), Some((STREAM_MIME, "wav")));
-        assert_eq!(
-            stream_route("/siren.wav?x=1"),
-            Some((STREAM_MIME, "wav"))
-        );
-        assert_eq!(
-            stream_route("/siren.l16"),
-            Some((STREAM_MIME_L16, "s16be"))
-        );
+        assert_eq!(stream_route("/siren.wav?x=1"), Some((STREAM_MIME, "wav")));
+        assert_eq!(stream_route("/siren.l16"), Some((STREAM_MIME_L16, "s16be")));
         assert_eq!(stream_route("/"), None);
         assert_eq!(stream_route("/index.html"), None);
     }
@@ -246,7 +239,9 @@ mod tests {
     fn ffmpeg_args_pulse_monitor() {
         let a = ffmpeg_args("Siren_Master.monitor", "wav");
         assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "pulse"));
-        assert!(a.windows(2).any(|w| w[0] == "-i" && w[1] == "Siren_Master.monitor"));
+        assert!(a
+            .windows(2)
+            .any(|w| w[0] == "-i" && w[1] == "Siren_Master.monitor"));
         assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "wav"));
         assert_eq!(a.last().map(String::as_str), Some("-"));
         let b = ffmpeg_args("Siren_Master.monitor", "s16be");

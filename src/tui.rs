@@ -4,7 +4,9 @@
 
 use crate::{config::SirenConfig, heos, library, player, playlist, queue, radio};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -394,11 +396,13 @@ impl App {
         let mut dirs: Vec<BrowserEntry> = Vec::new();
         let mut files: Vec<BrowserEntry> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&self.bcwd) {
-            let mut names: Vec<PathBuf> =
-                rd.filter_map(|e| e.ok().map(|x| x.path())).collect();
+            let mut names: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|x| x.path())).collect();
             names.sort();
             for p in names {
-                let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let name = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 if name.starts_with('.') {
                     continue;
                 }
@@ -544,7 +548,9 @@ impl App {
         self.mpv_pos = player::get_f64("time-pos");
         self.mpv_dur = player::get_f64("duration");
         self.mpv_paused = player::get_bool("pause", false);
-        self.mpv_vol = player::get("volume").and_then(|v| v.as_i64()).unwrap_or(self.cfg.default_volume as i64);
+        self.mpv_vol = player::get("volume")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(self.cfg.default_volume as i64);
     }
 
     /// Speaker poll runs in a background thread — never blocks draw/input.
@@ -552,7 +558,11 @@ impl App {
     /// Kick an async play job. Returns immediately; the TUI keeps
     /// drawing a spinner while the job runs. Blocks never — the old
     /// sync path froze the UI for ~4s per play.
-    fn start_play(&mut self, label: String, run: Box<dyn FnOnce() -> Result<String, String> + Send>) {
+    fn start_play(
+        &mut self,
+        label: String,
+        run: Box<dyn FnOnce() -> Result<String, String> + Send>,
+    ) {
         if self.play_pending {
             return; // one job at a time
         }
@@ -959,7 +969,9 @@ fn event_loop(
             app.poll_play();
             // speaker playing-state for the elapsed clock (roster may lag;
             // actions patch it optimistically, so this stays truthful)
-            let playing = speaker_entry(app).and_then(|p| p.state).map(|s| s == "play");
+            let playing = speaker_entry(app)
+                .and_then(|p| p.state)
+                .map(|s| s == "play");
             app.heos_elapsed = app.heos_clock.tick(playing);
             poll_trove(app);
             poll_radio(app);
@@ -994,6 +1006,14 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
     }
     if code == KeyCode::Char('h') {
         app.show_help = true;
+        return false;
+    }
+    if crate::grove_keys::is_cycle_next(code, mods) {
+        app.shift_view(1);
+        return false;
+    }
+    if crate::grove_keys::is_cycle_previous(code, mods) {
+        app.shift_view(-1);
         return false;
     }
     // input mode eats everything except Esc/Enter
@@ -1042,7 +1062,11 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
                 handle_mixer(app, KeyCode::Left);
                 return false;
             }
-            let arg = if mods.contains(KeyModifiers::SHIFT) { "-30" } else { "-5" };
+            let arg = if mods.contains(KeyModifiers::SHIFT) {
+                "-30"
+            } else {
+                "-5"
+            };
             do_seek(app, arg);
             return false;
         }
@@ -1051,7 +1075,11 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
                 handle_mixer(app, KeyCode::Right);
                 return false;
             }
-            let arg = if mods.contains(KeyModifiers::SHIFT) { "+30" } else { "+5" };
+            let arg = if mods.contains(KeyModifiers::SHIFT) {
+                "+30"
+            } else {
+                "+5"
+            };
             do_seek(app, arg);
             return false;
         }
@@ -1081,12 +1109,6 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> bool {
                 Err(m) => app.say(m),
             }
             return false;
-        }
-        KeyCode::Tab => {
-            app.shift_view(1);
-        }
-        KeyCode::BackTab => {
-            app.shift_view(-1);
         }
         KeyCode::Char('q') => return true,
         KeyCode::Esc => {
@@ -1140,9 +1162,7 @@ fn handle_mouse(app: &mut App, me: crossterm::event::MouseEvent) -> bool {
             scroll_by(app, 1);
             true
         }
-        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            click_at(app, me.row)
-        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => click_at(app, me.row),
         _ => false,
     }
 }
@@ -1209,7 +1229,9 @@ fn click_at(app: &mut App, row: u16) -> bool {
     let now = Instant::now();
     let view_no = app.focus as u8;
     let mut last = LAST_CLICK.lock().unwrap();
-    let double = last.1 == row && last.2 == view_no && now.duration_since(last.0) < Duration::from_millis(500);
+    let double = last.1 == row
+        && last.2 == view_no
+        && now.duration_since(last.0) < Duration::from_millis(500);
     *last = (now, row, view_no);
     drop(last);
     match app.view() {
@@ -1237,7 +1259,11 @@ fn click_at(app: &mut App, row: u16) -> bool {
         }
         View::Trove => {
             // 2 rows per doc + optional title row
-            let title_off = if app.trove.query.is_empty() && app.trove.docs.is_empty() { 0 } else { 1 };
+            let title_off = if app.trove.query.is_empty() && app.trove.docs.is_empty() {
+                0
+            } else {
+                1
+            };
             let rel = (row as usize).saturating_sub(1);
             if rel >= title_off {
                 let idx = (rel - title_off) / 2;
@@ -1370,8 +1396,7 @@ fn apply_input(app: &mut App, mode: InputMode, val: &str) {
             if q.is_empty() {
                 return;
             }
-            let mut words: Vec<String> =
-                q.split_whitespace().map(|s| s.to_string()).collect();
+            let mut words: Vec<String> = q.split_whitespace().map(|s| s.to_string()).collect();
             let mut kind: Option<String> = None;
             if !words.is_empty() && crate::trove::is_kind_token(&words[0]) {
                 kind = Some(words.remove(0));
@@ -1394,12 +1419,8 @@ fn apply_input(app: &mut App, mode: InputMode, val: &str) {
             let (tx, rx) = std::sync::mpsc::channel();
             app.trove.search_rx = Some(rx);
             std::thread::spawn(move || {
-                let res = crate::trove::search_page(
-                    kind.as_deref(),
-                    &words,
-                    crate::trove::PAGE_SIZE,
-                    1,
-                );
+                let res =
+                    crate::trove::search_page(kind.as_deref(), &words, crate::trove::PAGE_SIZE, 1);
                 let _ = tx.send(res);
             });
         }
@@ -1445,12 +1466,7 @@ fn trove_fetch_more(app: &mut App) {
     let (tx, rx) = std::sync::mpsc::channel();
     app.trove.more_rx = Some(rx);
     std::thread::spawn(move || {
-        let res = crate::trove::search_page(
-            kind.as_deref(),
-            &words,
-            crate::trove::PAGE_SIZE,
-            page,
-        );
+        let res = crate::trove::search_page(kind.as_deref(), &words, crate::trove::PAGE_SIZE, page);
         let _ = tx.send(res);
     });
 }
@@ -1606,7 +1622,12 @@ fn poll_trove(app: &mut App) {
 /// Download-thread → TUI messages.
 enum DlMsg {
     /// live per-file progress (replaces the previous progress line)
-    Progress { file: String, i: usize, n: usize, frac: Option<f64> },
+    Progress {
+        file: String,
+        i: usize,
+        n: usize,
+        frac: Option<f64>,
+    },
     /// finished line (completion / failure / done summary)
     Line(String),
     /// worker done
@@ -1667,8 +1688,7 @@ fn trove_download(app: &mut App, idxs: Vec<usize>, format: Option<String>) {
                 true,
                 fmt.as_deref(),
                 Some(&mut cb as &mut dyn FnMut(usize, usize, &str, bool)),
-                Some(&mut live
-                    as &mut dyn FnMut(usize, usize, &str, Option<f64>)),
+                Some(&mut live as &mut dyn FnMut(usize, usize, &str, Option<f64>)),
             ) {
                 Ok((ok, n, dir)) => {
                     let _ = tx.send(DlMsg::Line(format!(
@@ -1698,7 +1718,8 @@ fn trove_ask_format(app: &mut App, idx: usize) {
     let (tx, rx) = std::sync::mpsc::channel();
     app.trove.fmt_rx = Some(rx);
     std::thread::spawn(move || {
-        let mut opts = crate::trove::available_formats(&d.identifier, &d.mediatype).unwrap_or_default();
+        let mut opts =
+            crate::trove::available_formats(&d.identifier, &d.mediatype).unwrap_or_default();
         opts.push("all".into());
         let _ = tx.send((idx, opts));
     });
@@ -1780,7 +1801,10 @@ fn handle_trove(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
             }
         }
         KeyCode::Char('f') => {
-            let cur = SESSION_FMTS.iter().position(|f| *f == app.trove.fmt).unwrap_or(0);
+            let cur = SESSION_FMTS
+                .iter()
+                .position(|f| *f == app.trove.fmt)
+                .unwrap_or(0);
             app.trove.fmt = SESSION_FMTS[(cur + 1) % SESSION_FMTS.len()].to_string();
             app.say(format!("trove format → {}", app.trove.fmt));
         }
@@ -1796,9 +1820,12 @@ fn radio_visible(app: &App) -> Vec<(radio::Station, bool)> {
         out.push((s.clone(), true));
     }
     for s in &app.radio.stations {
-        if app.radio.favs.iter().any(|x| {
-            (!x.uuid.is_empty() && x.uuid == s.uuid) || x.url == s.url
-        }) {
+        if app
+            .radio
+            .favs
+            .iter()
+            .any(|x| (!x.uuid.is_empty() && x.uuid == s.uuid) || x.url == s.url)
+        {
             continue;
         }
         out.push((s.clone(), false));
@@ -1866,16 +1893,19 @@ fn radio_open_picker(app: &mut App) {
     });
 }
 
-/// Stage a station on the queue and play it through the one output.
+/// Play a station through the one output. Does not write the file queue.
 /// Non-blocking: the play runs in a job thread so the TUI keeps
 /// drawing the loading spinner instead of freezing ~4s per play.
 fn radio_play(app: &mut App, st: &radio::Station) {
-    queue::replace(vec![radio::to_queue_item(st)]);
     let cfg = app.cfg.clone();
     let label = st.name.clone();
-    app.start_play(label.clone(), Box::new(move || {
-        crate::output::play_from(&cfg, 0).map(|m| format!("{} · {m}", label))
-    }));
+    let url = st.url.clone();
+    app.start_play(
+        label.clone(),
+        Box::new(move || {
+            crate::output::play_station(&cfg, &url, &label).map(|m| format!("{} · {m}", label))
+        }),
+    );
 }
 
 /// Harvest finished radio threads + prefetch near the end (non-blocking).
@@ -2249,7 +2279,11 @@ fn handle_queue(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
         KeyCode::Char('d') => {
             let items = queue::snapshot();
             if let Some(it) = items.get(app.queue_sel) {
-                let d = if it.display.is_empty() { stem_name(&PathBuf::from(&it.path)) } else { it.display.clone() };
+                let d = if it.display.is_empty() {
+                    stem_name(&PathBuf::from(&it.path))
+                } else {
+                    it.display.clone()
+                };
                 let mut v = items;
                 if app.queue_sel < v.len() {
                     v.remove(app.queue_sel);
@@ -2284,7 +2318,9 @@ fn handle_queue(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
 
 fn mpv_toggle_pause(app: &mut App) {
     if crate::stream::following() {
-        if let Some(ip) = crate::stream::follow_speaker_ip().or_else(|| app.speaker_target().map(|t| t.0)) {
+        if let Some(ip) =
+            crate::stream::follow_speaker_ip().or_else(|| app.speaker_target().map(|t| t.0))
+        {
             let to = crate::stream::toggle_follow_pause(&ip);
             patch_roster(app, Some(to), None);
             app.say(format!("follow → {to}"));
@@ -2364,8 +2400,16 @@ fn cycle_repeat(app: &mut App) {
         "all" => "track",
         _ => "off",
     };
-    player::send(&serde_json::json!(["set_property", "loop-playlist", if nxt == "all" { "inf" } else { "no" }]));
-    player::send(&serde_json::json!(["set_property", "loop-file", if nxt == "track" { "inf" } else { "no" }]));
+    player::send(&serde_json::json!([
+        "set_property",
+        "loop-playlist",
+        if nxt == "all" { "inf" } else { "no" }
+    ]));
+    player::send(&serde_json::json!([
+        "set_property",
+        "loop-file",
+        if nxt == "track" { "inf" } else { "no" }
+    ]));
     app.say(format!("repeat {nxt}"));
 }
 
@@ -2403,7 +2447,11 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
         KeyCode::Char('p') | KeyCode::Char(' ') => mpv_toggle_pause(app),
         KeyCode::Char('r') => cycle_repeat(app),
         KeyCode::Char('o') => {
-            app.cfg.audio_output = if app.is_heos() { "local".into() } else { "heos".into() };
+            app.cfg.audio_output = if app.is_heos() {
+                "local".into()
+            } else {
+                "heos".into()
+            };
             let _ = app.cfg.save();
             app.say(format!("output → {}", app.cfg.audio_output));
         }
@@ -2414,9 +2462,16 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                 app.say("no speakers found");
                 return;
             }
-            let cur = app.audio.roster.iter().position(|p| {
-                p.name.to_lowercase().contains(&app.cfg.audio_speaker.to_lowercase())
-            }).unwrap_or(0);
+            let cur = app
+                .audio
+                .roster
+                .iter()
+                .position(|p| {
+                    p.name
+                        .to_lowercase()
+                        .contains(&app.cfg.audio_speaker.to_lowercase())
+                })
+                .unwrap_or(0);
             let next = &app.audio.roster[(cur + 1) % app.audio.roster.len()];
             app.cfg.audio_speaker = next.name.clone();
             let _ = app.cfg.save();
@@ -2425,16 +2480,26 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
         KeyCode::Char('v') => {
             app.force_speaker_poll();
             app.poll_speaker();
-            app.say(format!("{} speaker(s), dlna {}", app.audio.roster.len(), if app.audio.dlna_ok { "ok" } else { "down" }));
+            app.say(format!(
+                "{} speaker(s), dlna {}",
+                app.audio.roster.len(),
+                if app.audio.dlna_ok { "ok" } else { "down" }
+            ));
         }
         KeyCode::Char('t') => {
             // test cast: browser selection, else queue top, else now-playing, else lib top
-            let pick = app.browser_selected().or_else(|| {
-                queue::snapshot().first().map(|it| PathBuf::from(&it.path))
-            }).or_else(|| {
-                let p = player::now_path();
-                if p.is_empty() { None } else { Some(PathBuf::from(p)) }
-            }).or_else(|| app.lib().first().cloned());
+            let pick = app
+                .browser_selected()
+                .or_else(|| queue::snapshot().first().map(|it| PathBuf::from(&it.path)))
+                .or_else(|| {
+                    let p = player::now_path();
+                    if p.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(p))
+                    }
+                })
+                .or_else(|| app.lib().first().cloned());
             match pick {
                 Some(p) => app.cast_path(&p),
                 None => app.say("nothing to cast"),
@@ -2453,7 +2518,10 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                 if members.is_empty() {
                     app.say("no other speakers to group");
                 } else if heos::set_group(&ip, leader, &members) {
-                    app.say(format!("grouped {} speaker(s) under {name}", members.len() + 1));
+                    app.say(format!(
+                        "grouped {} speaker(s) under {name}",
+                        members.len() + 1
+                    ));
                     app.poll_groups();
                 } else {
                     app.say("group failed");
@@ -2481,7 +2549,10 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                     let muted = app.group_muted;
                     if heos::group_set_mute(&ip, gid, !muted) {
                         app.group_muted = !muted;
-                        app.say(format!("group mute → {}", if !muted { "on" } else { "off" }));
+                        app.say(format!(
+                            "group mute → {}",
+                            if !muted { "on" } else { "off" }
+                        ));
                     }
                 }
             } else {
@@ -2560,7 +2631,11 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                     let id = src.id;
                     let name = format!("{} ({})", src.app, src.media);
                     if crate::mixer::set_mute(id, !src.muted) {
-                        app.say(format!("{} mute → {}", name, if !src.muted { "on" } else { "off" }));
+                        app.say(format!(
+                            "{} mute → {}",
+                            name,
+                            if !src.muted { "on" } else { "off" }
+                        ));
                         app.poll_mixer_force();
                     }
                 }
@@ -2568,13 +2643,20 @@ fn handle_audio(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                 // read mute, flip
                 let mut muted = false;
                 for o in heos::rpc(&ip, &[format!("heos://player/get_mute?pid={pid}")]) {
-                    let msg = o.get("heos").and_then(|h| h.get("message")).and_then(|m| m.as_str()).unwrap_or("");
+                    let msg = o
+                        .get("heos")
+                        .and_then(|h| h.get("message"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("");
                     if msg.contains("state=on") {
                         muted = true;
                     }
                 }
                 if heos::set_mute(&ip, pid, !muted) {
-                    app.say(format!("{name} mute → {}", if !muted { "on" } else { "off" }));
+                    app.say(format!(
+                        "{name} mute → {}",
+                        if !muted { "on" } else { "off" }
+                    ));
                     app.force_speaker_poll();
                 }
             } else {
@@ -2859,7 +2941,9 @@ fn handle_mixer_mouse(app: &mut App, me: crossterm::event::MouseEvent) -> bool {
             }
         }
         MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-            let chan = app.mixer_drag.or_else(|| mixer_hit(app, me.column, me.row).map(|p| p.0));
+            let chan = app
+                .mixer_drag
+                .or_else(|| mixer_hit(app, me.column, me.row).map(|p| p.0));
             let Some(chan) = chan else { return false };
             mixer_select_chan(app, chan);
             if let Some(h) = app.mixer_hits.iter().find(|h| h.chan == chan) {
@@ -2911,7 +2995,10 @@ fn draw_viz(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             break;
         }
         let styled = Line::from(Span::styled(r.clone(), Style::default().fg(accent)));
-        f.render_widget(Paragraph::new(styled), Rect::new(inner.x, y, inner.width, 1));
+        f.render_widget(
+            Paragraph::new(styled),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
     }
 }
 
@@ -2925,12 +3012,18 @@ fn draw_help(f: &mut Frame, app: &mut App) {
     let silver = p.silver;
 
     let mut lines = vec![
-        Line::from(Span::styled("  ✦ siren help ✦", Style::default().fg(accent).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "  ✦ siren help ✦",
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        )),
         Line::from(Span::raw("")),
     ];
 
     // global keys — must match handle_key, not the wish-list
-    lines.push(Line::from(Span::styled("  global", Style::default().fg(silver).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(Span::styled(
+        "  global",
+        Style::default().fg(silver).add_modifier(Modifier::BOLD),
+    )));
     for (k, d) in [
         ("tab / shift+tab", "cycle views"),
         ("j / k  or  ↑ / ↓", "navigate (in the focused view)"),
@@ -2954,65 +3047,86 @@ fn draw_help(f: &mut Frame, app: &mut App) {
 
     // view-specific keys
     let (title, keys): (&str, &[(&str, &str)]) = match app.view() {
-        View::Browser => ("browser", &[
-            ("enter", "open / play"),
-            ("a", "add to queue"),
-            ("c", "cast to speaker"),
-            ("backspace", "up one directory"),
-            ("/", "filter"),
-            ("S", "save playlist"),
-            ("L", "load playlist"),
-            ("R", "remove playlist"),
-        ]),
-        View::Queue => ("queue", &[
-            ("enter", "play from cursor"),
-            ("d", "remove from queue"),
-            ("C", "clear queue"),
-            ("s", "shuffle queue"),
-        ]),
-        View::Audio => ("audio", &[
-            ("o", "local = mpv (radio rides follow); heos = Cave fetches"),
-            ("S", "cycle speaker"),
-            ("W", "Siren music → Cave; headset stays analog"),
-            ("r", "cycle repeat"),
-            ("v", "refresh speakers"),
-            ("t", "test cast"),
-            ("m", "mute mixer source (or speaker if none)"),
-            ("j / k", "select mixer source"),
-            ("g", "group all speakers"),
-            ("u", "ungroup"),
-            ("G", "group mute toggle"),
-            (",  .", "group volume -/+"),
-        ]),
-        View::Mixer => ("mixer", &[
-            ("drag", "set fader (speaker · outputs · apps)"),
-            ("click mute", "mute that channel"),
-            ("wheel", "nudge fader under pointer"),
-            ("j / k / ← / →", "select channel"),
-            ("+ / -", "selected fader (not HEOS)"),
-            ("m", "mute selected"),
-        ]),
-        View::Trove => ("trove", &[
-            ("s", "search"),
-            ("enter", "pick version"),
-            ("D", "download"),
-            ("M", "more results"),
-            ("A", "download all"),
-            ("F", "format"),
-            ("j / k", "navigate"),
-        ]),
-        View::Radio => ("radio", &[
-            ("enter / space", "play"),
-            ("C", "pick country"),
-            ("s", "search"),
-            ("f", "toggle favorite"),
-            ("A", "add stream url"),
-            ("M", "more results"),
-            ("j / k", "navigate"),
-        ]),
+        View::Browser => (
+            "browser",
+            &[
+                ("enter", "open / play"),
+                ("a", "add to queue"),
+                ("c", "cast to speaker"),
+                ("backspace", "up one directory"),
+                ("/", "filter"),
+                ("S", "save playlist"),
+                ("L", "load playlist"),
+                ("R", "remove playlist"),
+            ],
+        ),
+        View::Queue => (
+            "queue",
+            &[
+                ("enter", "play from cursor"),
+                ("d", "remove from queue"),
+                ("C", "clear queue"),
+                ("s", "shuffle queue"),
+            ],
+        ),
+        View::Audio => (
+            "audio",
+            &[
+                ("o", "local = mpv (radio rides follow); heos = Cave fetches"),
+                ("S", "cycle speaker"),
+                ("W", "Siren music → Cave; headset stays analog"),
+                ("r", "cycle repeat"),
+                ("v", "refresh speakers"),
+                ("t", "test cast"),
+                ("m", "mute mixer source (or speaker if none)"),
+                ("j / k", "select mixer source"),
+                ("g", "group all speakers"),
+                ("u", "ungroup"),
+                ("G", "group mute toggle"),
+                (",  .", "group volume -/+"),
+            ],
+        ),
+        View::Mixer => (
+            "mixer",
+            &[
+                ("drag", "set fader (speaker · outputs · apps)"),
+                ("click mute", "mute that channel"),
+                ("wheel", "nudge fader under pointer"),
+                ("j / k / ← / →", "select channel"),
+                ("+ / -", "selected fader (not HEOS)"),
+                ("m", "mute selected"),
+            ],
+        ),
+        View::Trove => (
+            "trove",
+            &[
+                ("s", "search"),
+                ("enter", "pick version"),
+                ("D", "download"),
+                ("M", "more results"),
+                ("A", "download all"),
+                ("F", "format"),
+                ("j / k", "navigate"),
+            ],
+        ),
+        View::Radio => (
+            "radio",
+            &[
+                ("enter / space", "play"),
+                ("C", "pick country"),
+                ("s", "search"),
+                ("f", "toggle favorite"),
+                ("A", "add stream url"),
+                ("M", "more results"),
+                ("j / k", "navigate"),
+            ],
+        ),
         View::Viz => ("viz", &[]),
     };
-    lines.push(Line::from(Span::styled(format!("  {title}"), Style::default().fg(silver).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(Span::styled(
+        format!("  {title}"),
+        Style::default().fg(silver).add_modifier(Modifier::BOLD),
+    )));
     for (k, d) in keys {
         lines.push(Line::from(vec![
             Span::raw("    "),
@@ -3022,14 +3136,19 @@ fn draw_help(f: &mut Frame, app: &mut App) {
     }
 
     lines.push(Line::from(Span::raw("")));
-    lines.push(Line::from(Span::styled("  press any key to close", Style::default().fg(dim))));
+    lines.push(Line::from(Span::styled(
+        "  press any key to close",
+        Style::default().fg(dim),
+    )));
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(" ✦ help ✦ ")
         .border_style(Style::default().fg(accent));
-    let para = Paragraph::new(lines).block(block).wrap(ratatui::widgets::Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(ratatui::widgets::Wrap { trim: false });
     f.render_widget(para, area);
 }
 
@@ -3076,11 +3195,21 @@ fn draw_top_panes(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         let (out_r, in_r) = if dir >= 0 {
             (
                 Rect::new(area.x, area.y, outgoing, area.height),
-                Rect::new(area.x.saturating_add(outgoing), area.y, incoming, area.height),
+                Rect::new(
+                    area.x.saturating_add(outgoing),
+                    area.y,
+                    incoming,
+                    area.height,
+                ),
             )
         } else {
             (
-                Rect::new(area.x.saturating_add(incoming), area.y, outgoing, area.height),
+                Rect::new(
+                    area.x.saturating_add(incoming),
+                    area.y,
+                    outgoing,
+                    area.height,
+                ),
                 Rect::new(area.x, area.y, incoming, area.height),
             )
         };
@@ -3160,7 +3289,10 @@ fn draw(f: &mut Frame, app: &mut App) {
             // which is reserved for the visualizer).
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(app.play_spinner(), Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    app.play_spinner(),
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(
                     format!(" connecting… {}", app.play_label),
                     Style::default().fg(p.accent),
@@ -3175,14 +3307,21 @@ fn draw(f: &mut Frame, app: &mut App) {
             let hint = match focus {
                 View::Browser => {
                     if app.filter.trim().is_empty() {
-                        format!("{} · {} entries · tab cycle · q quit", app.cwd_display(), app.bentries.len())
+                        format!(
+                            "{} · {} entries · tab cycle · q quit",
+                            app.cwd_display(),
+                            app.bentries.len()
+                        )
                     } else {
                         format!("{} tracks · tab cycle · q quit", app.filtered().len())
                     }
                 }
                 View::Queue => format!("{} queued · tab cycle · q quit", queue::snapshot().len()),
                 View::Viz => "waves · tab cycle · q quit".into(),
-                View::Audio => format!("out:{} · spk:{} · tab cycle · q quit", app.cfg.audio_output, app.cfg.audio_speaker),
+                View::Audio => format!(
+                    "out:{} · spk:{} · tab cycle · q quit",
+                    app.cfg.audio_output, app.cfg.audio_speaker
+                ),
                 View::Mixer => {
                     let n = mixer_chan_count(app);
                     if n == 0 {
@@ -3209,7 +3348,10 @@ fn draw(f: &mut Frame, app: &mut App) {
                 }
                 View::Radio => {
                     let where_ = if app.radio.query.trim().is_empty() {
-                        app.radio.country.clone().unwrap_or_else(|| "no country".into())
+                        app.radio
+                            .country
+                            .clone()
+                            .unwrap_or_else(|| "no country".into())
                     } else {
                         format!("search: {}", app.radio.query)
                     };
@@ -3224,10 +3366,16 @@ fn draw(f: &mut Frame, app: &mut App) {
                     } else {
                         format!("{}", radio_len(app))
                     };
-                    format!("{where_} · {st} · favs:{} · tab cycle · q quit", app.radio.favs.len())
+                    format!(
+                        "{where_} · {st} · favs:{} · tab cycle · q quit",
+                        app.radio.favs.len()
+                    )
                 }
             };
-            lines.push(Line::from(Span::styled(format!("  {hint}"), Style::default().fg(p.dim))));
+            lines.push(Line::from(Span::styled(
+                format!("  {hint}"),
+                Style::default().fg(p.dim),
+            )));
         }
         (format!(" ✦ {} menu ✦ ", focus.title()), lines)
     };
@@ -3323,11 +3471,14 @@ fn speaker_entry(app: &App) -> Option<heos::HeosPlayer> {
     app.audio
         .roster
         .iter()
-        .find(|p| p.name.to_lowercase().contains(&app.cfg.audio_speaker.to_lowercase()))
+        .find(|p| {
+            p.name
+                .to_lowercase()
+                .contains(&app.cfg.audio_speaker.to_lowercase())
+        })
         .or_else(|| app.audio.roster.first())
         .cloned()
 }
-
 
 /// Render the 64-band spectrum as a 3-row bar chart.
 /// Returns (top, mid, bottom) strings, each 64 chars.
@@ -3387,11 +3538,17 @@ fn waves_lines(app: &App) -> Vec<Line<'static>> {
                 ]));
             }
             None => {
-                lines.push(Line::from(Span::raw(format!("  heos → {}", app.cfg.audio_speaker))));
+                lines.push(Line::from(Span::raw(format!(
+                    "  heos → {}",
+                    app.cfg.audio_speaker
+                ))));
             }
         }
     } else if app.mpv_label.is_empty() && !player::alive() {
-        lines.push(Line::from(Span::styled("  idle — no mpv", Style::default().fg(dim))));
+        lines.push(Line::from(Span::styled(
+            "  idle — no mpv",
+            Style::default().fg(dim),
+        )));
     } else {
         let label = if app.mpv_label.is_empty() {
             "— silence —".to_string()
@@ -3400,7 +3557,10 @@ fn waves_lines(app: &App) -> Vec<Line<'static>> {
         };
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(if app.mpv_paused { "❚❚ " } else { "▶ " }, Style::default().fg(ok)),
+            Span::styled(
+                if app.mpv_paused { "❚❚ " } else { "▶ " },
+                Style::default().fg(ok),
+            ),
             Span::raw(label),
         ]));
     }
@@ -3410,10 +3570,13 @@ fn waves_lines(app: &App) -> Vec<Line<'static>> {
         // even in this short box, instead of the old 3 chunky rows.
         let (bands, peaks) = crate::viz::snapshot();
         let w = 44usize; // cell cols (2 dot cols each = 88 dot cols)
-        let h = 3usize;  // cell rows (4 dot rows each = 12 dot rows)
+        let h = 3usize; // cell rows (4 dot rows each = 12 dot rows)
         let rows = crate::viz::render_horizontal(&bands, &peaks, w, h);
         for r in rows {
-            lines.push(Line::from(Span::styled(format!("  {r}"), Style::default().fg(accent))));
+            lines.push(Line::from(Span::styled(
+                format!("  {r}"),
+                Style::default().fg(accent),
+            )));
         }
     }
     lines
@@ -3514,7 +3677,10 @@ fn draw_trove(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     if !title.is_empty() {
         rows.insert(
             0,
-            ListItem::new(Line::from(Span::styled(title, Style::default().fg(p.silver)))),
+            ListItem::new(Line::from(Span::styled(
+                title,
+                Style::default().fg(p.silver),
+            ))),
         );
     }
     let list = List::new(rows)
@@ -3567,10 +3733,7 @@ fn draw_radio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             rows.push(ListItem::new(Line::from(vec![
                 Span::raw("★ "),
                 Span::styled(s.name.clone(), Style::default().fg(p.warn)),
-                Span::styled(
-                    format!("  [{}]", s.country),
-                    Style::default().fg(p.dim),
-                ),
+                Span::styled(format!("  [{}]", s.country), Style::default().fg(p.dim)),
             ])));
             continue;
         }
@@ -3618,10 +3781,7 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     ]));
     lines.push(Line::from(vec![
         Span::raw("  speaker  "),
-        Span::styled(
-            app.cfg.audio_speaker.clone(),
-            Style::default().fg(p.accent),
-        ),
+        Span::styled(app.cfg.audio_speaker.clone(), Style::default().fg(p.accent)),
         Span::styled("   (s cycle · v refresh)", Style::default().fg(p.dim)),
     ]));
     if app.audio.roster.is_empty() {
@@ -3665,10 +3825,7 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                     format!("{} ", g.name),
                     Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("gid={} ", g.gid),
-                    Style::default().fg(p.dim),
-                ),
+                Span::styled(format!("gid={} ", g.gid), Style::default().fg(p.dim)),
                 Span::styled(
                     if app.group_muted { "muted" } else { "unmuted" },
                     Style::default().fg(if app.group_muted { p.warn } else { p.ok }),
@@ -3701,7 +3858,9 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             Span::raw("  stream  "),
             Span::styled(
                 if up { "live" } else { "down" },
-                Style::default().fg(if up { p.ok } else { p.dim }).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(if up { p.ok } else { p.dim })
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
                 "   master:{}  clients:{}  follow:{}",
@@ -3739,16 +3898,21 @@ fn draw_audio(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                         format!("{} ", src.app),
                         Style::default()
                             .fg(if sel { p.accent } else { p.silver })
-                            .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
+                            .add_modifier(if sel {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
                     ),
                     Span::styled(
-                        format!("{}%{} ", src.volume_pct, if src.muted { " MUTED" } else { "" }),
+                        format!(
+                            "{}%{} ",
+                            src.volume_pct,
+                            if src.muted { " MUTED" } else { "" }
+                        ),
                         Style::default().fg(if src.muted { p.warn } else { p.ok }),
                     ),
-                    Span::styled(
-                        src.media.clone(),
-                        Style::default().fg(p.dim),
-                    ),
+                    Span::styled(src.media.clone(), Style::default().fg(p.dim)),
                 ]));
             }
             lines.push(Line::from(Span::styled(
@@ -3799,10 +3963,7 @@ fn draw_mixer(f: &mut Frame, app: &mut App, area: Rect) {
     let bar_y = inner.y.saturating_add(1);
     let pct_h = 1u16;
     let mute_h = 2u16;
-    let bar_h = inner
-        .height
-        .saturating_sub(1 + pct_h + mute_h)
-        .max(1);
+    let bar_h = inner.height.saturating_sub(1 + pct_h + mute_h).max(1);
     let pct_y = bar_y.saturating_add(bar_h);
     let mute_y = pct_y.saturating_add(1);
 
@@ -3819,12 +3980,22 @@ fn draw_mixer(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let name_style = Style::default()
             .fg(if sel { p.accent } else { p.silver })
-            .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() });
+            .add_modifier(if sel {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
         f.render_widget(
             Paragraph::new(Span::styled(name, name_style)),
             Rect::new(x, name_y, col_w, 1),
         );
-        let fill_fg = if muted { p.warn } else if sel { p.accent } else { p.ok };
+        let fill_fg = if muted {
+            p.warn
+        } else if sel {
+            p.accent
+        } else {
+            p.ok
+        };
         let empty_fg = p.dim;
         let buf = f.buffer_mut();
         let bar_w = (col_w.saturating_sub(2)).min(3).max(1);
@@ -3880,18 +4051,26 @@ mod play_cue_tests {
     fn spinner_cycles_frames() {
         let mut app = App::new();
         assert_eq!(app.play_spinner(), "|");
-        app.play_phase = 1; assert_eq!(app.play_spinner(), "/");
-        app.play_phase = 2; assert_eq!(app.play_spinner(), "-");
-        app.play_phase = 3; assert_eq!(app.play_spinner(), "\\");
-        app.play_phase = 4; assert_eq!(app.play_spinner(), "|"); // wraps
-        app.play_phase = usize::MAX; assert_eq!(app.play_spinner(), "\\"); // no overflow panic
+        app.play_phase = 1;
+        assert_eq!(app.play_spinner(), "/");
+        app.play_phase = 2;
+        assert_eq!(app.play_spinner(), "-");
+        app.play_phase = 3;
+        assert_eq!(app.play_spinner(), "\\");
+        app.play_phase = 4;
+        assert_eq!(app.play_spinner(), "|"); // wraps
+        app.play_phase = usize::MAX;
+        assert_eq!(app.play_spinner(), "\\"); // no overflow panic
     }
 
     /// A finished job harvests into msg and clears the spinner.
     #[test]
     fn play_job_success_clears_and_reports() {
         let mut app = App::new();
-        app.start_play("Cidade FM".into(), Box::new(|| Ok("▶ Cidade FM · playing".into())));
+        app.start_play(
+            "Cidade FM".into(),
+            Box::new(|| Ok("▶ Cidade FM · playing".into())),
+        );
         assert!(app.play_pending, "job should be running");
         assert_eq!(app.play_label, "Cidade FM");
         // let the thread finish
@@ -3899,7 +4078,11 @@ mod play_cue_tests {
         app.poll_play();
         assert!(!app.play_pending, "job should have harvested");
         assert!(app.play_rx.is_none(), "rx cleared");
-        assert!(app.msg.contains("Cidade FM"), "result reported: {}", app.msg);
+        assert!(
+            app.msg.contains("Cidade FM"),
+            "result reported: {}",
+            app.msg
+        );
         assert!(app.play_label.is_empty(), "label cleared");
     }
 
@@ -3907,24 +4090,38 @@ mod play_cue_tests {
     #[test]
     fn play_job_failure_reports_honestly() {
         let mut app = App::new();
-        app.start_play("Antena 2 Ópera".into(), Box::new(|| Err("not responding".into())));
+        app.start_play(
+            "Antena 2 Ópera".into(),
+            Box::new(|| Err("not responding".into())),
+        );
         std::thread::sleep(std::time::Duration::from_millis(120));
         app.poll_play();
         assert!(!app.play_pending);
-        assert!(app.msg.contains("not responding"), "error reported: {}", app.msg);
+        assert!(
+            app.msg.contains("not responding"),
+            "error reported: {}",
+            app.msg
+        );
     }
 
     /// Spinner phase advances while pending, so the frame animates.
     #[test]
     fn spinner_advances_while_pending() {
         let mut app = App::new();
-        app.start_play("x".into(), Box::new(|| {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            Ok("done".into())
-        }));
+        app.start_play(
+            "x".into(),
+            Box::new(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok("done".into())
+            }),
+        );
         let p0 = app.play_phase;
         app.poll_play();
-        assert_eq!(app.play_phase, p0.wrapping_add(1), "phase advances while pending");
+        assert_eq!(
+            app.play_phase,
+            p0.wrapping_add(1),
+            "phase advances while pending"
+        );
     }
 
     /// Only one job at a time — a second start_play is ignored, so
@@ -3932,12 +4129,18 @@ mod play_cue_tests {
     #[test]
     fn play_job_is_single_flight() {
         let mut app = App::new();
-        app.start_play("first".into(), Box::new(|| {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            Ok("first".into())
-        }));
+        app.start_play(
+            "first".into(),
+            Box::new(|| {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                Ok("first".into())
+            }),
+        );
         app.start_play("second".into(), Box::new(|| Ok("second".into())));
-        assert_eq!(app.play_label, "first", "second start ignored while first runs");
+        assert_eq!(
+            app.play_label, "first",
+            "second start ignored while first runs"
+        );
         std::thread::sleep(std::time::Duration::from_millis(250));
         app.poll_play();
         assert!(!app.play_pending);
@@ -4124,10 +4327,13 @@ mod animating_tests {
     #[test]
     fn animating_true_while_play_job_runs() {
         let mut app = App::new();
-        app.start_play("x".into(), Box::new(|| {
-            std::thread::sleep(std::time::Duration::from_millis(120));
-            Ok("done".into())
-        }));
+        app.start_play(
+            "x".into(),
+            Box::new(|| {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                Ok("done".into())
+            }),
+        );
         assert!(app.animating(), "play job must animate (spinner)");
     }
 
@@ -4181,8 +4387,10 @@ mod draw_purity_tests {
         let lines: Vec<&str> = src.lines().collect();
         let mut i = 0;
         while i < lines.len() {
-            if lines[i].starts_with("fn draw") || lines[i].starts_with("fn waves_lines")
-                || lines[i].starts_with("fn spectrum_rows") {
+            if lines[i].starts_with("fn draw")
+                || lines[i].starts_with("fn waves_lines")
+                || lines[i].starts_with("fn spectrum_rows")
+            {
                 // find matching close brace at column 0
                 let mut depth = 0usize;
                 let mut started = false;
@@ -4190,8 +4398,12 @@ mod draw_purity_tests {
                 while j < lines.len() {
                     depth += lines[j].matches('{').count();
                     depth = depth.saturating_sub(lines[j].matches('}').count());
-                    if lines[j].contains('{') { started = true; }
-                    if started && depth == 0 { break; }
+                    if lines[j].contains('{') {
+                        started = true;
+                    }
+                    if started && depth == 0 {
+                        break;
+                    }
                     if lines[j].contains("Command::new") {
                         bad.push(format!("{}:{} spawns a process", lines[i].trim(), j + 1));
                     }
@@ -4201,7 +4413,11 @@ mod draw_purity_tests {
             }
             i += 1;
         }
-        assert!(bad.is_empty(), "draw path must not spawn processes: {:?}", bad);
+        assert!(
+            bad.is_empty(),
+            "draw path must not spawn processes: {:?}",
+            bad
+        );
     }
 
     /// animating() must be cheap (no syscall / mutex) — it is called
@@ -4212,7 +4428,10 @@ mod draw_purity_tests {
         let start = src.find("fn animating").expect("animating present");
         let body = &src[start..start + 400];
         assert!(!body.contains("Command::new"), "animating() must not spawn");
-        assert!(!body.contains("crate::viz::"), "animating() must use cached viz_on, not lock a mutex");
+        assert!(
+            !body.contains("crate::viz::"),
+            "animating() must use cached viz_on, not lock a mutex"
+        );
     }
 
     #[test]
@@ -4259,11 +4478,18 @@ mod no_blocking_tests {
         // only the genuinely expensive calls: pactl (~250-500ms) and the
         // HEOS network round-trip. `stream::running()` is try_wait — a
         // cheap waitpid, fine on the render thread.
-        let slow = ["crate::mixer::list_inputs", "crate::mixer::list_sinks",
-                    "crate::stream::master_", "heos::get_groups", "heos::get_mute"];
+        let slow = [
+            "crate::mixer::list_inputs",
+            "crate::mixer::list_sinks",
+            "crate::stream::master_",
+            "heos::get_groups",
+            "heos::get_mute",
+        ];
         let all: Vec<&str> = src.lines().collect();
         // skip our own test module — it contains the needle strings
-        let test_start = all.iter().position(|l| l.contains("mod no_blocking_tests"))
+        let test_start = all
+            .iter()
+            .position(|l| l.contains("mod no_blocking_tests"))
             .unwrap_or(all.len());
         // find every occurrence outside tests, assert it is after a spawn
         for needle in slow {
@@ -4272,10 +4498,19 @@ mod no_blocking_tests {
                     // walk upward for the enclosing thread::spawn
                     let mut found = false;
                     for back in all[..ln].iter().rev().take(80) {
-                        if back.contains("std::thread::spawn") { found = true; break; }
-                        if back.contains("fn draw") || back.contains("fn event_loop") { break; }
+                        if back.contains("std::thread::spawn") {
+                            found = true;
+                            break;
+                        }
+                        if back.contains("fn draw") || back.contains("fn event_loop") {
+                            break;
+                        }
                     }
-                    assert!(found, "{needle} at line {} is NOT inside a worker thread", ln+1);
+                    assert!(
+                        found,
+                        "{needle} at line {} is NOT inside a worker thread",
+                        ln + 1
+                    );
                 }
             }
         }
@@ -4371,7 +4606,8 @@ mod no_blocking_tests {
             .unwrap_or(src.len());
         let spk_body = &src[spk..spk_end];
         assert!(
-            !spk_body.contains("crate::viz::start(") && !spk_body.contains("crate::viz::start_hunt"),
+            !spk_body.contains("crate::viz::start(")
+                && !spk_body.contains("crate::viz::start_hunt"),
             "harvest must not pin waves onto the station URL"
         );
         assert!(
@@ -4385,9 +4621,18 @@ mod no_blocking_tests {
     fn poll_stream_is_pure_harvest() {
         let src = std::fs::read_to_string("src/tui.rs").expect("read tui.rs");
         let start = src.find("fn poll_stream").expect("poll_stream present");
-        let end = src[start..].find("\n    fn ").map(|i| start + i).unwrap_or(src.len());
+        let end = src[start..]
+            .find("\n    fn ")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
         let body = &src[start..end];
-        for bad in ["Command::new", "list_inputs", "master_", "get_groups", "list short"] {
+        for bad in [
+            "Command::new",
+            "list_inputs",
+            "master_",
+            "get_groups",
+            "list short",
+        ] {
             assert!(!body.contains(bad), "poll_stream must not call {bad}");
         }
     }
@@ -4471,10 +4716,7 @@ mod no_blocking_tests {
             body.contains("quit (closes a picker first)"),
             "Esc quits when no picker"
         );
-        assert!(
-            body.contains("cycle palette"),
-            "help lists T palette cycle"
-        );
+        assert!(body.contains("cycle palette"), "help lists T palette cycle");
         assert!(
             body.contains("pixie blush silver siren cave"),
             "help names the five palettes"
@@ -4484,7 +4726,9 @@ mod no_blocking_tests {
             "help does not list viz flip/zoom"
         );
         assert!(
-            src.contains("o local/heos · S speaker · W follow · j/k src · m mute · +/- vol · g group"),
+            src.contains(
+                "o local/heos · S speaker · W follow · j/k src · m mute · +/- vol · g group"
+            ),
             "audio menu: +/- is global volume, W is follow"
         );
     }

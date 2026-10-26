@@ -1,5 +1,19 @@
 # Siren changelog
 
+## Unreleased — radio is not the file queue
+
+- `player::alive` is a live IPC connect. A leftover sock after logout is
+  unlinked and mpv respawns. Local play no longer prints Queue empty for
+  a dead socket (`mpv not ready`).
+- `siren radio play` / TUI radio call `output::play_station` — one URL
+  through mpv (or TuneIn on heos). They do not write `queue.json`.
+  The file queue stays for playlists and library tracks.
+
+## 2026-10-11 — siren heos JSON
+
+- `siren heos` for Wisp: list, vol, mute, play/pause/stop, source aux|bt|net,
+  probe, group/ungroup. `play_input` for AUX/BT. No Denon sign-in.
+
 ## 2026-10-11 — mixer tab
 
 - New Tab stop: vertical faders for the current speaker, analog

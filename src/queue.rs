@@ -86,11 +86,9 @@ impl Queue {
 }
 
 static QUEUE: OnceLock<Mutex<Queue>> = OnceLock::new();
-static QUEUE_DRIVEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static QUEUE_DRIVEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LAST_LABEL: OnceLock<Mutex<String>> = OnceLock::new();
-static QUEUE_LOADED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static QUEUE_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn queue_file() -> std::path::PathBuf {
     crate::paths::join_config("queue.json")
@@ -148,16 +146,22 @@ pub fn ensure_loaded() {
     for t in arr {
         let path = t.get("path").and_then(|x| x.as_str()).unwrap_or("");
         // streams (radio) persist as URL items — no local file to check
-        if path.is_empty()
-            || (!crate::meta::is_url(path) && !std::path::Path::new(path).exists())
-        {
+        if path.is_empty() || (!crate::meta::is_url(path) && !std::path::Path::new(path).exists()) {
             continue;
         }
         items.push(QueueItem {
             path: path.to_string(),
-            display: t.get("display").and_then(|x| x.as_str()).unwrap_or("").into(),
+            display: t
+                .get("display")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .into(),
             title: t.get("title").and_then(|x| x.as_str()).unwrap_or("").into(),
-            artist: t.get("artist").and_then(|x| x.as_str()).unwrap_or("").into(),
+            artist: t
+                .get("artist")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .into(),
             duration: t.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0),
         });
     }
@@ -168,6 +172,12 @@ pub fn ensure_loaded() {
 
 fn set_driven(v: bool) {
     QUEUE_DRIVEN.store(v, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Radio sets driven=false so a leftover file queue does not resync over the stream.
+pub fn note_playing(label: &str, driven: bool) {
+    set_driven(driven);
+    set_last_label(label);
 }
 fn driven() -> bool {
     QUEUE_DRIVEN.load(std::sync::atomic::Ordering::SeqCst)
@@ -391,14 +401,20 @@ pub fn now_label() -> String {
 }
 
 pub fn fmt_clock(secs: f64) -> String {
-    format!("{}:{:02}", (secs as i64).max(0) / 60, (secs as i64).max(0) % 60)
+    format!(
+        "{}:{:02}",
+        (secs as i64).max(0) / 60,
+        (secs as i64).max(0) % 60
+    )
 }
 
 fn get_repeat() -> &'static str {
-    let yes = |v: Option<serde_json::Value>| matches!(
-        v.as_ref().and_then(|x| x.as_str()),
-        Some("inf") | Some("yes") | Some("always")
-    ) || v.as_ref().and_then(|x| x.as_bool()).unwrap_or(false);
+    let yes = |v: Option<serde_json::Value>| {
+        matches!(
+            v.as_ref().and_then(|x| x.as_str()),
+            Some("inf") | Some("yes") | Some("always")
+        ) || v.as_ref().and_then(|x| x.as_bool()).unwrap_or(false)
+    };
     if yes(player::get("loop-playlist")) {
         return "all";
     }
@@ -422,7 +438,11 @@ pub fn status_lines(cfg: &SirenConfig) -> Vec<String> {
     lines.push(format!("status: {status}"));
     lines.push(format!("track:  {}", {
         let l = now_label();
-        if l.is_empty() { "— silence —".into() } else { l }
+        if l.is_empty() {
+            "— silence —".into()
+        } else {
+            l
+        }
     }));
     let (pos, dur) = (player::get_f64("time-pos"), player::get_f64("duration"));
     if dur > 0.0 {
@@ -449,7 +469,10 @@ pub fn status_lines(cfg: &SirenConfig) -> Vec<String> {
 pub fn cli_add(cfg: &SirenConfig, query: &str, prepend: bool) -> i32 {
     let files = crate::library::resolve_play_args(
         cfg,
-        &query.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>(),
+        &query
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
     );
     if files.is_empty() {
         println!("No tracks found matching query.");
@@ -525,7 +548,11 @@ pub fn cli_play() -> i32 {
         return 1;
     }
     drop(q);
-    if play_queue_from(0, false) { 0 } else { 1 }
+    if play_queue_from(0, false) {
+        0
+    } else {
+        1
+    }
 }
 
 pub fn cli_queue_next() -> i32 {
@@ -540,10 +567,18 @@ pub fn cli_queue_next() -> i32 {
     match idx {
         Some(i) => {
             let n = queue().items.len();
-            if play_queue_from((i + 1) % n, true) { 0 } else { 1 }
+            if play_queue_from((i + 1) % n, true) {
+                0
+            } else {
+                1
+            }
         }
         None => {
-            if play_queue_from(0, false) { 0 } else { 1 }
+            if play_queue_from(0, false) {
+                0
+            } else {
+                1
+            }
         }
     }
 }

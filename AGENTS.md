@@ -295,6 +295,10 @@ Guards: `.part` resume, skip-if-exists, 40-file cap, 32MB confirm,
 ./build.sh install --house # faeOS engine + follow unit
 ```
 
+**Wisp** (`~/wisp`) is the HEOS remote TUI. It calls `siren heos --json`
+(list / vol / mute / play / source aux|bt|net / group). Stock CLI, no
+`sign_in`. Wisp does not open :1255 itself.
+
 **Tests:** every new behavior lands with a unit or source-scan test in
 the same pass. Pure helpers (name shape, JSON, pactl parsers, cmdline
 match) over live LAN. `#[ignore]` only for boxes that must be on the

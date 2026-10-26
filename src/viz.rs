@@ -110,7 +110,11 @@ pub(crate) fn is_network_src(s: &str) -> bool {
 
 /// Fail-fast on a dead Pulse monitor; give HTTP a second to connect.
 pub(crate) fn probe_hops(network: bool) -> u32 {
-    if network { 86 } else { 24 }
+    if network {
+        86
+    } else {
+        24
+    }
 }
 
 /// After a lock, wait longer before abandoning (a pause in the song).
@@ -208,12 +212,7 @@ fn open_pcm(monitor: &str) -> Option<Pcm> {
     if is_network_src(monitor) {
         // Icecast AAC needs more than 32 bytes to probe. Pulse can
         // stay tiny because `-f pulse` already names the format.
-        cmd.args([
-            "-probesize",
-            "262144",
-            "-analyzeduration",
-            "1000000",
-        ]);
+        cmd.args(["-probesize", "262144", "-analyzeduration", "1000000"]);
         let mut curl = Command::new("curl")
             .args([
                 "-sS",
@@ -352,11 +351,7 @@ fn hunt_loop(gen: u64, sources: Vec<String>) {
                         tick_peaks(&mut g.peaks, &sm);
                         g.smoothed = sm;
                         drop(g);
-                        let limit = if loud {
-                            hold_hops()
-                        } else {
-                            probe_hops(net)
-                        };
+                        let limit = if loud { hold_hops() } else { probe_hops(net) };
                         if silent >= limit {
                             break;
                         }
@@ -416,20 +411,40 @@ fn pack_braille(grid: &[Vec<bool>]) -> Vec<String> {
         let mut line = String::new();
         for cc in 0..cell_cols {
             let get = |r: isize, c: isize| -> bool {
-                if r < 0 || c < 0 { return false; }
-                grid.get(r as usize).map(|row| row.get(c as usize).copied().unwrap_or(false)).unwrap_or(false)
+                if r < 0 || c < 0 {
+                    return false;
+                }
+                grid.get(r as usize)
+                    .map(|row| row.get(c as usize).copied().unwrap_or(false))
+                    .unwrap_or(false)
             };
             let r = (cr * 4) as isize;
             let c = (cc * 2) as isize;
             let mut bits: u8 = 0;
-            if get(r,     c    ) { bits |= DOT1; }
-            if get(r + 1, c    ) { bits |= DOT2; }
-            if get(r + 2, c    ) { bits |= DOT3; }
-            if get(r,     c + 1) { bits |= DOT4; }
-            if get(r + 1, c + 1) { bits |= DOT5; }
-            if get(r + 2, c + 1) { bits |= DOT6; }
-            if get(r + 3, c    ) { bits |= DOT7; }
-            if get(r + 3, c + 1) { bits |= DOT8; }
+            if get(r, c) {
+                bits |= DOT1;
+            }
+            if get(r + 1, c) {
+                bits |= DOT2;
+            }
+            if get(r + 2, c) {
+                bits |= DOT3;
+            }
+            if get(r, c + 1) {
+                bits |= DOT4;
+            }
+            if get(r + 1, c + 1) {
+                bits |= DOT5;
+            }
+            if get(r + 2, c + 1) {
+                bits |= DOT6;
+            }
+            if get(r + 3, c) {
+                bits |= DOT7;
+            }
+            if get(r + 3, c + 1) {
+                bits |= DOT8;
+            }
             line.push(char::from_u32(0x2800 + bits as u32).unwrap_or(' '));
         }
         out.push(line);
@@ -439,7 +454,12 @@ fn pack_braille(grid: &[Vec<bool>]) -> Vec<String> {
 
 /// Horizontal bars: bands left→right, bars grow UP from the bottom.
 /// `w_cells` wide (each cell = 2 dot columns), `h_cells` tall (4 dot rows).
-pub fn render_horizontal(bands: &[f32; BANDS], peaks: &[f32; BANDS], w_cells: usize, h_cells: usize) -> Vec<String> {
+pub fn render_horizontal(
+    bands: &[f32; BANDS],
+    peaks: &[f32; BANDS],
+    w_cells: usize,
+    h_cells: usize,
+) -> Vec<String> {
     let dot_rows = h_cells * 4;
     let dot_cols = w_cells * 2;
     let mut grid = vec![vec![false; dot_cols]; dot_rows];
@@ -448,7 +468,9 @@ pub fn render_horizontal(bands: &[f32; BANDS], peaks: &[f32; BANDS], w_cells: us
         let v = bands[band].clamp(0.0, 1.0);
         let p = peaks[band].clamp(0.0, 1.0);
         let fill = ((v * dot_rows as f32).round() as usize).min(dot_rows);
-        let cap = ((p * dot_rows as f32).round() as isize).min(dot_rows as isize - 1).max(0) as usize;
+        let cap = ((p * dot_rows as f32).round() as isize)
+            .min(dot_rows as isize - 1)
+            .max(0) as usize;
         for r in (dot_rows - fill)..dot_rows {
             grid[r][c] = true;
         }
@@ -463,7 +485,12 @@ pub fn render_horizontal(bands: &[f32; BANDS], peaks: &[f32; BANDS], w_cells: us
 
 /// Vertical bars: bands top→bottom, bars grow RIGHT.
 /// `w_cells` wide (2 dot cols each), `h_cells` tall (4 dot rows each).
-pub fn render_vertical(bands: &[f32; BANDS], peaks: &[f32; BANDS], w_cells: usize, h_cells: usize) -> Vec<String> {
+pub fn render_vertical(
+    bands: &[f32; BANDS],
+    peaks: &[f32; BANDS],
+    w_cells: usize,
+    h_cells: usize,
+) -> Vec<String> {
     let dot_rows = h_cells * 4;
     let dot_cols = w_cells * 2;
     let mut grid = vec![vec![false; dot_cols]; dot_rows];
@@ -472,7 +499,9 @@ pub fn render_vertical(bands: &[f32; BANDS], peaks: &[f32; BANDS], w_cells: usiz
         let v = bands[band].clamp(0.0, 1.0);
         let p = peaks[band].clamp(0.0, 1.0);
         let fill = ((v * dot_cols as f32).round() as usize).min(dot_cols);
-        let cap = ((p * dot_cols as f32).round() as isize).min(dot_cols as isize - 1).max(0) as usize;
+        let cap = ((p * dot_cols as f32).round() as isize)
+            .min(dot_cols as isize - 1)
+            .max(0) as usize;
         for c in 0..fill {
             grid[r][c] = true;
         }
@@ -488,7 +517,9 @@ pub fn render_vertical(bands: &[f32; BANDS], peaks: &[f32; BANDS], w_cells: usiz
 mod tests {
     use super::*;
 
-    fn zeros() -> ([f32; BANDS], [f32; BANDS]) { ([0.0; BANDS], [0.0; BANDS]) }
+    fn zeros() -> ([f32; BANDS], [f32; BANDS]) {
+        ([0.0; BANDS], [0.0; BANDS])
+    }
 
     #[test]
     fn braille_pack_shape() {
@@ -538,8 +569,10 @@ mod tests {
         let p = [1.0f32; BANDS];
         let out = render_horizontal(&b, &p, 4, 3);
         // every cell should be non-blank (bars fill upward)
-        assert!(out.iter().all(|l| l.chars().all(|c| c != '\u{2800}')),
-            "full bands must light every dot");
+        assert!(
+            out.iter().all(|l| l.chars().all(|c| c != '\u{2800}')),
+            "full bands must light every dot"
+        );
     }
 
     #[test]
@@ -613,7 +646,10 @@ mod tests {
             body.contains("from_millis(100)"),
             "silent round parks before respawning curl"
         );
-        assert!(src.contains("pub fn stop"), "TUI exit / retarget kills viz ffmpeg");
+        assert!(
+            src.contains("pub fn stop"),
+            "TUI exit / retarget kills viz ffmpeg"
+        );
         let stop = src.find("pub fn stop").expect("stop");
         let stop_end = src[stop..]
             .find("\n/// Start")
@@ -652,7 +688,9 @@ mod tests {
         assert!(hold_hops() > probe_hops(true));
         assert!(is_network_src("http://x/s"));
         assert!(is_network_src("https://x/s"));
-        assert!(!is_network_src("alsa_output.pci-0000_31_00.4.analog-stereo.monitor"));
+        assert!(!is_network_src(
+            "alsa_output.pci-0000_31_00.4.analog-stereo.monitor"
+        ));
     }
 
     #[test]
@@ -672,7 +710,12 @@ mod tests {
         let mut peak = 1e-3;
         // a real tone (sine), not DC — flat signal reads as silence
         let pcm: Vec<f32> = (0..crate::spectrum::WINDOW)
-            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / crate::spectrum::SAMPLE_RATE as f32).sin() * 0.5)
+            .map(|i| {
+                (2.0 * std::f32::consts::PI * 1000.0 * i as f32
+                    / crate::spectrum::SAMPLE_RATE as f32)
+                    .sin()
+                    * 0.5
+            })
             .collect();
         let b = live_bands(&pcm, &mut peak);
         let mx = b.iter().copied().fold(0.0f32, f32::max);
@@ -689,13 +732,20 @@ mod latency_tests {
     fn hop_gives_fast_updates() {
         assert_eq!(crate::spectrum::HOP, 128);
         let step_ms = crate::spectrum::HOP as f64 * 1000.0 / crate::spectrum::SAMPLE_RATE as f64;
-        assert!(step_ms < 8.0, "HOP step should be under 8ms, got {step_ms:.1}ms");
+        assert!(
+            step_ms < 8.0,
+            "HOP step should be under 8ms, got {step_ms:.1}ms"
+        );
     }
 
     /// WINDOW still defines resolution: 2048 samples = ~92ms of audio.
     #[test]
     fn window_keeps_resolution() {
-        assert_eq!(crate::spectrum::WINDOW, 2048, "window must stay 2048 for frequency resolution");
+        assert_eq!(
+            crate::spectrum::WINDOW,
+            2048,
+            "window must stay 2048 for frequency resolution"
+        );
     }
 
     /// slide_window keeps the window length and shifts by hop.

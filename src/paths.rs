@@ -67,7 +67,10 @@ pub fn mpv_ipc() -> String {
     }
     #[cfg(not(windows))]
     {
-        runtime_dir().join("siren-mpv.sock").to_string_lossy().into_owned()
+        runtime_dir()
+            .join("siren-mpv.sock")
+            .to_string_lossy()
+            .into_owned()
     }
 }
 

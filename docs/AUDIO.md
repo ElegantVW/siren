@@ -41,6 +41,26 @@ Cave goes STOPPED on a leftover TuneIn title.
 
 Stop recipe: `siren stop` then `siren audio follow off`.
 
+## Local analog (AUX into a HEOS box)
+
+Office (or any amp) on a rear analog jack is the sound card, not HEOS
+CLI. `audio_output=heos` tries Cave UPnP (`192.168.11.51`) and fails
+when that box is only on AUX.
+
+```
+siren audio output local     # TUI `o` until the hint says local
+siren audio follow off       # mpv must not sit on Siren_Master
+```
+
+PipeWire sink `alsa_output.pci-0000_31_00.4.analog-stereo`, port
+`analog-output-lineout`. That is Front L/R on this ALC1220 (codec pin
+0x14, rear, colour red in the pin default). Surround/center jacks stay
+silent on the stereo profile. On the HEOS 3, source must be **AUX**.
+
+TUI mixer: first fader is Cave on the network; **phones** is this analog
+sink. Drag phones for AUX loudness. Global `+/-` on the mixer tab is
+the selected fader.
+
 ## Ether is a file cache
 
 Ether (`~/bin/ether`) is the faeOS **network creature**. Siren does not

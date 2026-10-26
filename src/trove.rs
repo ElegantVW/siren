@@ -41,7 +41,9 @@ fn max_total() -> u64 {
 
 fn no_confirm() -> bool {
     matches!(
-        std::env::var("TROVE_NO_CONFIRM").unwrap_or_default().as_str(),
+        std::env::var("TROVE_NO_CONFIRM")
+            .unwrap_or_default()
+            .as_str(),
         "1" | "yes" | "true" | "on"
     )
 }
@@ -49,18 +51,45 @@ fn no_confirm() -> bool {
 /// (mediatype, hint) — mirrors KIND_MAP in ia.py.
 fn kind_map(kind: &str) -> Option<(&'static str, &'static str)> {
     Some(match kind.to_lowercase().as_str() {
-        "music" => ("audio", "(subject:(music) OR collection:(opensource_audio) OR collection:(netlabels))"),
-        "tracks" | "songs" => ("audio", "(subject:(music) OR collection:(opensource_audio))"),
-        "album" => ("audio", "(subject:(album) OR subject:(music) OR collection:(netlabels))"),
-        "podcast" | "podcasts" | "shows" => ("audio", "(subject:(podcast) OR collection:(podcasts) OR title:(podcast))"),
-        "audiobook" | "audiobooks" => ("audio", "(collection:(librivoxaudio) OR subject:(audiobook) OR creator:(LibriVox))"),
+        "music" => (
+            "audio",
+            "(subject:(music) OR collection:(opensource_audio) OR collection:(netlabels))",
+        ),
+        "tracks" | "songs" => (
+            "audio",
+            "(subject:(music) OR collection:(opensource_audio))",
+        ),
+        "album" => (
+            "audio",
+            "(subject:(album) OR subject:(music) OR collection:(netlabels))",
+        ),
+        "podcast" | "podcasts" | "shows" => (
+            "audio",
+            "(subject:(podcast) OR collection:(podcasts) OR title:(podcast))",
+        ),
+        "audiobook" | "audiobooks" => (
+            "audio",
+            "(collection:(librivoxaudio) OR subject:(audiobook) OR creator:(LibriVox))",
+        ),
         "live" | "etree" | "lma" | "jam" => ("etree", "collection:(etree)"),
-        "movie" => ("movies", "(subject:(feature) OR subject:(film) OR collection:(feature_films))"),
-        "movies" => ("movies", "(subject:(feature) OR collection:(feature_films))"),
+        "movie" => (
+            "movies",
+            "(subject:(feature) OR subject:(film) OR collection:(feature_films))",
+        ),
+        "movies" => (
+            "movies",
+            "(subject:(feature) OR collection:(feature_films))",
+        ),
         "films" => ("movies", "(subject:(film) OR collection:(feature_films))"),
-        "series" => ("movies", "(subject:(series) OR subject:(television) OR subject:(episode))"),
+        "series" => (
+            "movies",
+            "(subject:(series) OR subject:(television) OR subject:(episode))",
+        ),
         "video" => ("movies", ""),
-        "documentary" | "documentaries" => ("movies", "(subject:(documentary) OR collection:(documentary))"),
+        "documentary" | "documentaries" => (
+            "movies",
+            "(subject:(documentary) OR collection:(documentary))",
+        ),
         _ => return None,
     })
 }
@@ -117,8 +146,16 @@ pub fn build_query(kind: Option<&str>, terms: &[String]) -> String {
 fn curl_text(url: &str) -> Result<String, String> {
     let out = Command::new("curl")
         .args([
-            "-fsSL", "--max-time", "30", "-A", UA, "--retry", "2",
-            "--retry-delay", "2", url,
+            "-fsSL",
+            "--max-time",
+            "30",
+            "-A",
+            UA,
+            "--retry",
+            "2",
+            "--retry-delay",
+            "2",
+            url,
         ])
         .output()
         .map_err(|e| format!("curl missing/failed: {e}"))?;
@@ -197,7 +234,14 @@ pub fn search(query: &str, rows: u32, page: u32) -> Result<(Vec<Doc>, u64), Stri
     let mut url = format!(
         "{IA_SEARCH}?q={enc}&rows={rows}&page={page}&output=json&sort%5B%5D=downloads+desc"
     );
-    for fl in ["identifier", "title", "creator", "year", "mediatype", "downloads"] {
+    for fl in [
+        "identifier",
+        "title",
+        "creator",
+        "year",
+        "mediatype",
+        "downloads",
+    ] {
         url.push_str(&format!("&fl%5B%5D={fl}"));
     }
     let text = curl_text(&url)?;
@@ -297,7 +341,10 @@ fn percent_encode(s: &str) -> String {
 }
 
 fn item_meta(ident: &str) -> Result<Value, String> {
-    let url = format!("https://archive.org/metadata/{}", percent_encode_path(ident));
+    let url = format!(
+        "https://archive.org/metadata/{}",
+        percent_encode_path(ident)
+    );
     let text = curl_text(&url)?;
     serde_json::from_str(&text).map_err(|e| format!("json: {e}"))
 }
@@ -328,7 +375,13 @@ const VIDEO_EXT: &[&str] = &[".mp4", ".mkv", ".webm", ".avi", ".ogv", ".mov"];
 fn sanitize_ident(ident: &str) -> String {
     ident
         .chars()
-        .map(|c| if c.is_alphanumeric() || ".-_".contains(c) { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || ".-_".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(80)
         .collect()
 }
@@ -361,7 +414,11 @@ pub fn available_formats(ident: &str, mediatype: &str) -> Result<Vec<String>, St
         return Ok(have);
     }
     let meta = item_meta(ident)?;
-    let files = meta.get("files").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+    let files = meta
+        .get("files")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut have: Vec<String> = Vec::new();
     for f in &files {
         if let Some(n) = f.get("name").and_then(|x| x.as_str()) {
@@ -448,21 +505,40 @@ fn pick_ccmixter_targets(ident: &str, format: Option<&str>) -> Result<Vec<Target
 
 /// (url, filename, dest_dir, size) — video decided by mediatype.
 /// `format`: Some(ext) keeps one file per song (stem-dedupe); None/"all" keeps everything.
-pub fn pick_targets(ident: &str, mediatype: &str, format: Option<&str>) -> Result<Vec<Target>, String> {
+pub fn pick_targets(
+    ident: &str,
+    mediatype: &str,
+    format: Option<&str>,
+) -> Result<Vec<Target>, String> {
     if is_ccmixter_ident(ident) {
         return pick_ccmixter_targets(ident, format);
     }
     let meta = item_meta(ident)?;
-    let files = meta.get("files").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+    let files = meta
+        .get("files")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mt = if mediatype.is_empty() {
-        meta.get("mediatype").and_then(|m| m.as_str()).unwrap_or("").to_lowercase()
+        meta.get("mediatype")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_lowercase()
     } else {
         mediatype.to_lowercase()
     };
     let suffix_of = |n: &str| {
         let lo = n.to_lowercase();
-        AUDIO_EXT.iter().find(|e| lo.ends_with(*e)).map(|e| e.to_string())
-            .or_else(|| VIDEO_EXT.iter().find(|e| lo.ends_with(*e)).map(|e| e.to_string()))
+        AUDIO_EXT
+            .iter()
+            .find(|e| lo.ends_with(*e))
+            .map(|e| e.to_string())
+            .or_else(|| {
+                VIDEO_EXT
+                    .iter()
+                    .find(|e| lo.ends_with(*e))
+                    .map(|e| e.to_string())
+            })
     };
     let mut media: Vec<&Value> = files
         .iter()
@@ -536,7 +612,12 @@ pub fn pick_targets(ident: &str, mediatype: &str, format: Option<&str>) -> Resul
             percent_encode_path_keep_slash(name)
         );
         let size = f.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
-        targets.push(Target { url, name: base, dir: dest_dir.clone(), size });
+        targets.push(Target {
+            url,
+            name: base,
+            dir: dest_dir.clone(),
+            size,
+        });
     }
     Ok(targets)
 }
@@ -598,7 +679,10 @@ pub fn download_file(
         return false;
     }
     if dest.exists() && dest.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
-        eprintln!("  skip (exists): {}", dest.file_name().unwrap_or_default().to_string_lossy());
+        eprintln!(
+            "  skip (exists): {}",
+            dest.file_name().unwrap_or_default().to_string_lossy()
+        );
         return true;
     }
     // "<name>.part" beside the destination (with_extension would eat the ext):
@@ -614,9 +698,31 @@ pub fn download_file(
     let silent = progress.is_some();
     let meter_args: &[&str] = if silent {
         // TUI/headless: no escape spam on the alt screen; progress via .part poll
-        &["-fL", "--retry", "2", "--retry-delay", "2", "--max-time", "0", "-C", "-", "-sS"]
+        &[
+            "-fL",
+            "--retry",
+            "2",
+            "--retry-delay",
+            "2",
+            "--max-time",
+            "0",
+            "-C",
+            "-",
+            "-sS",
+        ]
     } else {
-        &["-fL", "--retry", "2", "--retry-delay", "2", "--max-time", "0", "-C", "-", "--progress-bar"]
+        &[
+            "-fL",
+            "--retry",
+            "2",
+            "--retry-delay",
+            "2",
+            "--max-time",
+            "0",
+            "-C",
+            "-",
+            "--progress-bar",
+        ]
     };
     let mut cmd = Command::new("curl");
     cmd.args(meter_args).arg("-A").arg(UA);
@@ -624,7 +730,12 @@ pub fn download_file(
     if url.contains("ccmixter.org") {
         cmd.arg("-e").arg("https://ccmixter.org/");
     }
-    let mut child = match cmd.arg("-o").arg(&part).arg(url).stderr(Stdio::inherit()).spawn()
+    let mut child = match cmd
+        .arg("-o")
+        .arg(&part)
+        .arg(url)
+        .stderr(Stdio::inherit())
+        .spawn()
     {
         Ok(c) => c,
         Err(e) => {
@@ -664,7 +775,10 @@ pub fn download_file(
             if part.exists() && part.metadata().map(|m| m.len()).unwrap_or(1) == 0 {
                 let _ = std::fs::remove_file(&part);
             }
-            eprintln!("  download failed: {}", dest.file_name().unwrap_or_default().to_string_lossy());
+            eprintln!(
+                "  download failed: {}",
+                dest.file_name().unwrap_or_default().to_string_lossy()
+            );
             false
         }
     }
@@ -762,12 +876,20 @@ pub fn prompt_format(formats: &[String]) -> String {
 }
 
 pub fn doc_lines(i: usize, d: &Doc) -> (String, String) {
-    let title = if d.title.is_empty() { d.identifier.clone() } else { d.title.clone() };
+    let title = if d.title.is_empty() {
+        d.identifier.clone()
+    } else {
+        d.title.clone()
+    };
     let meta = [
         d.creator.chars().take(40).collect::<String>(),
         d.year.clone(),
         d.mediatype.clone(),
-        if d.downloads.is_empty() { String::new() } else { format!("↓{}", d.downloads) },
+        if d.downloads.is_empty() {
+            String::new()
+        } else {
+            format!("↓{}", d.downloads)
+        },
     ]
     .into_iter()
     .filter(|x| !x.is_empty())
@@ -780,12 +902,7 @@ pub fn doc_lines(i: usize, d: &Doc) -> (String, String) {
 }
 
 /// `siren trove …` — search archive.org, interactively download.
-pub fn run_trove(
-    n: u32,
-    terms: &[String],
-    kind: Option<&str>,
-    format: Option<String>,
-) -> i32 {
+pub fn run_trove(n: u32, terms: &[String], kind: Option<&str>, format: Option<String>) -> i32 {
     let n = n.clamp(1, 50);
     let mut k = kind.map(|s| s.to_string());
     let mut words: Vec<String> = terms.to_vec();
@@ -845,7 +962,8 @@ pub fn run_trove(
                 if io::stdin().read_line(&mut line).is_err() {
                     return 0;
                 }
-                let mut parts: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
+                let mut parts: Vec<String> =
+                    line.split_whitespace().map(|s| s.to_string()).collect();
                 if !parts.is_empty() {
                     if is_kind_token(&parts[0]) {
                         k = Some(parts.remove(0));
@@ -911,7 +1029,9 @@ fn interactive_list(
             "m" | "more" | "n" | "next" if more => return Loop::More,
             "a" | "all" => {
                 for d in docs {
-                    let f = format.clone().or_else(|| choose_format(&d.identifier, &d.mediatype));
+                    let f = format
+                        .clone()
+                        .or_else(|| choose_format(&d.identifier, &d.mediatype));
                     do_download(&d.identifier, &d.mediatype, &d.title, f.as_deref());
                 }
                 println!("Done. [s] new search, [q] quit.");
@@ -921,7 +1041,9 @@ fn interactive_list(
                 let n: usize = c.parse().unwrap_or(0);
                 if 1 <= n && n <= docs.len() {
                     let d = &docs[n - 1];
-                    let f = format.clone().or_else(|| choose_format(&d.identifier, &d.mediatype));
+                    let f = format
+                        .clone()
+                        .or_else(|| choose_format(&d.identifier, &d.mediatype));
                     do_download(&d.identifier, &d.mediatype, &d.title, f.as_deref());
                     println!("Another number, [m] more, [s] search again, or [q] quit?");
                     continue;

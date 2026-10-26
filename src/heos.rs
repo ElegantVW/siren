@@ -92,7 +92,6 @@ pub struct HeosPlayer {
     pub stream_url: Option<String>,
 }
 
-
 /// A HEOS speaker group (from `group/get_groups`).
 #[derive(Debug, Clone, Default)]
 pub struct HeosGroup {
@@ -189,7 +188,9 @@ fn rpc_once_wait(stream: &mut TcpStream, uris: &[String], rounds: u32) -> Option
     // stop at the first quiet gap AFTER all expected replies arrived
     // (firmware sometimes sends "command under process" + the real reply,
     // so exact counting alone would cut off early)
-    stream.set_read_timeout(Some(Duration::from_millis(120))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(120)))
+        .ok()?;
     let mut data = Vec::new();
     let mut buf = [0u8; 8192];
     let mut quiet_rounds = 0;
@@ -259,8 +260,12 @@ pub fn rpc_wait(ip: &str, uris: &[String], rounds: u32) -> Vec<Value> {
 }
 
 fn ok(objs: &[Value]) -> bool {
-    objs.iter()
-        .any(|o| o.get("heos").and_then(|h| h.get("result")).and_then(|r| r.as_str()) == Some("success"))
+    objs.iter().any(|o| {
+        o.get("heos")
+            .and_then(|h| h.get("result"))
+            .and_then(|r| r.as_str())
+            == Some("success")
+    })
 }
 
 /// Apply message-querystring fields (`state=`, `level=`) onto a player.
@@ -311,9 +316,21 @@ pub fn parse_get_players(objs: &[Value], fallback_ip: &str) -> Vec<HeosPlayer> {
                 out.push(HeosPlayer {
                     name: p.get("name").and_then(|x| x.as_str()).unwrap_or("?").into(),
                     pid: p.get("pid").and_then(|x| x.as_i64()).unwrap_or(0),
-                    model: p.get("model").and_then(|x| x.as_str()).unwrap_or("?").into(),
-                    ip: p.get("ip").and_then(|x| x.as_str()).unwrap_or(fallback_ip).into(),
-                    network: p.get("network").and_then(|x| x.as_str()).unwrap_or("").into(),
+                    model: p
+                        .get("model")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?")
+                        .into(),
+                    ip: p
+                        .get("ip")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or(fallback_ip)
+                        .into(),
+                    network: p
+                        .get("network")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
                     state: None,
                     volume: None,
                     song: None,
@@ -394,21 +411,19 @@ pub fn parallel_open(addrs: &[(String, u16)], timeout_ms: u64) -> Vec<(String, u
     let nworkers = SWEEP_WORKERS.min(addrs.len()).max(1);
     std::thread::scope(|s| {
         for _ in 0..nworkers {
-            s.spawn(|| {
-                loop {
-                    let idx = {
-                        let mut g = i.lock().unwrap();
-                        if *g >= addrs.len() {
-                            return;
-                        }
-                        let n = *g;
-                        *g += 1;
-                        n
-                    };
-                    let (host, port) = &addrs[idx];
-                    if tcp_open(host, *port, timeout_ms) {
-                        found.lock().unwrap().push((host.clone(), *port));
+            s.spawn(|| loop {
+                let idx = {
+                    let mut g = i.lock().unwrap();
+                    if *g >= addrs.len() {
+                        return;
                     }
+                    let n = *g;
+                    *g += 1;
+                    n
+                };
+                let (host, port) = &addrs[idx];
+                if tcp_open(host, *port, timeout_ms) {
+                    found.lock().unwrap().push((host.clone(), *port));
                 }
             });
         }
@@ -515,10 +530,7 @@ pub fn pick_lan_ipv4(
             && !i.ip.starts_with("169.254.")
             && !i.ip.starts_with("100.")
     };
-    let wired: Vec<&IfaceAddr> = ifaces
-        .iter()
-        .filter(|i| usable(i) && !i.is_usb)
-        .collect();
+    let wired: Vec<&IfaceAddr> = ifaces.iter().filter(|i| usable(i) && !i.is_usb).collect();
     let cands = if wired.is_empty() {
         ifaces.iter().filter(|i| usable(i)).collect()
     } else {
@@ -587,7 +599,10 @@ pub fn local_ip() -> Option<String> {
     pick_lan_ipv4(
         &list_ifaces(),
         default_src.as_deref(),
-        prefer.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()),
+        prefer
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty()),
     )
     .or(default_src)
 }
@@ -621,7 +636,10 @@ pub fn sweep() -> Vec<String> {
 /// Unpooled RPC to host:port — tests bind ephemeral ports; production uses :1255.
 pub fn rpc_at(host: &str, port: u16, uris: &[String]) -> Vec<Value> {
     let s = TcpStream::connect_timeout(
-        &format!("{host}:{port}").parse().ok().unwrap_or_else(|| "0.0.0.0:80".parse().unwrap()),
+        &format!("{host}:{port}")
+            .parse()
+            .ok()
+            .unwrap_or_else(|| "0.0.0.0:80".parse().unwrap()),
         Duration::from_secs(3),
     );
     let Ok(mut s) = s else {
@@ -708,7 +726,11 @@ fn player_from_json(v: &Value) -> Option<HeosPlayer> {
         pid: v.get("pid")?.as_i64()?,
         model: v.get("model").and_then(|x| x.as_str()).unwrap_or("").into(),
         ip: v.get("ip")?.as_str()?.to_string(),
-        network: v.get("network").and_then(|x| x.as_str()).unwrap_or("").into(),
+        network: v
+            .get("network")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .into(),
         state: None,
         volume: None,
         song: None,
@@ -815,6 +837,12 @@ fn write_ether_cache(players: &[HeosPlayer]) {
 /// Live discovery + rewrite the cache (timer calls this; best effort).
 /// Known IPs first; /24 sweep only when those are silent.
 pub fn refresh_roster() {
+    let _ = live_players();
+}
+
+/// Speakers that answer :1255 right now. Empty when the fleet is off-LAN.
+/// Rewrites the roster cache only when at least one player answers.
+pub fn live_players() -> Vec<HeosPlayer> {
     let mut players = roster();
     if players.is_empty() {
         players = roster_from(sweep());
@@ -822,6 +850,7 @@ pub fn refresh_roster() {
     if !players.is_empty() {
         write_roster_cache(&players);
     }
+    players
 }
 
 /// Resolve a speaker by name fragment (default: Cave).
@@ -848,7 +877,12 @@ pub fn resolve(hint: Option<&str>) -> Option<(String, i64, HeosPlayer)> {
 }
 
 pub fn set_state(ip: &str, pid: i64, state: &str) -> bool {
-    ok(&rpc(ip, &[format!("heos://player/set_play_state?pid={pid}&state={state}")]))
+    ok(&rpc(
+        ip,
+        &[format!(
+            "heos://player/set_play_state?pid={pid}&state={state}"
+        )],
+    ))
 }
 
 pub fn get_state(ip: &str, pid: i64) -> Option<String> {
@@ -882,13 +916,19 @@ pub fn toggle(ip: &str, pid: i64) -> &'static str {
 
 pub fn set_volume(ip: &str, pid: i64, level: i32) -> bool {
     let level = level.clamp(0, 100);
-    ok(&rpc(ip, &[format!("heos://player/set_volume?pid={pid}&level={level}")]))
+    ok(&rpc(
+        ip,
+        &[format!("heos://player/set_volume?pid={pid}&level={level}")],
+    ))
 }
 
 pub fn set_mute(ip: &str, pid: i64, on: bool) -> bool {
     ok(&rpc(
         ip,
-        &[format!("heos://player/set_mute?pid={pid}&state={}", if on { "on" } else { "off" })],
+        &[format!(
+            "heos://player/set_mute?pid={pid}&state={}",
+            if on { "on" } else { "off" }
+        )],
     ))
 }
 
@@ -936,7 +976,10 @@ pub fn play_next(ip: &str, pid: i64) -> bool {
 }
 
 pub fn play_previous(ip: &str, pid: i64) -> bool {
-    ok(&rpc(ip, &[format!("heos://player/play_previous?pid={pid}")]))
+    ok(&rpc(
+        ip,
+        &[format!("heos://player/play_previous?pid={pid}")],
+    ))
 }
 
 // ---- speaker queue (verbs per HEOS CLI spec; aid 1=now 2=next 3=end 4=replace) ----
@@ -957,9 +1000,21 @@ pub fn get_queue(ip: &str, pid: i64) -> Vec<QueueEntry> {
             for it in arr {
                 out.push(QueueEntry {
                     qid: it.get("qid").and_then(|x| x.as_i64()).unwrap_or(0),
-                    song: it.get("song").and_then(|x| x.as_str()).unwrap_or("?").into(),
-                    artist: it.get("artist").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    album: it.get("album").and_then(|x| x.as_str()).unwrap_or("").into(),
+                    song: it
+                        .get("song")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?")
+                        .into(),
+                    artist: it
+                        .get("artist")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    album: it
+                        .get("album")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .into(),
                     mid: it.get("mid").and_then(|x| x.as_str()).unwrap_or("").into(),
                 });
             }
@@ -969,11 +1024,19 @@ pub fn get_queue(ip: &str, pid: i64) -> Vec<QueueEntry> {
 }
 
 pub fn play_queue(ip: &str, pid: i64, qid: i64) -> bool {
-    ok(&rpc(ip, &[format!("heos://player/play_queue?pid={pid}&qid={qid}")]))
+    ok(&rpc(
+        ip,
+        &[format!("heos://player/play_queue?pid={pid}&qid={qid}")],
+    ))
 }
 
 pub fn remove_from_queue(ip: &str, pid: i64, qid: i64) -> bool {
-    ok(&rpc(ip, &[format!("heos://player/remove_from_queue?pid={pid}&qid={qid}")]))
+    ok(&rpc(
+        ip,
+        &[format!(
+            "heos://player/remove_from_queue?pid={pid}&qid={qid}"
+        )],
+    ))
 }
 
 pub fn clear_queue(ip: &str, pid: i64) -> bool {
@@ -981,10 +1044,73 @@ pub fn clear_queue(ip: &str, pid: i64) -> bool {
 }
 
 pub fn move_queue_item(ip: &str, pid: i64, sqid: i64, dqid: i64) -> bool {
-    ok(&rpc(ip, &[format!("heos://player/move_queue_item?pid={pid}&sqid={sqid}&dqid={dqid}")]))
+    ok(&rpc(
+        ip,
+        &[format!(
+            "heos://player/move_queue_item?pid={pid}&sqid={sqid}&dqid={dqid}"
+        )],
+    ))
 }
 
 // ---- DLNA casting (via VANGUARDA-DLNA / minidlna :8200) ----
+
+/// One row from `browse/get_music_sources`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusicSource {
+    pub sid: i64,
+    pub name: String,
+    pub kind: String,
+}
+
+/// Pure parser — sample JSON, no wire.
+pub fn parse_music_sources(objs: &[Value]) -> Vec<MusicSource> {
+    let mut out = Vec::new();
+    for o in objs {
+        let Some(arr) = o.get("payload").and_then(|p| p.as_array()) else {
+            continue;
+        };
+        for src in arr {
+            out.push(MusicSource {
+                sid: src.get("sid").and_then(|s| s.as_i64()).unwrap_or(0),
+                name: src
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .into(),
+                kind: src
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .into(),
+            });
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    out
+}
+
+/// House alias → HEOS `play_input` name. Network playback stays Siren.
+pub fn input_name(alias: &str) -> Option<&'static str> {
+    match alias.trim().to_ascii_lowercase().as_str() {
+        "aux" | "aux_in" | "aux-in" | "line" | "linein" | "line-in" => Some("inputs/aux_in_1"),
+        "bt" | "bluetooth" => Some("inputs/bluetooth"),
+        _ => None,
+    }
+}
+
+/// Switch a player to an aux/bt/… input. Empty name refuses.
+pub fn play_input(ip: &str, pid: i64, input: &str) -> bool {
+    let input = input.trim();
+    if input.is_empty() || ip.is_empty() {
+        return false;
+    }
+    ok(&rpc(
+        ip,
+        &[format!("heos://browse/play_input?pid={pid}&input={input}")],
+    ))
+}
 
 fn find_dlna_sid(ip: &str) -> Option<i64> {
     for o in rpc(ip, &["heos://browse/get_music_sources".into()]) {
@@ -1027,7 +1153,9 @@ fn dlna_children(ip: &str, sid: i64, cid: &str) -> Vec<Value> {
         let mut got = 0;
         for o in rpc(
             ip,
-            &[format!("heos://browse/browse?sid={sid}&cid={cid}&range={start},50")],
+            &[format!(
+                "heos://browse/browse?sid={sid}&cid={cid}&range={start},50"
+            )],
         ) {
             if let Some(arr) = o.get("payload").and_then(|p| p.as_array()) {
                 got = arr.len();
@@ -1099,7 +1227,9 @@ fn dlna_find(ip: &str, sid: i64, target: &std::path::Path) -> Option<(String, St
             }
             if let Some(c) = item.get("cid").and_then(|x| x.as_str()) {
                 let name = norm(item.get("name").and_then(|n| n.as_str()).unwrap_or(""));
-                let hit = crumbs.iter().any(|cr| name.contains(cr) || cr.contains(&name));
+                let hit = crumbs
+                    .iter()
+                    .any(|cr| name.contains(cr) || cr.contains(&name));
                 subs.push((hit, c.to_string()));
             }
         }
@@ -1170,9 +1300,7 @@ pub fn tunein_search(ip: &str, query: &str) -> Vec<TuneinHit> {
                         quiet_since_data = std::time::Instant::now();
                     }
                     Err(_) => {
-                        if !data.is_empty()
-                            && quiet_since_data.elapsed().as_secs() >= 2
-                        {
+                        if !data.is_empty() && quiet_since_data.elapsed().as_secs() >= 2 {
                             break;
                         }
                         if t0.elapsed().as_secs() > 12 {
@@ -1257,7 +1385,10 @@ fn http_no_retry(head: &str) -> bool {
 fn http_exchange(host: &str, port: u16, req: &str) -> String {
     use std::io::{Read, Write};
     let mut s = match std::net::TcpStream::connect_timeout(
-        &format!("{host}:{port}").parse().ok().unwrap_or_else(|| "0.0.0.0:80".parse().unwrap()),
+        &format!("{host}:{port}")
+            .parse()
+            .ok()
+            .unwrap_or_else(|| "0.0.0.0:80".parse().unwrap()),
         std::time::Duration::from_secs(3),
     ) {
         Ok(s) => s,
@@ -1319,7 +1450,10 @@ fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
         None => (rest, "/".to_string()),
     };
     let (host, port) = match hostport.find(':') {
-        Some(i) => (hostport[..i].to_string(), hostport[i + 1..].parse().unwrap_or(80)),
+        Some(i) => (
+            hostport[..i].to_string(),
+            hostport[i + 1..].parse().unwrap_or(80),
+        ),
         None => (hostport.to_string(), 80),
     };
     if host.is_empty() {
@@ -1350,9 +1484,7 @@ pub fn confirm_play_url(ip: &str, url: &str, secs: u64) -> bool {
     }
     // Loose match: speaker echoes what we sent, but don't trust
     // exact bytes. Compare the path tail + host substring.
-    let norm = |s: &str| -> String {
-        s.trim().trim_end_matches('/').to_ascii_lowercase()
-    };
+    let norm = |s: &str| -> String { s.trim().trim_end_matches('/').to_ascii_lowercase() };
     let n_uri = norm(&uri);
     let n_url = norm(url);
     n_uri == n_url || n_uri.contains(&n_url) || n_url.contains(&n_uri)
@@ -1373,7 +1505,10 @@ pub fn upnp_track_uri(ip: &str) -> String {
         ip = ip, len = body.len(), body = body,
     );
     let mut s = match std::net::TcpStream::connect_timeout(
-        &format!("{ip}:60006").parse().ok().unwrap_or_else(|| "0.0.0.0:80".parse().unwrap()),
+        &format!("{ip}:60006")
+            .parse()
+            .ok()
+            .unwrap_or_else(|| "0.0.0.0:80".parse().unwrap()),
         std::time::Duration::from_secs(5),
     ) {
         Ok(s) => s,
@@ -1393,19 +1528,24 @@ pub fn upnp_track_uri(ip: &str) -> String {
         }
     }
     let text = String::from_utf8_lossy(&out);
-    let Some(start) = text.find("<TrackURI>") else { return String::new() };
+    let Some(start) = text.find("<TrackURI>") else {
+        return String::new();
+    };
     let rest = &text[start + 11..];
-    let Some(end) = rest.find("</TrackURI>") else { return String::new() };
+    let Some(end) = rest.find("</TrackURI>") else {
+        return String::new();
+    };
     rest[..end].trim().to_string()
 }
-
 
 /// Parse a `group/get_groups` payload into structured groups.
 /// Pure function — no I/O, fully testable.
 pub fn parse_groups(objs: &[Value]) -> Vec<HeosGroup> {
     let mut out = Vec::new();
     for o in objs {
-        let Some(list) = o.get("payload").and_then(|p| p.as_array()) else { continue };
+        let Some(list) = o.get("payload").and_then(|p| p.as_array()) else {
+            continue;
+        };
         for g in list {
             let players = g
                 .get("players")
@@ -1441,7 +1581,10 @@ pub fn get_groups(ip: &str) -> Vec<HeosGroup> {
 pub fn group_pid_list(leader: i64, members: &[i64]) -> String {
     let mut pids = vec![leader];
     pids.extend_from_slice(members);
-    pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
+    pids.iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Create or modify a group. `leader` is the group leader; `members` are the
@@ -1449,18 +1592,12 @@ pub fn group_pid_list(leader: i64, members: &[i64]) -> String {
 /// `heos://group/set_group?pid=leader,member1,member2`
 pub fn set_group(ip: &str, leader: i64, members: &[i64]) -> bool {
     let list = group_pid_list(leader, members);
-    ok(&rpc(
-        ip,
-        &[format!("heos://group/set_group?pid={list}")],
-    ))
+    ok(&rpc(ip, &[format!("heos://group/set_group?pid={list}")]))
 }
 
 /// Ungroup every player in the group (leader pid only).
 pub fn ungroup(ip: &str, leader: i64) -> bool {
-    ok(&rpc(
-        ip,
-        &[format!("heos://group/set_group?pid={leader}")],
-    ))
+    ok(&rpc(ip, &[format!("heos://group/set_group?pid={leader}")]))
 }
 
 /// `+10` / `-10` / `26` / `26%` against a current level.
@@ -1509,7 +1646,10 @@ pub fn group_set_volume(ip: &str, gid: i64, level: i32) -> bool {
 pub fn group_set_mute(ip: &str, gid: i64, on: bool) -> bool {
     ok(&rpc(
         ip,
-        &[format!("heos://group/set_mute?gid={gid}&state={}", if on { "on" } else { "off" })],
+        &[format!(
+            "heos://group/set_mute?gid={gid}&state={}",
+            if on { "on" } else { "off" }
+        )],
     ))
 }
 
@@ -1538,7 +1678,9 @@ pub fn note_radio(url: &str, title: &str) {
 pub fn last_radio_title() -> Option<String> {
     let raw = std::fs::read_to_string(crate::paths::join_cache("heos-now.json")).ok()?;
     let v: Value = serde_json::from_str(&raw).ok()?;
-    v.get("title").and_then(|t| t.as_str()).map(|s| s.to_string())
+    v.get("title")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Last cast recorded by any siren (CLI or TUI): (path, epoch secs).
@@ -1657,7 +1799,10 @@ mod tests {
 
     #[test]
     fn group_pid_list_leader_first() {
-        assert_eq!(group_pid_list(258957015, &[-105329903]), "258957015,-105329903");
+        assert_eq!(
+            group_pid_list(258957015, &[-105329903]),
+            "258957015,-105329903"
+        );
     }
 
     #[test]
@@ -1672,20 +1817,27 @@ mod tests {
 
     #[test]
     fn group_pid_list_preserves_negative_pids() {
-        assert_eq!(group_pid_list(-105329903, &[258957015]), "-105329903,258957015");
+        assert_eq!(
+            group_pid_list(-105329903, &[258957015]),
+            "-105329903,258957015"
+        );
     }
 
     // ---------- parse_groups ----------
 
     #[test]
     fn parse_groups_empty_payload() {
-        let objs = vec![json!({"heos": {"command": "group/get_groups", "result": "success", "message": ""}, "payload": []})];
+        let objs = vec![
+            json!({"heos": {"command": "group/get_groups", "result": "success", "message": ""}, "payload": []}),
+        ];
         assert!(parse_groups(&objs).is_empty());
     }
 
     #[test]
     fn parse_groups_no_payload_key() {
-        let objs = vec![json!({"heos": {"command": "group/get_groups", "result": "success", "message": ""}})];
+        let objs = vec![
+            json!({"heos": {"command": "group/get_groups", "result": "success", "message": ""}}),
+        ];
         assert!(parse_groups(&objs).is_empty());
     }
 
@@ -1765,6 +1917,61 @@ mod tests {
     }
 
     #[test]
+    fn parse_music_sources_reads_aux_and_tunein() {
+        let objs = vec![json!({
+            "heos": {"command": "browse/get_music_sources", "result": "success"},
+            "payload": [
+                {"name": "TuneIn", "image_url": "", "type": "music_service", "sid": 3},
+                {"name": "AUX Input", "image_url": "", "type": "heos_service", "sid": 1027},
+                {"name": "Playlists", "type": "heos_service", "sid": 1025}
+            ]
+        })];
+        let v = parse_music_sources(&objs);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[1].name, "AUX Input");
+        assert_eq!(v[1].kind, "heos_service");
+        assert_eq!(v[0].sid, 3);
+        assert_eq!(input_name("aux"), Some("inputs/aux_in_1"));
+        assert_eq!(input_name("BT"), Some("inputs/bluetooth"));
+        assert_eq!(input_name("net"), None);
+        assert!(!play_input("", 1, "inputs/aux_in_1"));
+        assert!(!play_input("127.0.0.1", 1, ""));
+        let src = std::fs::read_to_string("src/heos.rs").expect("heos.rs");
+        let start = src.find("pub fn play_input").expect("play_input");
+        let end = src[start..]
+            .find("\nfn find_dlna_sid")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        assert!(
+            src[start..end].contains("browse/play_input"),
+            "play_input uses the CLI source switch"
+        );
+        assert!(
+            !src[start..end].contains("sign_in"),
+            "play_input never signs into Denon"
+        );
+        let main = std::fs::read_to_string("src/main.rs").expect("main.rs");
+        assert!(main.contains("enum HeosCmd"), "siren heos CLI");
+        let hs = main.find("fn cmd_heos").expect("cmd_heos");
+        let he = main[hs..]
+            .find("\nfn cmd_audio")
+            .map(|i| hs + i)
+            .unwrap_or(main.len());
+        assert!(
+            !main[hs..he].contains("sign_in"),
+            "siren heos never signs into Denon"
+        );
+        assert!(
+            main[hs..he].contains("play_input"),
+            "source uses play_input"
+        );
+        assert!(
+            main[hs..he].contains("live_players"),
+            "heos list --live uses live_players, not stale cache"
+        );
+    }
+
+    #[test]
     fn parse_mute_state_reads_on_off() {
         assert_eq!(
             parse_mute_state("heos://player/get_mute?pid=1&state=on"),
@@ -1808,10 +2015,7 @@ mod tests {
         );
         apply_msg(&mut p, &[json!({"payload": {"mid": "s12345"}})]);
         assert_eq!(p.stream_url, None);
-        apply_msg(
-            &mut p,
-            &[json!({"payload": {"mid": "https://ex/s.mp3"}})],
-        );
+        apply_msg(&mut p, &[json!({"payload": {"mid": "https://ex/s.mp3"}})]);
         assert_eq!(p.stream_url.as_deref(), Some("https://ex/s.mp3"));
     }
 
@@ -1831,7 +2035,12 @@ mod tests {
 
     #[test]
     fn pick_named_matches_speaker_hint() {
-        let cave = HeosPlayer { name: "Cave".into(), pid: 1, ip: "192.168.8.185".into(), ..HeosPlayer::default() };
+        let cave = HeosPlayer {
+            name: "Cave".into(),
+            pid: 1,
+            ip: "192.168.8.185".into(),
+            ..HeosPlayer::default()
+        };
         let ps = vec![cave, office()];
         assert_eq!(pick_named(&ps, "Office").unwrap().ip, "192.168.8.184");
         assert_eq!(pick_named(&ps, "cave").unwrap().name, "Cave");
@@ -1841,31 +2050,44 @@ mod tests {
     fn pick_named_defaults_to_cave() {
         let ps = vec![
             office(),
-            HeosPlayer { name: "Cave".into(), ..HeosPlayer::default() },
+            HeosPlayer {
+                name: "Cave".into(),
+                ..HeosPlayer::default()
+            },
         ];
         assert_eq!(pick_named(&ps, "").unwrap().name, "Cave");
         assert_eq!(pick_named(&ps, "Office").unwrap().name, "Vanguarda Office");
         let office_only = vec![office()];
-        assert_eq!(pick_named(&office_only, "").unwrap().name, "Vanguarda Office");
+        assert_eq!(
+            pick_named(&office_only, "").unwrap().name,
+            "Vanguarda Office"
+        );
     }
 
     #[test]
     fn write_roster_refreshes_ether_cache() {
         let src = std::fs::read_to_string("src/heos.rs").expect("heos.rs");
-        let start = src.find("fn write_roster_cache").expect("write_roster_cache");
+        let start = src
+            .find("fn write_roster_cache")
+            .expect("write_roster_cache");
         let end = src[start..]
             .find("\n/// Live discovery")
             .map(|i| start + i)
             .unwrap_or(src.len());
         let body = &src[start..end];
-        assert!(body.contains("write_ether_cache"), "live roster updates Ether");
+        assert!(
+            body.contains("write_ether_cache"),
+            "live roster updates Ether"
+        );
         assert!(src.contains(".config/ether/heos.json"), "Ether file path");
     }
 
     #[test]
     fn http_looks_alive_accepts_200_and_audio() {
         assert!(http_looks_alive("HTTP/1.0 200 OK\r\n"));
-        assert!(http_looks_alive("HTTP/1.1 200 ok\r\ncontent-type: audio/aac"));
+        assert!(http_looks_alive(
+            "HTTP/1.1 200 ok\r\ncontent-type: audio/aac"
+        ));
         assert!(http_looks_alive("icy-name: x\r\ncontent-type: audio/mpeg"));
         assert!(!http_looks_alive("HTTP/1.0 400 Bad Request\r\n"));
         assert!(!http_looks_alive("HTTP/1.0 404 Not Found\r\n"));
@@ -1989,7 +2211,10 @@ mod tests {
             !body.contains("192.168.8.187") && !body.contains("192.168.8.192"),
             "shop IPs are last-known roster, not hardcoded fallbacks"
         );
-        assert!(body.contains("read_roster_stale"), "try last roster on any LAN");
+        assert!(
+            body.contains("read_roster_stale"),
+            "try last roster on any LAN"
+        );
     }
 
     #[test]
@@ -1999,7 +2224,10 @@ mod tests {
             !src.contains("192.168.8.186"),
             "TUI must not pin shop IP for minidlna"
         );
-        assert!(src.contains("127.0.0.1:8200"), "DLNA liveness is local :8200");
+        assert!(
+            src.contains("127.0.0.1:8200"),
+            "DLNA liveness is local :8200"
+        );
     }
 
     #[test]
@@ -2088,8 +2316,16 @@ mod tests {
             name: "Office + Cave".into(),
             gid: -105329903,
             players: vec![
-                GroupPlayer { name: "Office".into(), pid: -105329903, role: "leader".into() },
-                GroupPlayer { name: "Cave".into(), pid: 258957015, role: "member".into() },
+                GroupPlayer {
+                    name: "Office".into(),
+                    pid: -105329903,
+                    role: "leader".into(),
+                },
+                GroupPlayer {
+                    name: "Cave".into(),
+                    pid: 258957015,
+                    role: "member".into(),
+                },
             ],
         };
         assert_eq!(gid_for_player(&[g.clone()], -105329903), Some(-105329903));
@@ -2145,7 +2381,9 @@ mod url_alive_tests {
             for mut s in listener.incoming().flatten() {
                 let mut buf = [0u8; 512];
                 let _ = s.read(&mut buf);
-                let _ = s.write_all(b"HTTP/1.0 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+                let _ = s.write_all(
+                    b"HTTP/1.0 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                );
             }
         });
         thread::sleep(Duration::from_millis(30));

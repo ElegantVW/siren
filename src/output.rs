@@ -1,18 +1,15 @@
 //! Output — the ONE playback channel.
 //!
-//! Sources (library queue, playlists, trove, radio) never touch mpv or
-//! HEOS directly. They stage `QueueItem`s and call `play_from`; output
-//! routes by `audio_output` + item kind:
-//! - local files → mpv playlist mirror (files and stream URLs alike)
-//! - speaker files → DLNA cast in order (play-now + appends)
-//! - speaker streams → TuneIn search by station name + `browse/play_stream`
-//!   (raw-URL `play_stream` won't hold on this HEOS 1 unit — verified)
-//!
-//! Stream items are queue items whose path is an `http(s)` URL with the
-//! station name in `display`.
+//! File queue / playlists call `play_from`. Radio calls `play_station`
+//! (one live URL) and does not write `queue.json`.
+//! Routes by `audio_output`:
+//! - local files → mpv playlist mirror
+//! - local radio → mpv `loadfile` URL
+//! - speaker files → DLNA cast
+//! - speaker streams → TuneIn / `play_url`
 
 use crate::config::SirenConfig;
-use crate::{heos, queue};
+use crate::{heos, player, queue};
 
 /// Map a station title to a TuneIn hit: full title, then keyword
 /// fallbacks ("OXIGÉNIO 102.6 FM" → "OXIGÉNIO 102" → "OXIGÉNIO").
@@ -120,7 +117,11 @@ fn play_log(msg: &str) {
     let dir = crate::paths::cache_dir();
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("play.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "[{ts}] {msg}");
     }
 }
@@ -136,10 +137,9 @@ pub fn play_from(cfg: &SirenConfig, index: usize) -> Result<String, String> {
         return if queue::play_queue_from(index, false) {
             Ok("playing from queue".into())
         } else {
-            Err("Queue empty.".into())
+            Err("mpv not ready".into())
         };
     }
-    let (ip, pid, name) = speaker_target(cfg).ok_or_else(|| "no speaker found".to_string())?;
     let slice = &items[index..];
     if crate::meta::is_url(&slice[0].path) {
         let url = slice[0].path.clone();
@@ -148,37 +148,7 @@ pub fn play_from(cfg: &SirenConfig, index: usize) -> Result<String, String> {
         } else {
             slice[0].display.clone()
         };
-        // 1. Try the favorite's own URL first — but only if it's
-        // alive. Icecast often 400s HEAD while GET 200; url_alive
-        // retries GET. Dead URLs skip so the speaker never "plays" a 404.
-        if heos::url_alive(&url) {
-            play_log(&format!("direct: {url} -> {ip} pid={pid}"));
-            if heos::play_url(&ip, pid, &url) && heos::confirm_play_url(&ip, &url, 4) {
-                heos::note_radio(&url, &title);
-                play_log(&format!("direct OK: {title} confirmed play"));
-                return Ok(format!("▶ {title} on {name}"));
-            }
-            play_log(&format!("direct FAILED: {title} (ack or confirm failed)"));
-            // URL alive but speaker wouldn't hold it — fall through to TuneIn
-        } else {
-            play_log(&format!("direct SKIP (dead URL): {url}"));
-        }
-        // 2. Fall back to TuneIn matching (name → mid → play).
-        // Rank gate (≤3) keeps URL-named favs from matching random junk.
-        let Some(hit) = tunein_find(&ip, &title) else {
-            return Err(format!("no TuneIn match: {title} (try output local)"));
-        };
-        if heos::tunein_play(&ip, pid, &hit) {
-            if heos::confirm_play(&ip, pid, 4) {
-                heos::note_radio(&url, &hit.name);
-                play_log(&format!("tunein OK: {} mid={} confirmed play", hit.name, hit.mid));
-                return Ok(format!("▶ {} on {name}", hit.name));
-            }
-            play_log(&format!("tunein FAILED (no confirm): {}", hit.name));
-            return Err(format!("{} not responding (stream may be down)", hit.name));
-        }
-        play_log(&format!("tunein FAILED (no ack): {}", hit.name));
-        Err(format!("TuneIn play failed: {}", hit.name))
+        play_station(cfg, &url, &title)
     } else {
         // files cast in order; stray streams after files can't ride DLNA
         let files: Vec<std::path::PathBuf> = slice
@@ -190,6 +160,7 @@ pub fn play_from(cfg: &SirenConfig, index: usize) -> Result<String, String> {
         if files.is_empty() {
             return Err("Queue empty.".into());
         }
+        let (ip, pid, name) = speaker_target(cfg).ok_or_else(|| "no speaker found".to_string())?;
         let (ok, n) = heos::dlna_cast_many(&ip, pid, &files);
         if ok > 0 {
             heos::note_cast(&files[0]);
@@ -202,5 +173,81 @@ pub fn play_from(cfg: &SirenConfig, index: usize) -> Result<String, String> {
             return Err(msg);
         }
         Ok(msg)
+    }
+}
+
+/// One live station. Does not write the file queue.
+pub fn play_station(cfg: &SirenConfig, url: &str, title: &str) -> Result<String, String> {
+    if cfg.audio_output != "heos" {
+        if !player::spawn(cfg) {
+            return Err("mpv not ready".into());
+        }
+        if !player::send(&serde_json::json!(["loadfile", url, "replace"])) {
+            return Err("mpv not ready".into());
+        }
+        player::send(&serde_json::json!(["set_property", "pause", false]));
+        player::send(&serde_json::json!(["set_property", "video", "no"]));
+        queue::note_playing(title, false);
+        return Ok(format!("▶ {title}"));
+    }
+    let (ip, pid, name) = speaker_target(cfg).ok_or_else(|| "no speaker found".to_string())?;
+    if heos::url_alive(url) {
+        play_log(&format!("direct: {url} -> {ip} pid={pid}"));
+        if heos::play_url(&ip, pid, url) && heos::confirm_play_url(&ip, url, 4) {
+            heos::note_radio(url, title);
+            play_log(&format!("direct OK: {title} confirmed play"));
+            return Ok(format!("▶ {title} on {name}"));
+        }
+        play_log(&format!("direct FAILED: {title} (ack or confirm failed)"));
+    } else {
+        play_log(&format!("direct SKIP (dead URL): {url}"));
+    }
+    let Some(hit) = tunein_find(&ip, title) else {
+        return Err(format!("no TuneIn match: {title} (try output local)"));
+    };
+    if heos::tunein_play(&ip, pid, &hit) {
+        if heos::confirm_play(&ip, pid, 4) {
+            heos::note_radio(url, &hit.name);
+            play_log(&format!(
+                "tunein OK: {} mid={} confirmed play",
+                hit.name, hit.mid
+            ));
+            return Ok(format!("▶ {} on {name}", hit.name));
+        }
+        play_log(&format!("tunein FAILED (no confirm): {}", hit.name));
+        return Err(format!("{} not responding (stream may be down)", hit.name));
+    }
+    play_log(&format!("tunein FAILED (no ack): {}", hit.name));
+    Err(format!("TuneIn play failed: {}", hit.name))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn radio_is_not_the_file_queue() {
+        let src = std::fs::read_to_string("src/output.rs").unwrap();
+        assert!(src.contains("pub fn play_station"));
+        assert!(src.contains("mpv not ready"));
+        let tui = std::fs::read_to_string("src/tui.rs").unwrap();
+        let radio_play = tui
+            .split("fn radio_play")
+            .nth(1)
+            .unwrap()
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        assert!(
+            radio_play.contains("play_station"),
+            "TUI radio must not stage queue.json"
+        );
+        assert!(
+            !radio_play.contains("queue::replace"),
+            "radio_play must not replace the file queue"
+        );
+        let main = std::fs::read_to_string("src/main.rs").unwrap();
+        assert!(
+            main.contains("output::play_station"),
+            "siren radio play uses play_station"
+        );
     }
 }

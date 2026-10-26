@@ -66,8 +66,16 @@ fn load_disk() {
         if e.get("a").is_none() && e.get("t").is_none() {
             continue;
         }
-        let artist = e.get("a").and_then(|x| x.as_str()).unwrap_or("").to_string();
-        let title = e.get("t").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let artist = e
+            .get("a")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let title = e
+            .get("t")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         // old rust keyed path:mtime — peel the suffix if the prefix is a real file
         let (path, mt_from_key) = match k.rsplit_once(':') {
             Some((p, rest)) if Path::new(p).is_file() && rest.parse::<i64>().is_ok() => {
@@ -256,7 +264,11 @@ pub fn is_url(path: &str) -> bool {
 fn url_tail(path: &str) -> String {
     let p = path.strip_prefix("file://").unwrap_or(path);
     let tail = p.rsplit('/').next().unwrap_or(p);
-    if tail.is_empty() { p.to_string() } else { tail.to_string() }
+    if tail.is_empty() {
+        p.to_string()
+    } else {
+        tail.to_string()
+    }
 }
 
 fn as_path(path: &str) -> &Path {

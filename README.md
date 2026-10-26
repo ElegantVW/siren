@@ -57,7 +57,7 @@ any key closes it).
 
 | Key | Action |
 |-----|--------|
-| Tab / Shift-Tab | cycle views |
+| Tab / Shift-Tab | cycle views (`cycle_next` / `cycle_previous` in Grove's canonical keyboard catalog) |
 | `n` / `b` | next / previous |
 | `p` | pause / resume |
 | ← / → | seek ±5s (Shift ±30s) |
@@ -66,6 +66,10 @@ any key closes it).
 | `h` | help overlay |
 | `q` | quit |
 | Esc | quit (closes a picker first) |
+
+The generated binding adapter is `src/grove_keys.rs`; regenerate from Grove
+with `python3 ../faeOS/tools/sync-keyboard-shortcuts.py` and verify with
+`--check`.
 
 **View keys** (uppercase = variant):
 
@@ -208,4 +212,3 @@ for Windows / Q4OS / macOS.
 
 **Tests:** `cargo test --offline`. Helpers (path shape, JSON, IPC cfg)
 over live LAN. `#[ignore]` only for boxes that must be on the wire.
-

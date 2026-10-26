@@ -48,11 +48,8 @@ struct House {
 
 impl House {
     fn new(tag: &str) -> Self {
-        let home = std::env::temp_dir().join(format!(
-            "siren-compat-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("siren-compat-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join("Music")).unwrap();
         std::fs::create_dir_all(home.join(".config/siren")).unwrap();
@@ -107,7 +104,11 @@ fn palette_default_without_mpv() {
     let h = House::new("palette");
     let out = h.run(&["config", "get", "palette"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "stderr {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(stdout.contains("pixie"), "got {stdout}");
 }
 
@@ -120,7 +121,11 @@ fn play_beep_then_now_json() {
     let h = House::new("play");
     write_beep_wav(&h.home.join("Music/beep.wav"), 3.0);
     let set = h.run(&["config", "set", "audio_output", "local"]);
-    assert!(set.status.success(), "config set: {}", String::from_utf8_lossy(&set.stderr));
+    assert!(
+        set.status.success(),
+        "config set: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
 
     let play = h.run(&["play", "beep"]);
     assert!(
@@ -132,7 +137,11 @@ fn play_beep_then_now_json() {
     std::thread::sleep(Duration::from_millis(400));
 
     let now = h.run(&["now", "--json"]);
-    assert!(now.status.success(), "now: {}", String::from_utf8_lossy(&now.stderr));
+    assert!(
+        now.status.success(),
+        "now: {}",
+        String::from_utf8_lossy(&now.stderr)
+    );
     let body = String::from_utf8_lossy(&now.stdout);
     assert!(body.contains("beep"), "now json should name beep: {body}");
     assert!(
@@ -141,7 +150,11 @@ fn play_beep_then_now_json() {
     );
 
     let stop = h.run(&["stop"]);
-    assert!(stop.status.success(), "stop: {}", String::from_utf8_lossy(&stop.stderr));
+    assert!(
+        stop.status.success(),
+        "stop: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
 }
 
 #[test]
@@ -157,7 +170,11 @@ fn missing_pactl_still_configs() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "stderr {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(stdout.contains("pixie"), "got {stdout}");
 }
 

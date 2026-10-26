@@ -191,8 +191,7 @@ impl SirenConfig {
                 self.library_roots = parts.clone();
                 Ok(parts.join(", "))
             }
-            "fuzzy_search" | "waves" | "gapless" | "normalize" | "cache_meta"
-            | "mouse" => {
+            "fuzzy_search" | "waves" | "gapless" | "normalize" | "cache_meta" | "mouse" => {
                 let b = matches!(
                     val.trim().to_lowercase().as_str(),
                     "1" | "yes" | "true" | "on"
@@ -281,7 +280,11 @@ impl SirenConfig {
 }
 
 fn onoff(b: bool) -> String {
-    if b { "on".into() } else { "off".into() }
+    if b {
+        "on".into()
+    } else {
+        "off".into()
+    }
 }
 
 #[cfg(test)]

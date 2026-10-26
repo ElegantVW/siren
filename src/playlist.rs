@@ -126,7 +126,10 @@ pub fn find(name: &str) -> Option<String> {
     if let Some(n) = all.iter().find(|n| n.to_lowercase() == low) {
         return Some(n.clone());
     }
-    let matches: Vec<&String> = all.iter().filter(|n| n.to_lowercase().starts_with(&low)).collect();
+    let matches: Vec<&String> = all
+        .iter()
+        .filter(|n| n.to_lowercase().starts_with(&low))
+        .collect();
     if matches.len() == 1 {
         return Some(matches[0].clone());
     }

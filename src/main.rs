@@ -5,22 +5,23 @@
 
 mod config;
 mod encode;
+mod grove_keys;
 mod heos;
 mod library;
 mod meta;
+mod mixer;
 mod output;
+mod paths;
 mod player;
-mod radio;
 mod playlist;
 mod queue;
-mod mixer;
-mod paths;
+mod radio;
 mod spectrum;
 mod stream;
 mod theme;
 mod trove;
-mod viz;
 mod tui;
+mod viz;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -40,9 +41,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Play ~/Music matches (or resume)
-    Play {
-        query: Vec<String>,
-    },
+    Play { query: Vec<String> },
     /// Play/pause toggle
     Pause,
     /// Stop playback
@@ -52,9 +51,7 @@ enum Cmd {
     /// Previous track
     Prev,
     /// Seek: +5 | -5 | 30% | mm:ss | seconds
-    Seek {
-        arg: String,
-    },
+    Seek { arg: String },
     /// Now playing
     Now {
         /// Read ~/.cache/siren/now.json instead of live state
@@ -100,29 +97,17 @@ enum Cmd {
         args: Vec<String>,
     },
     /// Sleep timer: `siren sleep 30` stops playback in 30min, `off` cancels
-    Sleep {
-        args: Vec<String>,
-    },
+    Sleep { args: Vec<String> },
     /// Queue: add|list|clear|play|next|remove|move
-    Queue {
-        args: Vec<String>,
-    },
+    Queue { args: Vec<String> },
     /// Playlists: save|load|list|remove
-    Playlist {
-        args: Vec<String>,
-    },
+    Playlist { args: Vec<String> },
     /// Resolve a query against ~/Music (dry)
-    Resolve {
-        query: Vec<String>,
-    },
+    Resolve { query: Vec<String> },
     /// Debug: analyze a file's spectrum, print bars (no playback)
-    Spectrum {
-        path: String,
-    },
+    Spectrum { path: String },
     /// Community radio (radio-browser.info, keyless)
-    Radio {
-        args: Vec<String>,
-    },
+    Radio { args: Vec<String> },
     /// Play a video's audio (YouTube etc. via yt-dlp): local or speaker
     Video {
         /// Video URL or "ytsearch:query"
@@ -134,6 +119,11 @@ enum Cmd {
         #[command(subcommand)]
         sub: StreamCmd,
     },
+    /// HEOS remote for Wisp (JSON). No Denon account.
+    Heos {
+        #[command(subcommand)]
+        sub: HeosCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -141,17 +131,11 @@ enum AudioCmd {
     /// Show current audio routing
     Status,
     /// Set output: local | heos
-    Output {
-        value: Option<String>,
-    },
+    Output { value: Option<String> },
     /// Set/show preferred speaker
-    Speaker {
-        value: Option<String>,
-    },
+    Speaker { value: Option<String> },
     /// Set/show speaker volume (0-100)
-    Vol {
-        value: Option<String>,
-    },
+    Vol { value: Option<String> },
     /// Cast now-playing (or first queue/library track) to the speaker
     Test,
     /// LAN doctor: cached IPs vs a fast /24 :1255 scan
@@ -170,6 +154,8 @@ enum AudioCmd {
         /// on | off | run (run = on, then wait for the encoder — systemd)
         action: String,
     },
+    /// Match the PC path to a HEOS source: aux | bt | net
+    Match { source: String },
 }
 
 #[derive(Subcommand)]
@@ -181,7 +167,74 @@ enum StreamCmd {
     },
 }
 
-
+#[derive(Subcommand)]
+enum HeosCmd {
+    /// Roster. Default is cache; `--live` sweeps :1255 and hides dead IPs.
+    List {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        live: bool,
+    },
+    /// Volume 0-100 or +N/-N
+    Vol {
+        value: String,
+        #[arg(long, short)]
+        speaker: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mute on|off|toggle
+    Mute {
+        mode: Option<String>,
+        #[arg(long, short)]
+        speaker: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Play {
+        #[arg(long, short)]
+        speaker: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Pause {
+        #[arg(long, short)]
+        speaker: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Stop {
+        #[arg(long, short)]
+        speaker: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Source: aux | bt | net
+    Source {
+        name: String,
+        #[arg(long, short)]
+        speaker: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Probe {
+        #[arg(long)]
+        json: bool,
+    },
+    Group {
+        #[arg(long, short)]
+        speaker: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Ungroup {
+        #[arg(long, short)]
+        speaker: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
 
 fn cmd_config(action: Option<String>, key: Option<String>, value: Option<String>) -> i32 {
     let mut cfg = SirenConfig::load();
@@ -370,15 +423,16 @@ fn cmd_play(cfg: &SirenConfig, rest: &[String]) -> i32 {
             return cmd_playlist_load(&hit);
         }
     }
-    let files = library::resolve_play_args(
-        cfg,
-        &rest.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-    );
+    let files =
+        library::resolve_play_args(cfg, &rest.iter().map(|s| s.to_string()).collect::<Vec<_>>());
     if files.is_empty() {
         println!("No tracks match: {}", rest.join(" "));
         return 1;
     }
-    let paths: Vec<String> = files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let paths: Vec<String> = files
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
     if queue::start_playlist(cfg, &paths, false) {
         0
     } else {
@@ -686,11 +740,8 @@ fn now_snapshot(cfg: &SirenConfig) -> serde_json::Value {
             let (uri, _, _) = crate::stream::position_info(&t.0);
             let upnp = crate::stream::transport_state(&t.0);
             let published = crate::stream::publish_state(ps[0].state.as_deref(), &upnp);
-            let suffix = crate::stream::now_suffix(
-                &uri,
-                ps[0].song.as_deref(),
-                published.as_deref(),
-            );
+            let suffix =
+                crate::stream::now_suffix(&uri, ps[0].song.as_deref(), published.as_deref());
             let stale = published.is_none();
             let mut snap = heos_snap(&ps[0], stale);
             snap["state"] = published
@@ -778,7 +829,8 @@ fn cmd_now_refresh(cfg: &SirenConfig, json: bool) -> i32 {
 /// Live `siren now`: try the speaker, fall back to stale roster names.
 fn cmd_now_live(cfg: &SirenConfig, json: bool) -> i32 {
     let cfg2 = cfg.clone();
-    let snap = with_deadline(5, move || now_snapshot(&cfg2)).unwrap_or_else(|| now_snapshot_cached(cfg));
+    let snap =
+        with_deadline(5, move || now_snapshot(&cfg2)).unwrap_or_else(|| now_snapshot_cached(cfg));
     if json {
         println!("{snap}");
         return 0;
@@ -808,7 +860,10 @@ fn print_heos_status(snap: &serde_json::Value) {
             println!("speaker: {name} ({ip})");
         }
     } else {
-        let label = snap.get("label").and_then(|x| x.as_str()).unwrap_or("no speaker found");
+        let label = snap
+            .get("label")
+            .and_then(|x| x.as_str())
+            .unwrap_or("no speaker found");
         println!("speaker: {label}");
     }
     match snap.get("vol").and_then(|x| x.as_i64()) {
@@ -823,7 +878,8 @@ fn print_heos_status(snap: &serde_json::Value) {
 fn cmd_status(cfg: &SirenConfig) -> i32 {
     if use_heos(cfg) || crate::stream::following() {
         let cfg2 = cfg.clone();
-        let snap = with_deadline(5, move || now_snapshot(&cfg2)).unwrap_or_else(|| now_snapshot_cached(cfg));
+        let snap = with_deadline(5, move || now_snapshot(&cfg2))
+            .unwrap_or_else(|| now_snapshot_cached(cfg));
         print_heos_status(&snap);
         return 0;
     }
@@ -918,6 +974,47 @@ fn cmd_audio_probe(json: bool) -> i32 {
     report.verdict.exit_code()
 }
 
+/// HEOS input → Siren player path. AUX is analog; network is follow; BT is the box.
+fn cmd_audio_match(cfg: &SirenConfig, source: &str) -> i32 {
+    match source.trim().to_ascii_lowercase().as_str() {
+        "aux" | "aux_in_1" | "line" => {
+            let mut cfg = cfg.clone();
+            if let Err(msg) = cfg.set("audio_output", "local") {
+                eprintln!("audio_output: {msg}");
+                return 1;
+            }
+            if cfg.save().is_err() {
+                eprintln!("save failed");
+                return 1;
+            }
+            crate::stream::follow_off(true);
+            let analog = crate::stream::pin_analog_lineout();
+            crate::player::apply_follow_route(false);
+            let mut cave = String::new();
+            if let Some((ip, pid, p)) = heos::resolve(None) {
+                heos::set_mute(&ip, pid, false);
+                let _ = heos::play_input(&ip, pid, "inputs/aux_in_1");
+                cave = format!(" {} AUX unmute", p.name);
+            }
+            println!(
+                "match aux → output=local follow=off analog={}{cave}",
+                if analog { "lineout" } else { "pin-failed" }
+            );
+            0
+        }
+        "bt" | "bluetooth" => {
+            crate::stream::follow_off(true);
+            println!("match bt → follow=off (A2DP is on the speaker)");
+            0
+        }
+        "net" | "network" | "follow" => cmd_audio_follow(cfg, "on"),
+        other => {
+            eprintln!("usage: siren audio match aux|bt|net  (got {other})");
+            1
+        }
+    }
+}
+
 fn cmd_audio_follow(cfg: &SirenConfig, action: &str) -> i32 {
     match action.trim().to_ascii_lowercase().as_str() {
         "on" | "start" | "1" | "run" => {
@@ -937,8 +1034,7 @@ fn cmd_audio_follow(cfg: &SirenConfig, action: &str) -> i32 {
                 }
             };
             if crate::stream::follow_on(crate::stream::DEFAULT_PORT, &tgt.0) {
-                let def = crate::stream::default_sink()
-                    .unwrap_or_else(|| "headset".into());
+                let def = crate::stream::default_sink().unwrap_or_else(|| "headset".into());
                 println!(
                     "follow on → {} ({})  music={}  default={}",
                     tgt.2,
@@ -966,6 +1062,282 @@ fn cmd_audio_follow(cfg: &SirenConfig, action: &str) -> i32 {
     }
 }
 
+fn heos_print(json_out: bool, ok: bool, v: serde_json::Value) -> i32 {
+    let mut obj = match v {
+        serde_json::Value::Object(m) => m,
+        other => {
+            let mut m = serde_json::Map::new();
+            m.insert("msg".into(), other);
+            m
+        }
+    };
+    obj.insert("ok".into(), serde_json::Value::Bool(ok));
+    if json_out {
+        println!("{}", serde_json::Value::Object(obj));
+    } else if ok {
+        if let Some(s) = obj.get("msg").and_then(|x| x.as_str()) {
+            println!("{s}");
+        } else {
+            println!("ok");
+        }
+    } else {
+        let err = obj
+            .get("error")
+            .and_then(|x| x.as_str())
+            .unwrap_or("failed");
+        eprintln!("{err}");
+    }
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn cmd_heos(cfg: &SirenConfig, sub: HeosCmd) -> i32 {
+    match sub {
+        HeosCmd::Probe { json } => cmd_audio_probe(json),
+        HeosCmd::List { json, live } => {
+            let mut players = if live {
+                heos::live_players()
+            } else {
+                heos::read_roster_cache()
+                    .or_else(heos::read_roster_stale)
+                    .unwrap_or_default()
+            };
+            if live && !players.is_empty() {
+                heos::enrich(&mut players);
+            }
+            let rows: Vec<serde_json::Value> = players
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "name": p.name,
+                        "model": p.model,
+                        "pid": p.pid,
+                        "ip": p.ip,
+                        "network": p.network,
+                        "state": p.state,
+                        "volume": p.volume,
+                        "song": p.song,
+                    })
+                })
+                .collect();
+            if json {
+                heos_print(true, true, serde_json::json!({ "players": rows }))
+            } else if rows.is_empty() {
+                println!("no HEOS speakers (cached empty — try wisp enlist / AP)");
+                0
+            } else {
+                for p in &players {
+                    let st = p.state.as_deref().unwrap_or("?");
+                    let vol = p.volume.map(|v| format!(" {v}%")).unwrap_or_default();
+                    println!("  {}  {}  {}  {st}{vol}", p.name, p.model, p.ip);
+                }
+                0
+            }
+        }
+        HeosCmd::Vol {
+            value,
+            speaker,
+            json,
+        } => match heos_target(cfg, speaker.as_deref()) {
+            None => heos_print(
+                json,
+                false,
+                serde_json::json!({"error": "no speaker found"}),
+            ),
+            Some((ip, pid, name)) => {
+                let cur = heos::read_roster_stale()
+                    .or_else(heos::read_roster_cache)
+                    .and_then(|ps| heos::pick_named(&ps, &name).and_then(|p| p.volume))
+                    .unwrap_or(20);
+                let Some(next) = heos::parse_vol_arg(&value, cur) else {
+                    return heos_print(
+                        json,
+                        false,
+                        serde_json::json!({"error": "volume expects 0-100 or +N/-N"}),
+                    );
+                };
+                let ok = heos::apply_volume(&ip, pid, next, crate::stream::following());
+                heos_print(
+                    json,
+                    ok,
+                    serde_json::json!({"msg": format!("{name} volume → {next}%"), "volume": next, "name": name}),
+                )
+            }
+        },
+        HeosCmd::Mute {
+            mode,
+            speaker,
+            json,
+        } => match heos_target(cfg, speaker.as_deref()) {
+            None => heos_print(
+                json,
+                false,
+                serde_json::json!({"error": "no speaker found"}),
+            ),
+            Some((ip, pid, name)) => {
+                let want = match mode.as_deref().map(|s| s.to_ascii_lowercase()).as_deref() {
+                    None | Some("toggle") => {
+                        let on = heos::get_mute(&ip, pid).unwrap_or(false);
+                        !on
+                    }
+                    Some("on") | Some("1") | Some("true") => true,
+                    Some("off") | Some("0") | Some("false") => false,
+                    Some(other) => {
+                        return heos_print(
+                            json,
+                            false,
+                            serde_json::json!({"error": format!("mute expects on|off|toggle (got {other})")}),
+                        );
+                    }
+                };
+                let ok = heos::set_mute(&ip, pid, want);
+                heos_print(
+                    json,
+                    ok,
+                    serde_json::json!({
+                        "msg": format!("{name} mute → {}", if want { "on" } else { "off" }),
+                        "mute": want,
+                        "name": name
+                    }),
+                )
+            }
+        },
+        HeosCmd::Play { speaker, json } => match heos_target(cfg, speaker.as_deref()) {
+            None => heos_print(
+                json,
+                false,
+                serde_json::json!({"error": "no speaker found"}),
+            ),
+            Some((ip, pid, name)) => {
+                let ok = heos::set_state(&ip, pid, "play");
+                heos_print(
+                    json,
+                    ok,
+                    serde_json::json!({"msg": format!("{name} play"), "name": name}),
+                )
+            }
+        },
+        HeosCmd::Pause { speaker, json } => match heos_target(cfg, speaker.as_deref()) {
+            None => heos_print(
+                json,
+                false,
+                serde_json::json!({"error": "no speaker found"}),
+            ),
+            Some((ip, pid, name)) => {
+                let ok = heos::set_state(&ip, pid, "pause");
+                heos_print(
+                    json,
+                    ok,
+                    serde_json::json!({"msg": format!("{name} pause"), "name": name}),
+                )
+            }
+        },
+        HeosCmd::Stop { speaker, json } => match heos_target(cfg, speaker.as_deref()) {
+            None => heos_print(
+                json,
+                false,
+                serde_json::json!({"error": "no speaker found"}),
+            ),
+            Some((ip, pid, name)) => {
+                let ok = heos::set_state(&ip, pid, "stop");
+                heos_print(
+                    json,
+                    ok,
+                    serde_json::json!({"msg": format!("{name} stop"), "name": name}),
+                )
+            }
+        },
+        HeosCmd::Source {
+            name: src,
+            speaker,
+            json,
+        } => {
+            let key = src.trim().to_ascii_lowercase();
+            if key == "net" || key == "network" {
+                return heos_print(
+                    json,
+                    true,
+                    serde_json::json!({
+                        "msg": "network source is siren play/follow",
+                        "source": "network"
+                    }),
+                );
+            }
+            let Some(input) = heos::input_name(&key) else {
+                return heos_print(
+                    json,
+                    false,
+                    serde_json::json!({"error": "source expects aux|bt|net"}),
+                );
+            };
+            match heos_target(cfg, speaker.as_deref()) {
+                None => heos_print(
+                    json,
+                    false,
+                    serde_json::json!({"error": "no speaker found"}),
+                ),
+                Some((ip, pid, name)) => {
+                    let ok = heos::play_input(&ip, pid, input);
+                    heos_print(
+                        json,
+                        ok,
+                        serde_json::json!({
+                            "msg": format!("{name} source → {key} ({input})"),
+                            "source": key,
+                            "input": input,
+                            "name": name
+                        }),
+                    )
+                }
+            }
+        }
+        HeosCmd::Group { speaker, json } => match heos_target(cfg, speaker.as_deref()) {
+            None => heos_print(
+                json,
+                false,
+                serde_json::json!({"error": "no speaker found"}),
+            ),
+            Some((ip, pid, name)) => {
+                let players = heos::read_roster_stale()
+                    .or_else(heos::read_roster_cache)
+                    .unwrap_or_default();
+                let members: Vec<i64> = players
+                    .iter()
+                    .map(|p| p.pid)
+                    .filter(|p| *p != pid)
+                    .collect();
+                let ok = heos::set_group(&ip, pid, &members);
+                heos_print(
+                    json,
+                    ok,
+                    serde_json::json!({
+                        "msg": format!("group under {name} ({} members)", members.len()),
+                        "name": name
+                    }),
+                )
+            }
+        },
+        HeosCmd::Ungroup { speaker, json } => match heos_target(cfg, speaker.as_deref()) {
+            None => heos_print(
+                json,
+                false,
+                serde_json::json!({"error": "no speaker found"}),
+            ),
+            Some((ip, pid, name)) => {
+                let ok = heos::ungroup(&ip, pid);
+                heos_print(
+                    json,
+                    ok,
+                    serde_json::json!({"msg": format!("ungroup {name}"), "name": name}),
+                )
+            }
+        },
+    }
+}
+
 fn cmd_audio(sub: Option<AudioCmd>) -> i32 {
     let mut cfg = SirenConfig::load();
     match sub {
@@ -973,7 +1345,8 @@ fn cmd_audio(sub: Option<AudioCmd>) -> i32 {
             println!("output:  {}", cfg.audio_output);
             println!("speaker: {}", cfg.audio_speaker);
             let cfg2 = cfg.clone();
-            let snap = with_deadline(5, move || now_snapshot(&cfg2)).unwrap_or_else(|| now_snapshot_cached(&cfg));
+            let snap = with_deadline(5, move || now_snapshot(&cfg2))
+                .unwrap_or_else(|| now_snapshot_cached(&cfg));
             let name = snap.get("name").and_then(|x| x.as_str()).unwrap_or("");
             let ip = snap.get("ip").and_then(|x| x.as_str()).unwrap_or("");
             let state = snap.get("state").and_then(|x| x.as_str()).unwrap_or("?");
@@ -1083,9 +1456,10 @@ fn cmd_audio(sub: Option<AudioCmd>) -> i32 {
         Some(AudioCmd::Queue { args }) => {
             let cfg = SirenConfig::load();
             cmd_speaker_queue(&cfg, &args)
-        },
+        }
         Some(AudioCmd::Probe { json }) => cmd_audio_probe(json),
         Some(AudioCmd::Follow { action }) => cmd_audio_follow(&cfg, &action),
+        Some(AudioCmd::Match { source }) => cmd_audio_match(&cfg, &source),
         Some(AudioCmd::Test) => {
             // now-playing → queue top → library top
             let pick = {
@@ -1096,7 +1470,11 @@ fn cmd_audio(sub: Option<AudioCmd>) -> i32 {
                     None
                 }
             }
-            .or_else(|| queue::snapshot().first().map(|it| std::path::PathBuf::from(&it.path)))
+            .or_else(|| {
+                queue::snapshot()
+                    .first()
+                    .map(|it| std::path::PathBuf::from(&it.path))
+            })
             .or_else(|| library::scan_library(&cfg).first().cloned());
             match pick {
                 Some(p) => {
@@ -1151,7 +1529,13 @@ fn cmd_cast(
             return 1;
         }
     };
-    let aid = if next { 2 } else if append { 3 } else { 1 };
+    let aid = if next {
+        2
+    } else if append {
+        3
+    } else {
+        1
+    };
     match heos::dlna_cast(&tgt.0, tgt.1, top, aid) {
         Ok(()) => {
             if aid == 1 {
@@ -1204,7 +1588,11 @@ fn cmd_speaker_queue(cfg: &SirenConfig, args: &[String]) -> i32 {
             return 0;
         }
         for (i, it) in items.iter().enumerate() {
-            let artist = if it.artist.is_empty() { "".into() } else { format!(" — {}", it.artist) };
+            let artist = if it.artist.is_empty() {
+                "".into()
+            } else {
+                format!(" — {}", it.artist)
+            };
             println!("  {:3}. {}{}", i + 1, it.song, artist);
         }
         return 0;
@@ -1408,10 +1796,9 @@ fn cmd_radio(args: &[String]) -> i32 {
                 println!("No stations match: {q}");
                 return 1;
             };
-            queue::replace(vec![radio::to_queue_item(&st)]);
             println!("tuning: {} ({})", st.name, st.url);
             let cfg = SirenConfig::load();
-            match output::play_from(&cfg, 0) {
+            match output::play_station(&cfg, &st.url, &st.name) {
                 Ok(m) => {
                     println!("{m}");
                     0
@@ -1523,7 +1910,10 @@ fn cmd_video(args: &[String]) -> i32 {
             "--print",
             "after_move:filepath",
             "--paths",
-            crate::paths::cache_dir().join("videos").to_str().unwrap_or("."),
+            crate::paths::cache_dir()
+                .join("videos")
+                .to_str()
+                .unwrap_or("."),
             &query,
         ])
         .output()
@@ -1584,14 +1974,24 @@ fn cmd_video(args: &[String]) -> i32 {
 /// Video title from yt-dlp (best effort, ~2s); None on failure.
 fn video_title(query: &str) -> Option<String> {
     let out = std::process::Command::new("yt-dlp")
-        .args(["--no-playlist", "--get-title", "--socket-timeout", "10", query])
+        .args([
+            "--no-playlist",
+            "--get-title",
+            "--socket-timeout",
+            "10",
+            query,
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
     let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if t.is_empty() { None } else { Some(t) }
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
 }
 
 fn main() -> Result<()> {
@@ -1652,7 +2052,11 @@ fn main() -> Result<()> {
                 0
             }
         }
-        Some(Cmd::Now { cached, refresh, json }) => {
+        Some(Cmd::Now {
+            cached,
+            refresh,
+            json,
+        }) => {
             if refresh {
                 cmd_now_refresh(&cfg, json)
             } else if cached {
@@ -1696,8 +2100,10 @@ fn main() -> Result<()> {
                     }
                 }
             } else {
-                let paths: Vec<String> =
-                    lib.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                let paths: Vec<String> = lib
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
                 if queue::start_playlist(&cfg, &paths, true) {
                     0
                 } else {
@@ -1707,17 +2113,20 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Config { action, key, value }) => cmd_config(action, key, value),
         Some(Cmd::Audio { sub }) => cmd_audio(sub),
-        Some(Cmd::Cast { query, speaker, next, append }) => {
-            cmd_cast(&cfg, &query, speaker.as_deref(), next, append)
-        }
+        Some(Cmd::Cast {
+            query,
+            speaker,
+            next,
+            append,
+        }) => cmd_cast(&cfg, &query, speaker.as_deref(), next, append),
         Some(Cmd::Trove { args }) => cmd_trove(&args),
         Some(Cmd::Radio { args }) => cmd_radio(&args),
         Some(Cmd::Video { url }) => cmd_video(&url),
+        Some(Cmd::Heos { sub }) => cmd_heos(&cfg, sub),
         Some(Cmd::Stream { sub }) => match sub {
             StreamCmd::Serve { port, monitor } => {
                 let port = port.unwrap_or(stream::DEFAULT_PORT);
-                let monitor =
-                    monitor.unwrap_or_else(|| stream::monitor_of(stream::MASTER));
+                let monitor = monitor.unwrap_or_else(|| stream::monitor_of(stream::MASTER));
                 encode::serve(port, &monitor)
             }
         },
@@ -1749,8 +2158,11 @@ fn main() -> Result<()> {
                     );
                     for t in [5.0, 30.0, 300.0, 1800.0] {
                         if t < s.duration {
-                            let row: String =
-                                s.at(t).iter().map(|v| crate::spectrum::bar_glyph(*v)).collect();
+                            let row: String = s
+                                .at(t)
+                                .iter()
+                                .map(|v| crate::spectrum::bar_glyph(*v))
+                                .collect();
                             println!("  t={t:>6.0}s {row}");
                         }
                     }
@@ -1804,7 +2216,11 @@ mod deadline_tests {
             1
         });
         assert!(v.is_none(), "must return None on timeout, got {v:?}");
-        assert!(start.elapsed().as_secs() < 3, "must return promptly, took {:?}", start.elapsed());
+        assert!(
+            start.elapsed().as_secs() < 3,
+            "must return promptly, took {:?}",
+            start.elapsed()
+        );
     }
 
     /// The worker still completes later; we just stop waiting.
@@ -1814,7 +2230,10 @@ mod deadline_tests {
         let _ = with_deadline(1, || {
             std::thread::sleep(std::time::Duration::from_secs(2));
         });
-        assert!(start.elapsed().as_secs() < 2, "caller must not wait for the worker");
+        assert!(
+            start.elapsed().as_secs() < 2,
+            "caller must not wait for the worker"
+        );
     }
 
     #[test]
@@ -1839,10 +2258,14 @@ mod deadline_tests {
             "not-on-lan message names the sink we leave alone"
         );
         assert!(
-            !body.contains("follow_on") || body.find("NotOnLan").unwrap() < body.rfind("follow_on").unwrap(),
+            !body.contains("follow_on")
+                || body.find("NotOnLan").unwrap() < body.rfind("follow_on").unwrap(),
             "NotOnLan check must run before follow_on"
         );
-        assert!(body.contains("wait_while_encoder"), "follow run waits on encoder");
+        assert!(
+            body.contains("wait_while_encoder"),
+            "follow run waits on encoder"
+        );
         assert!(body.contains("\"run\""), "systemd ExecStart is follow run");
         assert!(
             src.contains("encode::serve"),
@@ -1863,8 +2286,23 @@ mod deadline_tests {
             .map(|i| start + i)
             .unwrap_or(src.len());
         let body = &src[start..end];
-        assert!(body.contains("health_line"), "siren audio names encoder/ESTAB/UPnP");
-        assert!(src.contains("mark_follow_want_stop"), "stop on wav does not reclaim");
+        assert!(
+            body.contains("health_line"),
+            "siren audio names encoder/ESTAB/UPnP"
+        );
+        assert!(
+            src.contains("fn cmd_audio_match"),
+            "Wisp source keys match the PC path"
+        );
+        assert!(src.contains("match aux → output=local follow=off"));
+        assert!(
+            src.contains("pin_analog_lineout") && src.contains("play_input"),
+            "match aux pins analog line-out and Cave AUX"
+        );
+        assert!(
+            src.contains("mark_follow_want_stop"),
+            "stop on wav does not reclaim"
+        );
         let st = src.find("fn cmd_status").expect("cmd_status");
         let st_end = src[st..]
             .find("\nfn print_heos_status")

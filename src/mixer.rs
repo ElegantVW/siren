@@ -44,11 +44,7 @@ pub fn parse_inputs(text: &str) -> Vec<SinkInput> {
             } else if t.starts_with("Volume: ") {
                 // "Volume: front-left: 65536 / 100% / 0.00 dB, ..."
                 if let Some(pct) = t.split('/').nth(1) {
-                    cur.volume_pct = pct
-                        .trim()
-                        .trim_end_matches('%')
-                        .parse()
-                        .unwrap_or(100);
+                    cur.volume_pct = pct.trim().trim_end_matches('%').parse().unwrap_or(100);
                 }
             } else if let Some(v) = t.strip_prefix("application.name = ") {
                 cur.app = v.trim_matches('"').to_string();
@@ -66,9 +62,7 @@ pub fn parse_inputs(text: &str) -> Vec<SinkInput> {
     }
     // drop the loopback itself — muting it would kill local monitoring,
     // and it's infrastructure, not a source
-    out.retain(|s| {
-        !(s.app.contains("loopback") || s.media.contains("loopback"))
-    });
+    out.retain(|s| !(s.app.contains("loopback") || s.media.contains("loopback")));
     out
 }
 
@@ -134,11 +128,7 @@ pub fn parse_sinks(text: &str) -> Vec<Sink> {
                 cur.muted = v.trim() == "yes";
             } else if t.starts_with("Volume: ") {
                 if let Some(pct) = t.split('/').nth(1) {
-                    cur.volume_pct = pct
-                        .trim()
-                        .trim_end_matches('%')
-                        .parse()
-                        .unwrap_or(100);
+                    cur.volume_pct = pct.trim().trim_end_matches('%').parse().unwrap_or(100);
                 }
             }
         }
@@ -205,11 +195,7 @@ pub fn set_sink_mute(name: &str, mute: bool) -> bool {
         return false;
     }
     std::process::Command::new("pactl")
-        .args([
-            "set-sink-mute",
-            name,
-            if mute { "1" } else { "0" },
-        ])
+        .args(["set-sink-mute", name, if mute { "1" } else { "0" }])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)

@@ -26,10 +26,16 @@ struct C32 {
 
 impl C32 {
     fn add(self, o: C32) -> C32 {
-        C32 { re: self.re + o.re, im: self.im + o.im }
+        C32 {
+            re: self.re + o.re,
+            im: self.im + o.im,
+        }
     }
     fn sub(self, o: C32) -> C32 {
-        C32 { re: self.re - o.re, im: self.im - o.im }
+        C32 {
+            re: self.re - o.re,
+            im: self.im - o.im,
+        }
     }
     fn mul(self, o: C32) -> C32 {
         C32 {
@@ -61,7 +67,10 @@ fn fft(buf: &mut [C32]) {
     let mut len = 2;
     while len <= n {
         let ang = -2.0 * std::f32::consts::PI / len as f32;
-        let wlen = C32 { re: ang.cos(), im: ang.sin() };
+        let wlen = C32 {
+            re: ang.cos(),
+            im: ang.sin(),
+        };
         let mut i = 0;
         while i < n {
             let mut w = C32 { re: 1.0, im: 0.0 };
@@ -130,7 +139,12 @@ fn cache_dir() -> PathBuf {
 
 fn cache_key(path: &Path) -> Option<String> {
     let meta = path.metadata().ok()?;
-    let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
     let mut h = std::collections::hash_map::DefaultHasher::new();
     use std::hash::{Hash, Hasher};
     path.to_string_lossy().hash(&mut h);
@@ -179,16 +193,29 @@ fn read_cache(key: &str) -> Option<TrackSpec> {
         frames.push(band);
     }
     let duration = n as f64 * frame_dur;
-    Some(TrackSpec { frames, frame_dur, duration })
+    Some(TrackSpec {
+        frames,
+        frame_dur,
+        duration,
+    })
 }
 
 fn decode_pcm(path: &Path) -> Result<Vec<f32>, String> {
     let out = std::process::Command::new("ffmpeg")
         .args([
-            "-v", "error", "-i",
+            "-v",
+            "error",
+            "-i",
             &path.to_string_lossy(),
-            "-f", "f32le", "-ac", "1", "-ar", &SAMPLE_RATE.to_string(),
-            "-map", "a", "-",
+            "-f",
+            "f32le",
+            "-ac",
+            "1",
+            "-ar",
+            &SAMPLE_RATE.to_string(),
+            "-map",
+            "a",
+            "-",
         ])
         .output()
         .map_err(|e| format!("ffmpeg missing/failed: {e}"))?;
@@ -230,7 +257,11 @@ fn analyze(pcm: &[f32]) -> TrackSpec {
         }
     }
     let duration = frames.len() as f64 * frame_dur;
-    TrackSpec { frames, frame_dur, duration }
+    TrackSpec {
+        frames,
+        frame_dur,
+        duration,
+    }
 }
 
 /// Live spectrum: one frame of BANDS magnitudes from a PCM window.
@@ -312,7 +343,10 @@ pub fn request_analyze(path: &Path) {
         return;
     }
     {
-        let mut p = PENDING.get_or_init(|| Mutex::new(std::collections::HashSet::new())).lock().unwrap();
+        let mut p = PENDING
+            .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+            .lock()
+            .unwrap();
         if !p.insert(key.clone()) {
             return;
         }

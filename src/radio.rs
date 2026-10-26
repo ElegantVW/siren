@@ -37,8 +37,16 @@ fn curl_text(url: &str) -> Result<String, String> {
     let mut err = String::new();
     let out = std::process::Command::new("curl")
         .args([
-            "-fsSL", "--max-time", "25", "-A", UA, "--retry", "1",
-            "--retry-delay", "1", url,
+            "-fsSL",
+            "--max-time",
+            "25",
+            "-A",
+            UA,
+            "--retry",
+            "1",
+            "--retry-delay",
+            "1",
+            url,
         ])
         .output()
         .map_err(|e| format!("curl missing/failed: {e}"))?;
@@ -49,8 +57,16 @@ fn curl_text(url: &str) -> Result<String, String> {
             let alt = url.replacen(BASES[0], BASES[1], 1);
             let out2 = std::process::Command::new("curl")
                 .args([
-                    "-fsSL", "--max-time", "25", "-A", UA, "--retry", "1",
-                    "--retry-delay", "1", &alt,
+                    "-fsSL",
+                    "--max-time",
+                    "25",
+                    "-A",
+                    UA,
+                    "--retry",
+                    "1",
+                    "--retry-delay",
+                    "1",
+                    &alt,
                 ])
                 .output()
                 .map_err(|e| format!("curl missing/failed: {e}"))?;
@@ -117,13 +133,26 @@ fn to_station(v: &serde_json::Value) -> Option<Station> {
     // No health filtering: the directory's automated check is flaky and
     // hides working stations. Dead links fail loudly per-station instead.
     Some(Station {
-        uuid: v.get("stationuuid").and_then(|x| x.as_str()).unwrap_or("").into(),
-        name: v.get("name").and_then(|x| x.as_str()).unwrap_or(url).trim().into(),
+        uuid: v
+            .get("stationuuid")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .into(),
+        name: v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or(url)
+            .trim()
+            .into(),
         url: url.into(),
         codec: v.get("codec").and_then(|x| x.as_str()).unwrap_or("").into(),
         bitrate: v.get("bitrate").and_then(|x| x.as_u64()).unwrap_or(0),
         tags: v.get("tags").and_then(|x| x.as_str()).unwrap_or("").into(),
-        country: v.get("country").and_then(|x| x.as_str()).unwrap_or("").into(),
+        country: v
+            .get("country")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .into(),
     })
 }
 
@@ -173,7 +202,10 @@ pub fn countries() -> Result<Vec<Country>, String> {
             }
         }
     }
-    let text = curl_text(&format!("{}/countries?order=stationcount&reverse=true", BASES[0]))?;
+    let text = curl_text(&format!(
+        "{}/countries?order=stationcount&reverse=true",
+        BASES[0]
+    ))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("json: {e}"))?;
     let mut out: Vec<Country> = v
         .as_array()
@@ -297,9 +329,10 @@ pub fn search_many(query: &str, total: usize) -> Result<Vec<Station>, String> {
 pub fn merge_unique(dst: &mut Vec<Station>, chunk: Vec<Station>) -> usize {
     let mut changed = 0;
     for s in chunk {
-        if let Some(pos) = dst.iter().position(|m: &Station| {
-            (!m.uuid.is_empty() && m.uuid == s.uuid) || m.url == s.url
-        }) {
+        if let Some(pos) = dst
+            .iter()
+            .position(|m: &Station| (!m.uuid.is_empty() && m.uuid == s.uuid) || m.url == s.url)
+        {
             if s.name.trim().len() < dst[pos].name.trim().len() {
                 dst[pos] = s;
                 changed += 1;
@@ -443,7 +476,11 @@ pub fn add_url(url: &str, name: &str) -> Station {
 /// Toggle favorite by station uuid. Returns true when now a fav.
 pub fn toggle_fav(s: &Station) -> bool {
     let mut st = load_state();
-    if st.favs.iter().any(|f| f.uuid == s.uuid && !s.uuid.is_empty()) {
+    if st
+        .favs
+        .iter()
+        .any(|f| f.uuid == s.uuid && !s.uuid.is_empty())
+    {
         st.favs.retain(|f| f.uuid != s.uuid);
         save_state(&st);
         false
@@ -477,7 +514,7 @@ pub fn about_text() -> Vec<String> {
 
 pub fn is_fav(s: &Station) -> bool {
     let st = load_state();
-    st.favs.iter().any(|f| {
-        (!s.uuid.is_empty() && f.uuid == s.uuid) || f.url == s.url
-    })
+    st.favs
+        .iter()
+        .any(|f| (!s.uuid.is_empty() && f.uuid == s.uuid) || f.url == s.url)
 }

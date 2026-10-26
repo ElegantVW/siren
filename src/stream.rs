@@ -24,7 +24,9 @@ pub const STREAM_MIME_L16: &str = "audio/L16;rate=48000;channels=2";
 pub const CHUNK_BYTES: usize = 4096;
 pub const SAMPLE_RATE: u32 = 48000;
 pub const MASTER: &str = "Siren_Master";
-pub const FALLBACK_SINK: &str = "alsa_output.pci-0000_31_00.4.iec958-stereo";
+/// Rear analog Front L/R (red line-out) → Cave AUX. IEC958 has no cable.
+pub const FALLBACK_SINK: &str = "alsa_output.pci-0000_31_00.4.analog-stereo";
+pub const ANALOG_PORT: &str = "analog-output-lineout";
 
 /// Pulse monitor name for a sink (`Foo` → `Foo.monitor`).
 pub fn monitor_of(sink: &str) -> String {
@@ -878,8 +880,24 @@ fn follow_off_dest(prev: Option<&str>) -> &str {
     }
 }
 
+/// Pin PipeWire to analog line-out (unmute, default, move streams).
+/// AUX into Cave uses this jack; SPDIF/HDMI do not.
+pub fn pin_analog_lineout() -> bool {
+    let name = FALLBACK_SINK;
+    let _ = Command::new("pactl")
+        .args(["set-sink-port", name, ANALOG_PORT])
+        .status();
+    let unmuted = set_sink_mute(name, false);
+    let def = set_default_sink(name);
+    move_sink_inputs_to(name);
+    unmuted && def
+}
+
 pub fn default_sink() -> Option<String> {
-    let out = Command::new("pactl").arg("get-default-sink").output().ok()?;
+    let out = Command::new("pactl")
+        .arg("get-default-sink")
+        .output()
+        .ok()?;
     let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if name.is_empty() {
         None
@@ -1048,7 +1066,7 @@ mod tests {
         assert_eq!(monitor_of(MASTER), "Siren_Master.monitor");
         assert_eq!(
             monitor_of(FALLBACK_SINK),
-            "alsa_output.pci-0000_31_00.4.iec958-stereo.monitor"
+            "alsa_output.pci-0000_31_00.4.analog-stereo.monitor"
         );
     }
 
@@ -1148,10 +1166,7 @@ mod tests {
             viz_input(false, Some("s12345"), Some("headset")),
             "headset.monitor"
         );
-        assert_eq!(
-            viz_input(false, None, Some("headset")),
-            "headset.monitor"
-        );
+        assert_eq!(viz_input(false, None, Some("headset")), "headset.monitor");
         assert_eq!(http_url("http://x/y"), Some("http://x/y".into()));
         assert_eq!(http_url("s12345"), None);
         assert_eq!(http_url(""), None);
@@ -1179,13 +1194,10 @@ mod tests {
 
     #[test]
     fn capture_from_default_includes_master() {
-        assert_eq!(
-            capture_from_default(Some(MASTER)),
-            "Siren_Master.monitor"
-        );
+        assert_eq!(capture_from_default(Some(MASTER)), "Siren_Master.monitor");
         assert_eq!(
             capture_from_default(Some(FALLBACK_SINK)),
-            "alsa_output.pci-0000_31_00.4.iec958-stereo.monitor"
+            "alsa_output.pci-0000_31_00.4.analog-stereo.monitor"
         );
         assert_eq!(capture_from_default(None), "Siren_Master.monitor");
         assert_eq!(capture_from_default(Some("")), "Siren_Master.monitor");
@@ -1217,6 +1229,15 @@ mod tests {
         assert!(!is_playing("STOPPED"));
         assert!(!is_playing(""));
         assert!(!is_playing("PAUSED_PLAYBACK"));
+    }
+
+    #[test]
+    fn analog_fallback_is_lineout_not_spdif() {
+        assert!(FALLBACK_SINK.contains("analog-stereo"));
+        assert!(!FALLBACK_SINK.contains("iec958"));
+        let src = std::fs::read_to_string("src/stream.rs").expect("stream.rs");
+        assert!(src.contains("pin_analog_lineout"));
+        assert!(src.contains("analog-output-lineout"));
     }
 
     #[test]
@@ -1252,10 +1273,7 @@ mod tests {
             body.contains("stream") && body.contains("serve"),
             "encoder is siren stream serve"
         );
-        assert!(
-            !body.contains("python3"),
-            "encoder must not spawn python3"
-        );
+        assert!(!body.contains("python3"), "encoder must not spawn python3");
     }
 
     #[test]
@@ -1335,10 +1353,7 @@ mod tests {
     #[test]
     fn encoder_stop_does_not_pkill_substring() {
         let src = std::fs::read_to_string("src/stream.rs").expect("stream.rs");
-        let prod = src
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap_or(&src);
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(&src);
         for (i, line) in prod.lines().enumerate() {
             let t = line.trim_start();
             if t.starts_with("//") || t.starts_with("///") {
@@ -1361,7 +1376,10 @@ mod tests {
             .map(|i| start + i)
             .unwrap_or(src.len());
         let body = &src[start..end];
-        assert!(body.contains("stop_playback"), "Stop before Play so leftover URI re-GETs");
+        assert!(
+            body.contains("stop_playback"),
+            "Stop before Play so leftover URI re-GETs"
+        );
         assert!(body.contains("wait_playing"), "must wait for PLAYING");
         assert!(
             body.contains("apply_follow_route(true)"),
@@ -1372,10 +1390,7 @@ mod tests {
             "follow must not steal the headset default"
         );
         assert!(body.contains("persist_follow"), "persist prev_default");
-        assert!(
-            body.contains("follow failed:"),
-            "fail path names the step"
-        );
+        assert!(body.contains("follow failed:"), "fail path names the step");
     }
 
     #[test]
@@ -1422,10 +1437,22 @@ mod tests {
 
     #[test]
     fn publish_state_prefers_upnp_over_cli_unknown() {
-        assert_eq!(publish_state(Some("unknown"), "PLAYING").as_deref(), Some("play"));
-        assert_eq!(publish_state(Some("unknown"), "TRANSITIONING").as_deref(), Some("play"));
-        assert_eq!(publish_state(Some("play"), "PAUSED_PLAYBACK").as_deref(), Some("pause"));
-        assert_eq!(publish_state(Some("unknown"), "STOPPED").as_deref(), Some("stop"));
+        assert_eq!(
+            publish_state(Some("unknown"), "PLAYING").as_deref(),
+            Some("play")
+        );
+        assert_eq!(
+            publish_state(Some("unknown"), "TRANSITIONING").as_deref(),
+            Some("play")
+        );
+        assert_eq!(
+            publish_state(Some("play"), "PAUSED_PLAYBACK").as_deref(),
+            Some("pause")
+        );
+        assert_eq!(
+            publish_state(Some("unknown"), "STOPPED").as_deref(),
+            Some("stop")
+        );
         assert_eq!(publish_state(Some("unknown"), ""), None);
         assert_eq!(publish_state(Some("play"), "").as_deref(), Some("play"));
     }
@@ -1433,26 +1460,44 @@ mod tests {
     #[test]
     fn now_suffix_follow_uri_wins() {
         assert_eq!(
-            now_suffix("http://192.168.8.186:8899/siren.wav", Some("other"), Some("play")),
+            now_suffix(
+                "http://192.168.8.186:8899/siren.wav",
+                Some("other"),
+                Some("play")
+            ),
             "Siren Follow"
         );
-        assert_eq!(now_suffix("http://x/radio", Some("OXIGÉNIO"), Some("play")), "OXIGÉNIO");
+        assert_eq!(
+            now_suffix("http://x/radio", Some("OXIGÉNIO"), Some("play")),
+            "OXIGÉNIO"
+        );
         assert_eq!(now_suffix("", None, Some("play")), "play");
         assert_eq!(now_suffix("", None, None), "?");
         assert_eq!(
-            now_suffix("http://x/radio", Some("102nd Old Time Music Hour"), Some("stop")),
+            now_suffix(
+                "http://x/radio",
+                Some("102nd Old Time Music Hour"),
+                Some("stop")
+            ),
             "stop",
             "STOPPED drops leftover TuneIn title"
         );
         assert_eq!(
-            now_suffix("http://192.168.8.186:8899/siren.wav", Some("other"), Some("stop")),
+            now_suffix(
+                "http://192.168.8.186:8899/siren.wav",
+                Some("other"),
+                Some("stop")
+            ),
             "stop"
         );
     }
 
     #[test]
     fn skip_heos_seek_on_live_wav_or_zero_duration() {
-        assert!(should_skip_heos_seek("http://192.168.8.186:8899/siren.wav", "00:18:20"));
+        assert!(should_skip_heos_seek(
+            "http://192.168.8.186:8899/siren.wav",
+            "00:18:20"
+        ));
         assert!(should_skip_heos_seek("http://dlna/track.mp3", "00:00:00"));
         assert!(should_skip_heos_seek("http://dlna/track.mp3", ""));
         assert!(!should_skip_heos_seek("http://dlna/track.mp3", "00:03:12"));
@@ -1469,7 +1514,12 @@ mod tests {
             "Cave dropped the wav while want=play"
         );
         assert!(
-            !reclaim_due(true, "http://192.168.8.186:8899/siren.wav", "STOPPED", false),
+            !reclaim_due(
+                true,
+                "http://192.168.8.186:8899/siren.wav",
+                "STOPPED",
+                false
+            ),
             "siren stop sets want=stop"
         );
     }
@@ -1495,16 +1545,23 @@ mod tests {
             .map(|i| start + i)
             .unwrap_or(src.len());
         let body = &src[start..end];
-        assert!(body.contains("publish_state"), "now must publish UPnP over CLI unknown");
-        assert!(body.contains("now_suffix"), "follow URI labels Siren Follow");
-        assert!(body.contains("transport_state"), "UPnP transport is the honesty path");
+        assert!(
+            body.contains("publish_state"),
+            "now must publish UPnP over CLI unknown"
+        );
+        assert!(
+            body.contains("now_suffix"),
+            "follow URI labels Siren Follow"
+        );
+        assert!(
+            body.contains("transport_state"),
+            "UPnP transport is the honesty path"
+        );
         assert!(
             body.contains("following() || cfg.audio_output == \"heos\""),
             "local + follow still uses Cave UPnP"
         );
-        let cached_end = src
-            .find("fn now_snapshot(")
-            .unwrap_or(src.len());
+        let cached_end = src.find("fn now_snapshot(").unwrap_or(src.len());
         let cached = &src[src.find("fn now_snapshot_cached").unwrap_or(0)..cached_end];
         assert!(
             cached.contains("following()"),
@@ -1522,11 +1579,11 @@ mod tests {
         let src = std::fs::read_to_string("AGENTS.md").expect("AGENTS");
         assert!(src.contains("ProtectHome=yes"), "minidlna hides ~/Music");
         assert!(src.contains("minidlna.service.d"), "house drop-in path");
-        assert!(src.contains("/run/minidlna/music"), "bind dest is outside /home");
         assert!(
-            src.contains("8899/tcp"),
-            "UFW follow wav from speaker LAN"
+            src.contains("/run/minidlna/music"),
+            "bind dest is outside /home"
         );
+        assert!(src.contains("8899/tcp"), "UFW follow wav from speaker LAN");
     }
 
     #[test]
