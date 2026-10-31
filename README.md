@@ -1,6 +1,6 @@
 ![Siren hero](assets/hero/siren.svg)
 
-# Siren — the Aether's music vessel 🎵
+# Siren — the music 🎵
 
 A terminal music player. Local files through **mpv**, a two-box TUI,
 optional HEOS speakers on the same LAN. Linux, Windows, and macOS.
